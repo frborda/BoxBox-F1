@@ -1,0 +1,7 @@
+PySide6>=6.7
+pyqtgraph>=0.13.7
+numpy>=1.26
+pandas>=2.1
+fastf1>=3.4
+aiohttp>=3.9
+psycopg[binary]>=3.1
