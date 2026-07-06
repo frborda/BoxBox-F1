@@ -5,7 +5,17 @@ brake, RPM, gear) for one or several cars at once, with **distance on the X
 axis** and one series per driver. Built with
 [Fast-F1](https://github.com/theOehrly/Fast-F1), PySide6 and pyqtgraph.
 
-![F1 Live Telemetry — Quali comparison mode replaying a race, with timing tower and track map](docs/screenshot.png)
+![F1 Live Telemetry — Race mode replaying a race, with timing tower and track map](docs/screenshot.png)
+
+**Times / Gap** — gap to a reference driver over the whole race, tyre
+degradation per stint and the timing tower with pit stops and averages:
+
+![Times / Gap mode with degradation analysis](docs/screenshot-gap.png)
+
+**Quali comparison** — live laps against a target lap, with the cumulative
+delta trace and per-sector/microsector delta cards updating in real time:
+
+![Quali comparison mode against a target lap](docs/screenshot-quali.png)
 
 ## Modes
 
