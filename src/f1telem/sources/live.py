@@ -1,30 +1,33 @@
-"""Fuente en vivo: cliente SignalR (clásico) de F1 Live Timing.
+"""Fuente en vivo: cliente SignalR Core de F1 Live Timing.
 
-Se conecta a https://livetiming.formula1.com/signalr, se suscribe a los
-feeds y decodifica CarData.z (zlib+base64). La distancia se obtiene
-integrando la velocidad en el tiempo; el número de vuelta sale de
-TimingData (NumberOfLaps por piloto).
+F1 migró el streaming a SignalR Core (`wss://livetiming.formula1.com/signalrcore`)
+con token de suscripción F1TV — el mismo que usa FastF1 (se lee de su archivo
+`f1auth.json`; el capturador ofrece el login por navegador). Sin token se
+intenta sin autenticación, que puede entregar datos parciales según la sesión.
 
-Solo hay datos cuando una sesión oficial está en curso; fuera de sesión
-la conexión queda a la espera. El stream crudo se graba en
-%LOCALAPPDATA%/f1telem/recordings para análisis posterior.
+Se decodifica CarData.z / Position.z (zlib+base64), la distancia se integra
+de la velocidad y la vuelta sale de TimingData. Cada frame recibido se graba
+en un archivo de captura (una línea JSON por mensaje, en el mismo formato de
+sobre que entiende `CaptureSource` para re-reproducirlo).
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import datetime as dt
 import json
+import logging
+import os
 import re
+import threading
 import time
-import urllib.parse
 import zlib
 
 from .. import config
 from ..models import DriverInfo, Sample
 from .base import BaseSource
 
-BASE_URL = "https://livetiming.formula1.com/signalr"
+NEGOTIATE_URL = "https://livetiming.formula1.com/signalrcore/negotiate"
+WSS_URL = "wss://livetiming.formula1.com/signalrcore"
 FEEDS = [
     "Heartbeat",
     "CarData.z",
@@ -36,7 +39,6 @@ FEEDS = [
     "WeatherData",
     "LapCount",
 ]
-_CONNECTION_DATA = json.dumps([{"name": "Streaming"}])
 _UTC_RE = re.compile(r"(\.\d{1,6})\d*")
 
 
@@ -63,106 +65,24 @@ class _CarState:
         self.lap_start_dist = 0.0
 
 
-class LiveSource(BaseSource):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+class LiveDecoderMixin:
+    """Decodificación del stream de live timing a señales de BaseSource.
+
+    La usan LiveSource (red) y CaptureSource (archivo grabado). Las subclases
+    deben heredar también de BaseSource: el mixin emite sus señales.
+    """
+
+    def _init_decoder(self) -> None:
         self._states: dict[str, _CarState] = {}
         self._laps_done: dict[str, int] = {}
         self._t0: float | None = None
         self._last_rel_t = 0.0
+        self._drivers: dict[str, DriverInfo] = {}
         self._status_closed: list[tuple[float, float, str]] = []
         self._status_open: tuple[float, str] | None = None
         self._weather_log: list[tuple] = []
-        self._drivers: dict[str, DriverInfo] = {}
-        self._recorder = None
-
-    @property
-    def session_key(self) -> str:
-        return f"live-{dt.date.today().isoformat()}"
-
-    def run(self) -> None:
-        try:
-            rec_dir = config.recordings_dir()
-            rec_dir.mkdir(parents=True, exist_ok=True)
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            self._recorder = open(rec_dir / f"live_{stamp}.jsonl", "a", encoding="utf-8")
-        except OSError:
-            self._recorder = None
-        try:
-            asyncio.run(self._main())
-        finally:
-            if self._recorder:
-                self._recorder.close()
-
-    async def _main(self) -> None:
-        attempts = 0
-        while self._running:
-            try:
-                await self._connect_once()
-                attempts = 0
-            except Exception as exc:
-                attempts += 1
-                if not self._running:
-                    break
-                if attempts >= 5:
-                    self.failed.emit(f"Could not connect to F1 Live Timing: {exc}")
-                    return
-                self.statusChanged.emit(
-                    f"Connection dropped ({exc}); retry {attempts}/5 in 5 s..."
-                )
-                await asyncio.sleep(5)
-
-    async def _connect_once(self) -> None:
-        import aiohttp
-
-        self.statusChanged.emit("Negotiating connection with F1 Live Timing...")
-        headers = {"User-Agent": "BestHTTP", "Accept-Encoding": "gzip,identity"}
-        timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=90)
-        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as http:
-            params = {"connectionData": _CONNECTION_DATA, "clientProtocol": "1.5"}
-            async with http.get(f"{BASE_URL}/negotiate", params=params) as resp:
-                resp.raise_for_status()
-                nego = await resp.json(content_type=None)
-            token = nego["ConnectionToken"]
-
-            ws_url = (
-                BASE_URL.replace("https://", "wss://")
-                + "/connect?transport=webSockets&clientProtocol=1.5"
-                + f"&connectionToken={urllib.parse.quote(token)}"
-                + f"&connectionData={urllib.parse.quote(_CONNECTION_DATA)}"
-            )
-            async with http.ws_connect(ws_url, heartbeat=30) as ws:
-                await ws.send_json({"H": "Streaming", "M": "Subscribe", "A": [FEEDS], "I": 1})
-                self.statusChanged.emit(
-                    "Connected to F1 Live Timing. Waiting for data "
-                    "(it only flows during an official session)..."
-                )
-                while self._running:
-                    try:
-                        msg = await ws.receive(timeout=1.0)
-                    except asyncio.TimeoutError:
-                        continue
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        self._record(msg.data)
-                        try:
-                            self._handle(json.loads(msg.data))
-                        except Exception:
-                            pass  # un mensaje malformado no debe tirar la conexión
-                    elif msg.type in (
-                        aiohttp.WSMsgType.CLOSED,
-                        aiohttp.WSMsgType.CLOSE,
-                        aiohttp.WSMsgType.ERROR,
-                    ):
-                        raise ConnectionError("websocket cerrado por el servidor")
 
     # ------------------------------------------------------------- protocolo
-
-    def _record(self, raw: str) -> None:
-        if self._recorder and raw and raw != "{}":
-            try:
-                self._recorder.write(raw + "\n")
-            except OSError:
-                self._recorder = None
 
     def _handle(self, msg: dict) -> None:
         # respuesta al Subscribe: snapshot inicial de todos los feeds
@@ -198,22 +118,6 @@ class LiveSource(BaseSource):
         elif name == "WeatherData":
             self._on_weather(data)
 
-    def _on_weather(self, data) -> None:
-        if not isinstance(data, dict):
-            return
-        try:
-            entry = (
-                self._last_rel_t,
-                float(data.get("AirTemp", 0) or 0),
-                float(data.get("TrackTemp", 0) or 0),
-                float(data.get("WindSpeed", 0) or 0),
-                str(data.get("Rainfall", "0")) == "1",
-            )
-        except (ValueError, TypeError):
-            return
-        self._weather_log.append(entry)
-        self.weather.emit(list(self._weather_log))
-
     def _on_track_status(self, data) -> None:
         """Banderas/SC: cierra el período abierto y abre uno nuevo si aplica."""
         if not isinstance(data, dict):
@@ -230,6 +134,22 @@ class LiveSource(BaseSource):
         if self._status_open is not None:
             periods.append((self._status_open[0], float("inf"), self._status_open[1]))
         self.trackStatus.emit(periods)
+
+    def _on_weather(self, data) -> None:
+        if not isinstance(data, dict):
+            return
+        try:
+            entry = (
+                self._last_rel_t,
+                float(data.get("AirTemp", 0) or 0),
+                float(data.get("TrackTemp", 0) or 0),
+                float(data.get("WindSpeed", 0) or 0),
+                str(data.get("Rainfall", "0")) == "1",
+            )
+        except (ValueError, TypeError):
+            return
+        self._weather_log.append(entry)
+        self.weather.emit(list(self._weather_log))
 
     def _on_session_info(self, data) -> None:
         if not isinstance(data, dict):
@@ -331,3 +251,145 @@ class LiveSource(BaseSource):
                 )
         if batch:
             self.batch.emit(batch)
+
+
+class LiveSource(LiveDecoderMixin, BaseSource):
+    def __init__(self, record_path: str | None = None, parent=None):
+        super().__init__(parent)
+        self._init_decoder()
+        self.record_path = record_path
+        self._recorder = None
+        self._rec_lock = threading.Lock()
+        self._connected = False
+        self._conn = None
+
+    @property
+    def session_key(self) -> str:
+        return f"live-{dt.date.today().isoformat()}"
+
+    @staticmethod
+    def stored_token() -> str | None:
+        """Token de suscripción F1TV guardado por FastF1 (si existe)."""
+        try:
+            from fastf1.internals.f1auth import AUTH_DATA_FILE
+
+            token = AUTH_DATA_FILE.read_text().strip()
+            return token or None
+        except Exception:
+            return None
+
+    def run(self) -> None:
+        try:
+            rec_dir = config.recordings_dir()
+            rec_dir.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = self.record_path or str(rec_dir / f"live_{stamp}.jsonl")
+            # line-buffered: el visualizador puede seguir el archivo en vivo
+            self._recorder = open(path, "a", buffering=1, encoding="utf-8")
+            self.statusChanged.emit(f"Capturing to {os.path.basename(path)}")
+        except OSError:
+            self._recorder = None
+        try:
+            self._run_client()
+        except Exception as exc:
+            if self._running:
+                self.failed.emit(f"Could not connect to F1 Live Timing: {exc}")
+        finally:
+            if self._conn is not None:
+                try:
+                    self._conn.stop()
+                except Exception:
+                    pass
+            if self._recorder is not None:
+                self._recorder.close()
+
+    # ------------------------------------------------------- SignalR Core
+
+    def _run_client(self) -> None:
+        import requests
+        from signalrcore.hub_connection_builder import HubConnectionBuilder
+
+        token = self.stored_token()
+        if token is None:
+            self.statusChanged.emit(
+                "No F1TV token found — connecting unauthenticated (data may be "
+                "partial); sign in from the Capture window."
+            )
+        headers: dict[str, str] = {}
+        self.statusChanged.emit("Negotiating connection with F1 Live Timing...")
+        resp = requests.options(NEGOTIATE_URL, headers=headers, timeout=20)
+        cookie = resp.cookies.get("AWSALBCORS")
+        if cookie:
+            headers["Cookie"] = f"AWSALBCORS={cookie}"
+        options = {"verify_ssl": True, "headers": headers}
+        if token:
+            options["access_token_factory"] = lambda: token
+        conn = (
+            HubConnectionBuilder()
+            .with_url(WSS_URL, options=options)
+            .configure_logging(logging.WARNING)
+            .with_automatic_reconnect({
+                "type": "raw",
+                "keep_alive_interval": 10,
+                "reconnect_interval": 5,
+                "max_attempts": 100000,
+            })
+            .build()
+        )
+        conn.on_open(self._on_ws_open)
+        conn.on_close(lambda: (
+            self.statusChanged.emit("Connection closed; reconnecting...")
+            if self._running else None
+        ))
+        conn.on("feed", self._on_ws_feed)
+        self._conn = conn
+        conn.start()
+        started = time.monotonic()
+        while self._running and not self._connected:
+            time.sleep(0.1)
+            if time.monotonic() - started > 30:
+                raise ConnectionError("timed out opening the websocket")
+        while self._running:
+            time.sleep(0.2)
+
+    def _on_ws_open(self) -> None:
+        self._connected = True
+        try:
+            self._conn.send("Subscribe", [FEEDS], on_invocation=self._on_ws_snapshot)
+        except Exception:
+            return
+        self.statusChanged.emit(
+            "Connected to F1 Live Timing. Waiting for data "
+            "(it only flows during an official session)..."
+        )
+
+    def _on_ws_snapshot(self, msg) -> None:
+        result = getattr(msg, "result", None)
+        if not isinstance(result, dict):
+            return
+        self._record_line({"R": result})
+        for topic, data in result.items():
+            try:
+                self._feed(topic, data)
+            except Exception:
+                pass
+
+    def _on_ws_feed(self, msg) -> None:
+        if not isinstance(msg, list) or len(msg) < 2:
+            return
+        topic, data = msg[0], msg[1]
+        stamp = msg[2] if len(msg) > 2 else ""
+        self._record_line({"M": [{"H": "Streaming", "M": "feed", "A": [topic, data, stamp]}]})
+        try:
+            self._feed(topic, data)
+        except Exception:
+            pass  # un mensaje malformado no debe tirar la conexión
+
+    def _record_line(self, obj) -> None:
+        if self._recorder is None:
+            return
+        try:
+            with self._rec_lock:
+                self._recorder.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        except OSError:
+            self._recorder = None

@@ -33,13 +33,34 @@ delta trace and per-sector/microsector delta cards updating in real time:
 - **Replay (Fast-F1 historical)** — replays any real session (2018 onwards) as
   if it were live, with a speed multiplier (x1 to x25). The first load of a
   session downloads data (may take a few minutes); it is cached afterwards.
-- **Live (F1 Live Timing)** — built-in SignalR client for
-  `livetiming.formula1.com`. It decodes `CarData.z` (speed, RPM, gear,
-  throttle, brake, DRS at ~4 Hz per car) and `Position.z`, integrates speed to
-  obtain distance and takes lap numbers from `TimingData`. **Data only flows
-  while an official session is running** (practice, qualifying or race); the
-  public feed also runs ~30 s behind TV. The raw stream is recorded to
+- **Live (F1 Live Timing)** — SignalR Core client for
+  `livetiming.formula1.com/signalrcore`. It decodes `CarData.z` (speed, RPM,
+  gear, throttle, brake, DRS at ~4 Hz per car) and `Position.z`, integrates
+  speed to obtain distance and takes lap numbers from `TimingData`. **Data
+  only flows while an official session is running**, and the full stream
+  requires an **F1TV subscription token** (the same one Fast-F1 uses; sign in
+  from the capture window). Every message is recorded to
   `%LOCALAPPDATA%\f1telem\recordings\`.
+- **Capture (recorded live)** — follows a capture file written by the
+  **capturer** with minimal delay (new lines are decoded as soon as they hit
+  the disk, ~50 ms). The timeline lets you seek back anywhere in the session
+  while the capture keeps growing, and the red **LIVE** button jumps back to
+  the latest data.
+
+## Capturer
+
+A companion app that ONLY captures the live stream to a file, so the
+visualizer (this app, even multiple instances) can follow it live or rewind
+without touching the network connection:
+
+```powershell
+F1LiveTelemetry.exe --capture     # or: python -m f1telem --capture
+```
+
+It shows the output file, connection status and data counters, and offers
+**Sign in with F1TV…** (browser flow, token shared with Fast-F1). Then open
+the main app and pick the *Capture (recorded live)* source: it automatically
+follows the most recent capture file.
 
 ## Features
 

@@ -8,12 +8,16 @@ def _selftest() -> int:
     """Verifica que todas las dependencias diferidas estén disponibles
     (útil para validar el build congelado): F1Telem.exe --selftest"""
     try:
-        import aiohttp  # noqa: F401
         import fastf1  # noqa: F401
         import psycopg  # noqa: F401
         import pyqtgraph  # noqa: F401
+        import requests  # noqa: F401
+        import signalrcore  # noqa: F401
 
-        from .sources import DemoSource, LiveSource, ReplaySource  # noqa: F401
+        from .capture_app import CaptureWindow  # noqa: F401
+        from .sources import (  # noqa: F401
+            CaptureSource, DemoSource, LiveSource, ReplaySource,
+        )
         from .storage import PgWriter  # noqa: F401
         return 0
     except Exception:
@@ -26,6 +30,10 @@ def _selftest() -> int:
 def main() -> int:
     if "--selftest" in sys.argv:
         return _selftest()
+    if "--capture" in sys.argv:
+        from .capture_app import main as capture_main
+
+        return capture_main()
 
     from PySide6.QtWidgets import QApplication
 

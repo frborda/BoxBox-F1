@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 from .. import config
 from ..hub import DataHub
 from ..models import CHANNELS, CHANNEL_ORDER
-from ..sources import BaseSource, DemoSource, LiveSource, ReplaySource
+from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplaySource
 from ..storage import PgWriter
 from . import theme
 from .charts import RollingChart, WrapChart
@@ -249,7 +249,10 @@ class MainWindow(QMainWindow):
         src_box = QGroupBox("Data source")
         src_lay = QVBoxLayout(src_box)
         self.source_combo = QComboBox()
-        self.source_combo.addItems(["Demo (synthetic)", "Replay (FastF1 historical)", "Live (F1 Live Timing)"])
+        self.source_combo.addItems([
+            "Demo (synthetic)", "Replay (FastF1 historical)",
+            "Live (F1 Live Timing)", "Capture (recorded live)",
+        ])
         src_lay.addWidget(self.source_combo)
 
         rep = self.cfg["replay"]
@@ -386,6 +389,11 @@ class MainWindow(QMainWindow):
         self.pause_btn.setFixedWidth(30)
         self.pause_btn.setToolTip("Pause / resume playback")
         seek_lay.addWidget(self.pause_btn)
+        self.live_btn = QPushButton("LIVE")
+        self.live_btn.setFixedWidth(48)
+        self.live_btn.setToolTip("Jump to the latest captured data")
+        self.live_btn.setVisible(False)
+        seek_lay.addWidget(self.live_btn)
         seek_lay.addWidget(QLabel("Time:"))
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 1000)
@@ -432,6 +440,7 @@ class MainWindow(QMainWindow):
         self.window_combo.currentIndexChanged.connect(self._window_changed)
         self.seek_slider.sliderReleased.connect(self._seek_released)
         self.pause_btn.toggled.connect(self._pause_toggled)
+        self.live_btn.clicked.connect(self._go_live)
         self.speed_combo.currentIndexChanged.connect(self._speed_changed)
         self.tower_check.toggled.connect(self._tower_toggled)
         if self.peaks_check.isChecked():
@@ -465,8 +474,20 @@ class MainWindow(QMainWindow):
                 session=self.session_combo.currentText(),
                 speed=speed,
             )
-        else:
+        elif kind == 2:
             source = LiveSource()
+        else:
+            # Capture: seguir el archivo más reciente grabado por el capturador
+            captures = sorted(config.recordings_dir().glob("*.jsonl"),
+                              key=lambda p: p.stat().st_mtime)
+            if not captures:
+                QMessageBox.warning(
+                    self, "F1 Live Telemetry",
+                    "No capture files found.\nRun the capturer first: "
+                    "F1LiveTelemetry.exe --capture",
+                )
+                return
+            source = CaptureSource(captures[-1], speed=speed)
 
         self.hub.reset()
         for chart in self.charts:
@@ -489,13 +510,17 @@ class MainWindow(QMainWindow):
         self.lap_ruler.set_status([])
         self.pause_btn.setChecked(False)
         self.tower.clear_data()
-        if isinstance(source, ReplaySource):
+        if isinstance(source, (ReplaySource, CaptureSource)):
             source.progress.connect(self._on_progress)
             source.seekReset.connect(self._on_seek_reset)
             source.lapMarks.connect(self.lap_ruler.set_marks)
             self.seek_row.setVisible(True)
         else:
             self.seek_row.setVisible(False)
+        self.live_btn.setVisible(isinstance(source, CaptureSource))
+        if isinstance(source, CaptureSource):
+            source.liveChanged.connect(self._on_live_changed)
+            self._on_live_changed(True)
         source.driversDiscovered.connect(self.hub.on_drivers)
         source.trackLength.connect(self.hub.on_track_length)
         source.trackOutline.connect(self.hub.on_outline)
@@ -520,6 +545,7 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Connect")
         self.source_combo.setEnabled(True)
         self.seek_row.setVisible(False)
+        self.live_btn.setVisible(False)
         self._on_source_status("Disconnected. Received data remains available.")
 
     def _on_source_finished(self) -> None:
@@ -531,6 +557,7 @@ class MainWindow(QMainWindow):
             self.connect_btn.setText("Connect")
             self.source_combo.setEnabled(True)
             self.seek_row.setVisible(False)
+            self.live_btn.setVisible(False)
 
     # ------------------------------------------------- línea de tiempo
 
@@ -540,8 +567,18 @@ class MainWindow(QMainWindow):
         return f"{int(seconds // 60)}:{int(seconds % 60):02d}"
 
     def _seek_to_time(self, t: float) -> None:
-        if isinstance(self.source, ReplaySource):
+        if isinstance(self.source, (ReplaySource, CaptureSource)):
             self.source.request_seek(t)
+
+    def _go_live(self) -> None:
+        if isinstance(self.source, CaptureSource):
+            self.pause_btn.setChecked(False)
+            self.source.go_live()
+
+    def _on_live_changed(self, on: bool) -> None:
+        self.live_btn.setStyleSheet(
+            "background: #e10600; color: white; font-weight: bold;" if on else ""
+        )
 
     def _on_chart_hover(self, dist) -> None:
         """Hover en un gráfico -> anillo en el punto de pista del mapa."""
@@ -592,7 +629,7 @@ class MainWindow(QMainWindow):
         self.time_label.setText(f"{self._fmt_mmss(t - t0)} / {self._fmt_mmss(t1 - t0)}")
 
     def _seek_released(self) -> None:
-        if self._progress is None or not isinstance(self.source, ReplaySource):
+        if self._progress is None or not isinstance(self.source, (ReplaySource, CaptureSource)):
             return
         t0, _t, t1 = self._progress
         self.source.request_seek(t0 + self.seek_slider.value() / 1000.0 * (t1 - t0))

@@ -173,6 +173,94 @@ def test_gap_grid_offset() -> None:
           f"gap 0 con autos igualados en pista (max {float(np.nanmax(np.abs(yc))):.3f} s)")
 
 
+def _zpack(obj) -> str:
+    raw = json.dumps(obj).encode()
+    comp = zlib.compress(raw)[2:-4]  # deflate crudo sin cabecera zlib
+    return base64.b64encode(comp).decode()
+
+
+def test_capture_source() -> None:
+    """Capturador + fuente Capture: archivo sintético seguido en vivo (cola
+    con delay mínimo), salto hacia atrás y vuelta al LIVE."""
+    import tempfile
+    from f1telem.hub import DataHub
+    from f1telem.sources.capture import CaptureSource
+
+    def frame(k: int) -> str:
+        utc = f"2026-07-06T14:00:{0:02d}.0000000Z".replace(":00.", f":00.")
+        # Utc creciente: base + k segundos
+        mm, ss = divmod(k, 60)
+        utc = f"2026-07-06T14:{mm:02d}:{ss:02d}.0000000Z"
+        data = _zpack({"Entries": [{
+            "Utc": utc,
+            "Cars": {"1": {"Channels": {"0": 11000, "2": 250 + (k % 7), "3": 7,
+                                        "4": 99, "5": 0, "45": 12}}},
+        }]})
+        return json.dumps({"M": [{"H": "Streaming", "M": "feed",
+                                  "A": ["CarData.z", data, ""]}]})
+
+    path = Path(tempfile.mkdtemp()) / "capture_test.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"R": {
+            "DriverList": {"1": {"RacingNumber": "1", "Tla": "VER",
+                                 "FullName": "Max Verstappen",
+                                 "TeamName": "Red Bull", "TeamColour": "3671C6"}},
+            "TimingData": {"Lines": {"1": {"NumberOfLaps": 0}}},
+        }}) + "\n")
+        for k in range(60):
+            if k and k % 20 == 0:  # cruce de meta cada 20 s
+                f.write(json.dumps({"M": [{"H": "Streaming", "M": "feed",
+                                           "A": ["TimingData",
+                                                 {"Lines": {"1": {"NumberOfLaps": k // 20}}},
+                                                 ""]}]}) + "\n")
+            f.write(frame(k) + "\n")
+
+    hub = DataHub()
+    resets = [0]
+    src = CaptureSource(path, speed=25.0)
+    src.batch.connect(hub.on_batch, Qt.DirectConnection)
+    src.driversDiscovered.connect(hub.on_drivers, Qt.DirectConnection)
+    src.seekReset.connect(lambda: (resets.__setitem__(0, resets[0] + 1),
+                                   hub.clear_samples()), Qt.DirectConnection)
+    src.start()
+
+    def wait_for(cond, timeout: float) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return False
+
+    check(wait_for(lambda: hub.total_samples >= 60, 10.0),
+          f"capture: archivo completo leído ({hub.total_samples} muestras)")
+    check(src.live_mode, "capture: arranca en modo LIVE")
+    check("VER" in [d.code for d in hub.drivers.values()], "capture: snapshot decodificado")
+
+    # cola en vivo: agregar frames y medir el delay de llegada
+    t_write = time.monotonic()
+    with open(path, "a", encoding="utf-8") as f:
+        for k in range(60, 65):
+            f.write(frame(k) + "\n")
+    arrived = wait_for(lambda: hub.total_samples >= 65, 3.0)
+    delay = time.monotonic() - t_write
+    check(arrived and delay < 1.0, f"capture: cola en vivo con delay mínimo ({delay * 1000:.0f} ms)")
+
+    # salto hacia atrás
+    src.request_seek(20.0)
+    check(wait_for(lambda: resets[0] == 1 and not src.live_mode
+                   and 15.0 <= hub.latest_t <= 26.0, 5.0),
+          f"capture: seek atrás reconstruye hasta el punto (t={hub.latest_t:.0f})")
+
+    # volver al vivo
+    src.go_live()
+    check(wait_for(lambda: src.live_mode and hub.latest_t >= 64.0, 5.0),
+          f"capture: LIVE vuelve al último dato (t={hub.latest_t:.0f})")
+
+    src.stop()
+    src.wait(5000)
+
+
 def test_catch_projection() -> None:
     """Proyección de alcance con datos exactos: B (50,5 m/s) persigue a A
     (50 m/s) desde 300 m => rate ~0,99 s/vuelta, alcance en ~2 vueltas."""
@@ -752,6 +840,7 @@ def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     apply_theme(app)
     test_live_decoder()
+    test_capture_source()
     test_gap_grid_offset()
     test_catch_projection()
     test_app_demo(app)
