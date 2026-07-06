@@ -11,6 +11,7 @@ if (-not (Test-Path $python)) {
 
 & $python -m PyInstaller --noconfirm --clean (Join-Path $root "f1telem.spec")
 if ($LASTEXITCODE -eq 0) {
+    Copy-Item (Join-Path $root "capture.ps1") (Join-Path $root "dist\F1LiveTelemetry\") -Force
     Write-Host ""
     Write-Host "Done: $(Join-Path $root 'dist\F1LiveTelemetry\F1LiveTelemetry.exe')"
 }
