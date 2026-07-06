@@ -26,6 +26,9 @@ class _AuthWorker(QObject):
     """Login F1TV por navegador (flujo de FastF1) sin bloquear la GUI."""
 
     done = Signal(str)
+    progress = Signal(str)
+
+    TIMEOUT_S = 900  # the F1 login (password/2FA) can take a while
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="f1tv-auth").start()
@@ -41,8 +44,14 @@ class _AuthWorker(QObject):
             port = httpd.server_port
             server = threading.Thread(target=httpd.serve_forever, daemon=True)
             server.start()
-            webbrowser.open(f"https://f1login.fastf1.dev?port={port}")
-            ok = f1auth._auth_finished.wait(timeout=300)
+            url = f"https://f1login.fastf1.dev?port={port}"
+            self.progress.emit(
+                f"Waiting for browser sign-in (up to {self.TIMEOUT_S // 60}"
+                f" min) — keep this window open.\nIf the browser did not"
+                f" open, go to: {url}"
+            )
+            webbrowser.open(url)
+            ok = f1auth._auth_finished.wait(timeout=self.TIMEOUT_S)
             httpd.shutdown()
             token = f1auth._subscription_token if ok else None
             if token:
@@ -101,6 +110,7 @@ class CaptureWindow(QWidget):
 
         self._auth = _AuthWorker()
         self._auth.done.connect(self._on_auth_done)
+        self._auth.progress.connect(self.status_label.setText)
         self._update_token_label()
 
         self._timer = QTimer(self)
