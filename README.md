@@ -5,6 +5,8 @@ brake, RPM, gear) for one or several cars at once, with **distance on the X
 axis** and one series per driver. Built with
 [Fast-F1](https://github.com/theOehrly/Fast-F1), PySide6 and pyqtgraph.
 
+![F1 Live Telemetry — Quali comparison mode replaying a race, with timing tower and track map](docs/screenshot.png)
+
 ## Modes
 
 | Mode | Behaviour |
