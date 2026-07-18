@@ -15,6 +15,7 @@ import zlib
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("F1TELEM_NO_UPDATE_CHECK", "1")  # sin red hacia GitHub
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 # la consola Windows (cp1252) no soporta Δ, →, −: degradar en vez de crashear
 sys.stdout.reconfigure(errors="replace")
@@ -419,9 +420,17 @@ def test_app_demo(app: QApplication) -> None:
     check(gx is not None and len(gx) > 50 and bool(np.isfinite(gy).all()),
           f"Gap: serie con datos finitos ({0 if gx is None else len(gx)})")
     check(abs(float(gy[-1])) < 120, f"Gap: magnitud razonable ({float(gy[-1]):+.2f} s)")
+    # las tablas se refrescan a 2 Hz: esperar a que el resumen se pueble
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if (tv.summary_table.rowCount() == len(sel)
+                and tv.summary_table.item(0, 2) is not None):
+            break
+        pump(app, 0.3)
+    cell = tv.summary_table.item(0, 2)
     check(tv.summary_table.rowCount() == len(sel)
-          and ":" in tv.summary_table.item(0, 2).text(),
-          f"Resumen: tiempos de vuelta poblados ({tv.summary_table.item(0, 2).text()})")
+          and cell is not None and ":" in cell.text(),
+          f"Resumen: tiempos de vuelta poblados ({'—' if cell is None else cell.text()})")
     tvref = tv.ref_combo.currentData() or sel[0]
     tv._update_laps_table()  # las pestañas no visibles se actualizan al verlas
     tv._update_micro(tvref)

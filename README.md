@@ -142,7 +142,27 @@ python -m venv .venv
 ```
 
 Produces `dist\F1LiveTelemetry\F1LiveTelemetry.exe` (self-contained folder,
-no Python required).
+no Python required) and `dist\F1LiveTelemetry-win64.zip`, ready to upload as
+the GitHub release asset.
+
+## Automatic updates
+
+Both the visualizer and the capturer check the
+[latest GitHub release](https://github.com/frborda/F1-Live-Telemetry/releases)
+shortly after startup, and on demand via the **vX.Y.Z** button in the status
+bar (bottom-right corner of each window). When a newer version exists, a
+dialog shows its release notes and offers **Download and install**: the zip
+is downloaded to `%LOCALAPPDATA%\f1telem\updates`, verified against the
+sha256 digest published by GitHub, and an unattended script swaps the
+install folder once every running instance closes, then relaunches the app —
+with automatic rollback if the copy fails (see `update.log` in that folder).
+**Skip this version** silences that release; the startup check can be turned
+off from the same dialog (`updates.check_on_startup` in `config.json`).
+Running from source only opens the releases page.
+
+Publishing a release: bump `__version__` in `src/f1telem/__init__.py`, run
+`.\build.ps1`, create a GitHub release tagged `vX.Y.Z` and upload
+`dist\F1LiveTelemetry-win64.zip` (keep that asset name).
 
 ## Tests
 
@@ -150,6 +170,7 @@ no Python required).
 $env:QT_QPA_PLATFORM = "offscreen"
 .venv\Scripts\python tests\smoke.py         # full app with the demo source + live decoder
 .venv\Scripts\python tests\replay_check.py  # real Fast-F1 integration (downloads data)
+.venv\Scripts\python tests\updater_check.py # updater: versions, zip layout, install script
 ```
 
 ## Technical notes

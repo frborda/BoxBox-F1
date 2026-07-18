@@ -39,6 +39,10 @@ DEFAULTS = {
         "show_tower": True,          # torre de tiempos visible
         "show_peaks": False,         # valores en texto sobre picos máx/mín
     },
+    "updates": {
+        "check_on_startup": True,    # buscar nuevas versiones al abrir
+        "skip_version": "",          # versión que el usuario eligió omitir
+    },
 }
 
 

@@ -1,6 +1,8 @@
 """Ventana principal: fuentes, selección de pilotos, modos y estado."""
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPixmap, QPolygonF, QIcon
 from PySide6.QtWidgets import (
@@ -10,7 +12,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .. import config
+from .. import __version__, config
 from ..hub import DataHub
 from ..models import CHANNELS, CHANNEL_ORDER
 from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplaySource
@@ -20,6 +22,7 @@ from .qualy_view import QualyView
 from .timing_view import TimingView, fmt_laptime
 from .tower import TimingTower
 from .track_map import TrackMapView
+from .update_dialog import run_check
 
 MODES = [
     ("Race (rolling window)", 0),
@@ -201,6 +204,12 @@ class MainWindow(QMainWindow):
         self._laps_timer.timeout.connect(self._refresh_ref_laps)
         self._laps_timer.start()
 
+        if (bool(self.cfg.get("updates", {}).get("check_on_startup", True))
+                and not os.environ.get("F1TELEM_NO_UPDATE_CHECK")):
+            QTimer.singleShot(
+                3000, lambda: run_check(self, self.cfg, silent=True)
+            )
+
     # ------------------------------------------------------------------- UI
 
     def _build_ui(self) -> None:
@@ -371,6 +380,11 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status_label, 1)
         self.meta_label = QLabel("")
         self.statusBar().addPermanentWidget(self.meta_label)
+        self.version_btn = QPushButton(f"v{__version__}")
+        self.version_btn.setFlat(True)
+        self.version_btn.setCursor(Qt.PointingHandCursor)
+        self.version_btn.setToolTip("Check for updates")
+        self.statusBar().addPermanentWidget(self.version_btn)
 
     def _wire(self) -> None:
         self.connect_btn.clicked.connect(self._toggle_connection)
@@ -408,6 +422,9 @@ class MainWindow(QMainWindow):
         self._load_schedule()
         self.source_combo.currentIndexChanged.connect(self._source_kind_changed)
         self._source_kind_changed(self.source_combo.currentIndex())
+        self.version_btn.clicked.connect(
+            lambda: run_check(self, self.cfg, silent=False)
+        )
 
     def _source_kind_changed(self, kind: int) -> None:
         """Year/GP/Session solo aplican a Replay; Speed no aplica a Live."""

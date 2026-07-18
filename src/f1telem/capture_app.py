@@ -7,6 +7,7 @@ una suscripción F1TV activa; sin token se intenta sin autenticación.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import webbrowser
@@ -17,9 +18,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import config
+from . import __version__, config
 from .sources.live import LiveSource
 from .ui import theme
+from .ui.update_dialog import run_check
 
 
 class _AuthWorker(QObject):
@@ -84,6 +86,7 @@ class CaptureWindow(QWidget):
         super().__init__()
         self.setWindowTitle("F1 Live Telemetry — Capture")
         self.setMinimumWidth(460)
+        self.cfg = config.load_config()
         self.source: LiveSource | None = None
         self.path = ""
         self._samples = 0
@@ -116,6 +119,13 @@ class CaptureWindow(QWidget):
         buttons.addWidget(self.toggle_btn)
         buttons.addWidget(self.auth_btn)
         buttons.addStretch(1)
+        self.version_btn = QPushButton(f"v{__version__}")
+        self.version_btn.setFlat(True)
+        self.version_btn.setToolTip("Check for updates")
+        self.version_btn.clicked.connect(
+            lambda: run_check(self, self.cfg, silent=False)
+        )
+        buttons.addWidget(self.version_btn)
         lay.addLayout(buttons)
         hint = QLabel(
             "Open the main app and pick the \"Capture (recorded live)\" source\n"
@@ -134,6 +144,12 @@ class CaptureWindow(QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
         self._start()
+
+        if (bool(self.cfg.get("updates", {}).get("check_on_startup", True))
+                and not os.environ.get("F1TELEM_NO_UPDATE_CHECK")):
+            QTimer.singleShot(
+                3000, lambda: run_check(self, self.cfg, silent=True)
+            )
 
     # ------------------------------------------------------------------
 

@@ -4,3 +4,4 @@ numpy>=1.26
 pandas>=2.1
 fastf1>=3.4
 aiohttp>=3.9
+requests>=2.31
