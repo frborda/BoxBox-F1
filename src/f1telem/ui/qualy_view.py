@@ -15,9 +15,10 @@ import math
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+    QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMessageBox,
+    QPushButton, QVBoxLayout, QWidget,
 )
 
 from ..hub import DataHub
@@ -158,6 +159,25 @@ class QualyView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        # selector de la vuelta objetivo (vive acá: cada ventana con sus
+        # propios controles)
+        ref_row = QHBoxLayout()
+        ref_row.setContentsMargins(4, 2, 4, 0)
+        ref_row.addWidget(QLabel("Target:"))
+        self.ref_driver_combo = QComboBox()
+        ref_row.addWidget(self.ref_driver_combo)
+        self.ref_lap_combo = QComboBox()
+        self.ref_lap_combo.setMinimumWidth(150)
+        ref_row.addWidget(self.ref_lap_combo)
+        self.ref_set_btn = QPushButton("Set")
+        self.ref_set_btn.clicked.connect(self._set_reference_clicked)
+        ref_row.addWidget(self.ref_set_btn)
+        self.ref_clear_btn = QPushButton("Clear")
+        self.ref_clear_btn.clicked.connect(lambda: self.set_reference(None))
+        ref_row.addWidget(self.ref_clear_btn)
+        ref_row.addStretch(1)
+        layout.addLayout(ref_row)
+
         self.chart = QualyChart(hub)
         layout.addWidget(self.chart, stretch=5)
 
@@ -194,6 +214,63 @@ class QualyView(QWidget):
         layout.addWidget(self.more_note)
 
         hub.driversChanged.connect(self._restyle)
+        hub.driversChanged.connect(self._rebuild_ref_drivers)
+        self.ref_driver_combo.currentIndexChanged.connect(self._refresh_ref_laps)
+        self._laps_timer = QTimer(self)
+        self._laps_timer.setInterval(2000)
+        self._laps_timer.timeout.connect(self._refresh_ref_laps)
+        self._laps_timer.start()
+
+    # ------------------------------------------------- vuelta objetivo
+
+    def _rebuild_ref_drivers(self) -> None:
+        current = self.ref_driver_combo.currentData()
+        self.ref_driver_combo.blockSignals(True)
+        self.ref_driver_combo.clear()
+        for info in sorted(self.hub.drivers.values(),
+                           key=lambda d: d.label.upper()):
+            self.ref_driver_combo.addItem(info.label, info.number)
+        if current is not None:
+            idx = self.ref_driver_combo.findData(current)
+            if idx >= 0:
+                self.ref_driver_combo.setCurrentIndex(idx)
+        self.ref_driver_combo.blockSignals(False)
+        self._refresh_ref_laps()
+
+    def _refresh_ref_laps(self) -> None:
+        if not self.isVisible():
+            return
+        drv = self.ref_driver_combo.currentData()
+        if drv is None:
+            return
+        buf = self.hub.buffers.get(drv)
+        laps = buf.completed_laps() if buf else []
+        if laps == [self.ref_lap_combo.itemData(i)
+                    for i in range(self.ref_lap_combo.count())]:
+            return
+        current = self.ref_lap_combo.currentData()
+        self.ref_lap_combo.blockSignals(True)
+        self.ref_lap_combo.clear()
+        for lap in laps:
+            lap_time = self.analyzer.lap_time(drv, lap)
+            self.ref_lap_combo.addItem(
+                f"Lap {lap} — {fmt_laptime(lap_time)}", lap)
+        if current is not None:
+            idx = self.ref_lap_combo.findData(current)
+            if idx >= 0:
+                self.ref_lap_combo.setCurrentIndex(idx)
+        self.ref_lap_combo.blockSignals(False)
+
+    def _set_reference_clicked(self) -> None:
+        drv = self.ref_driver_combo.currentData()
+        lap = self.ref_lap_combo.currentData()
+        if drv is None or lap is None:
+            QMessageBox.information(
+                self, "F1 Live Telemetry",
+                "That driver has no completed laps to use as target yet.",
+            )
+            return
+        self.set_reference(drv, int(lap))
 
     # ------------------------------------------------- interfaz de "chart"
 

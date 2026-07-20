@@ -17,9 +17,25 @@ delta trace and per-sector/microsector delta cards updating in real time:
 
 ![Quali comparison mode against a target lap](docs/screenshot-quali.png)
 
-## Modes
+## All-windows model
 
-| Mode | Behaviour |
+The visualizer is a compact **control hub** plus independent windows. The
+hub only manages the data input (source, Connect, timeline), the driver
+selection, the **window catalog** (every view listed with a one-line
+description and an open/close toggle), the **window profiles**
+(save/apply/delete complete arrangements — e.g. "Race 3 monitors", "Quali
+compact"; three factory presets are seeded on first run) and general
+settings. Everything else — every chart, the tower, the map, each context
+panel — lives in **its own window**: freely placed on any monitor, pinnable
+(frameless, always on top) over a broadcast, and each chart carries **its
+own controls** (channel, X window), so two Race windows can show different
+channels at the same time. Closing a window just hides it; its position,
+size and pin are remembered and the whole arrangement is restored on the
+next start.
+
+## Views
+
+| Window | Behaviour |
 |------|-----------|
 | **Race** | Sliding window configurable in laps (½ to 20 or the whole session; default 1), plus free space on the right so the latest values and each series' label stay visible. The X axis is the **track position** ((lap − 1) × lap length + lap meter), so the same corner falls on the same vertical for every car: braking points line up even when a car runs behind. |
 | **Race 2** | Fixed X axis from 0 to the last meter of the lap. Each series overwrites ("eats") its own previous-lap line as it advances, with a visible gap ahead of each car's cursor. |
@@ -155,26 +171,18 @@ follows the most recent capture file.
 
 ## Features
 
-- **Detachable panels**: every panel — timing tower, track map, Times/Gap
-  tables, Quali delta cards, each mode's central view (Race, Race 2, Quali,
-  Times/Gap, Race trace), session strip, race control, tyre strategy,
-  weather, data source, driver selection, Mode box and the
-  timeline — has a small title bar with a ⧉ button that pops it out into
-  **its own window**, freely movable and resizable, plus a 📌 **pin**
-  button that makes the floating window frameless, always-on-top and
-  immovable (ideal over a broadcast), and a ⇱ button to dock it back where
-  it was (a floating central view leaves a dock-back placeholder in its
-  mode). The **Panels…** button chooses which panels are visible — the
-  choice is global and independent of the active mode, so **any
-  combination of panels** can be assembled; floating panels stay open
-  across modes and keep refreshing (e.g. the timing tables while watching
-  the Race chart). The whole layout is **persistent**: window geometry,
-  splitters and each panel's docked/floating state, position, size and
-  pinned flag are reapplied exactly as they were on the next start.
-- **Layout profiles**: Panels… → *Layout profiles* saves the complete current
-  arrangement (visible panels, floating windows with position/size/pin,
-  splitters and window geometry) under a name — e.g. "Race 3 monitors",
-  "Quali compact" — and reapplies it with one click.
+- **One window per view** (see *All-windows model* above): every view opens
+  from the hub's catalog into its own window with a 📌 **pin** button
+  (frameless, always-on-top, immovable — ideal over a broadcast). Any
+  combination can be assembled across monitors; every open window keeps
+  refreshing. The arrangement is **persistent** — geometry, pin and open
+  state are reapplied exactly on the next start. The Times/Gap tables and
+  the Quali cards can additionally be popped out of their parent window
+  with their own ⧉ button.
+- **Window profiles**: the hub saves the complete current arrangement
+  (which windows are open, where, sizes, pins) under a name and reapplies
+  it with one click; factory presets **Race / Quali / Strategy** are
+  created on first run.
 - **Session strip** (banner above the charts, detachable like everything
   else): meeting/session name, live **track-status badge**
   (clear/yellow/SC/VSC/red), **LAP n/total** (races) and the **session clock**
@@ -189,6 +197,24 @@ follows the most recent capture file.
   lap. The tower also shows each car's **current compound and tyre age**
   next to the driver code. Live data comes from `TimingAppData`; replay uses
   Fast-F1 laps.
+- **Lap wheel**: a circular lap view — north is the start/finish line,
+  south is half distance, and each car sits at its lap-fraction angle in
+  real time (smoothed). The ring is split into the three sectors (official
+  boundaries once derived) and carries every numbered corner as a tick.
+  Pick a driver in **Pit sim** and a dashed **PIT ghost** marks where they
+  would drop if they pitted now — using the Pit strategy window value —
+  with the projected position and margin in the header.
+- **Pit strategy panel (Ventana de Box)**: the real cost of a pit stop is
+  not the pit-lane time — braking in and accelerating out also lose time.
+  The app measures a **box window on track** (from 2 microsectors before
+  the pit entry to 2 after the pit exit) and compares a pitting car's
+  crossing (stop **normalized to a standard 3 s**) against the clean
+  reference: the average of the **last 3 clean laps (track clear, no
+  pitting) of the race's top 5**. The value auto-updates as stops happen,
+  and can be **edited manually with a lock** so the automatic estimate
+  never overwrites it. Below it, a live **rejoin projection** per driver:
+  if they pit now (3 s stop), the predicted position and the car/margin
+  they would come out behind.
 - **Pit lane panel**: who is in the pit lane **right now**, the compound
   they entered on, and two live clocks — total time in the lane and time
   stationary (speed 0, from telemetry). The tower also shows each driver's
@@ -209,6 +235,15 @@ follows the most recent capture file.
   during races or the minutes since the session start otherwise.
 - **Tower font size**: A− / A+ buttons in the tower header scale its font
   and row heights (persisted).
+- **Capturer status in the hub**: a live line under the Connect button —
+  not running / running idle / capturing / importing, with the write rate
+  in MB/min — so you always know what the capturer is doing.
+- **Overlay opacity**: pinned windows gain an opacity slider (55–100%) in
+  their title bar — a semi-transparent tower or session strip over the
+  broadcast; per-window and persisted.
+- **Timeline previews**: hovering the lap ruler or dragging the scrubber
+  shows "L14 · 32:05 · SAFETY CAR" before releasing, and clicking inside a
+  flag/SC band jumps straight to the start of that incident.
 - **Pause and hot speed change** (demo/replay): the ⏸ button next to the
   timeline pauses/resumes, and the speed selector can be changed at any
   moment without reconnecting.
@@ -219,9 +254,9 @@ follows the most recent capture file.
   mark jumps straight to that lap. Pit stops show as diamonds (driver color),
   flag/SC periods as colored bands and rain as a thin blue stripe. The
   timeline stays active after the replay ends so you can seek back.
-- **Timing tower** (right panel, above the map): broadcast-style rows —
-  position and driver code on the team color, positions gained/lost, DRS
-  status, gear/RPM/speed, **LAST/BEST pills** (purple = session best,
+- **Timing tower**: broadcast-style rows —
+  position and driver code on the team color, positions gained/lost, tyre,
+  speed, **LAST/BEST pills** (purple = session best,
   green = personal best), interval to the car ahead and gap to the leader
   (or "+nL" when lapped), plus the **mini-sector dashes** with the sector
   times below (official feed segments when live; computed against personal
@@ -287,8 +322,10 @@ python -m venv .venv
 2. Check the drivers you want to chart — the list is alphabetical and has a
    **Select all** (teammates share the team color and are distinguished by
    line style).
-3. Switch mode and channel at will; in **Quali**, pick the target driver and
-   lap (each lap shows its time) and press **Set**.
+3. Open the windows you need from the hub's catalog (or apply a profile);
+   each chart window carries its own channel / X-window selectors. In
+   **Quali comparison**, pick the target driver and lap in the window's own
+   toolbar and press **Set**.
 
 ## Windows executable
 

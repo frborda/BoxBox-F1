@@ -250,6 +250,76 @@ center2 = NotificationCenter(hub3, ncfg)
 center2.check()
 check(center2.log == [], "notif: centro nuevo sobre estado viejo no notifica")
 
+# ------------------------------------- Ventana de Box (pit window) y rejoin
+
+from f1telem.timing import TimingAnalyzer  # noqa: E402
+from f1telem.ui.pit_strategy import (  # noqa: E402
+    PitWindowEstimator, clean_at, project_rejoin,
+)
+
+hub4 = DataHub()
+hub4.on_track_length(5000.0)
+DT, V = 0.5, 50.0  # paso 0.5 s · 50 m/s -> vuelta de 100 s
+
+
+def synth_car(num: str, lead: float, pit: bool):
+    """4+ vueltas a ritmo constante; el que para se detiene 5 s en el metro
+    4990 de la vuelta 3. Devuelve (samples, t_in, t_out) con la visita
+    medida al pasar por 4950 (entrada) y 50 de la vuelta 4 (salida)."""
+    rows, t, pos, stopped = [], 0.0, float(lead), 0.0
+    t_in = t_out = None
+    while t < 420.0:
+        lap = int(pos // 5000) + 1
+        dist = pos - (lap - 1) * 5000.0
+        in_stop = pit and lap == 3 and dist >= 4990.0 and stopped < 5.0
+        speed = 0.0 if in_stop else 180.0
+        rows.append(Sample(driver=num, t=t, lap=lap, dist_lap=dist,
+                           dist_total=pos, speed=speed, throttle=80.0,
+                           brake=0.0, rpm=9000.0, gear=6, drs=0))
+        if pit and t_in is None and lap == 3 and dist >= 4950.0:
+            t_in = t
+        if pit and t_out is None and lap == 4 and dist >= 50.0:
+            t_out = t
+        t += DT
+        if in_stop:
+            stopped += DT
+        else:
+            pos += V * DT
+    return rows, t_in, t_out
+
+batch4 = []
+for i, num in enumerate(("1", "2", "3", "4", "5")):
+    rows, _ti, _to = synth_car(num, 100.0 - 20.0 * i, pit=False)
+    batch4.extend(rows)
+rows9, t_in9, t_out9 = synth_car("9", -20.0, pit=True)
+batch4.extend(rows9)
+batch4.sort(key=lambda s: s.t)
+hub4.on_batch(batch4)
+hub4.on_pit_lane({"9": [[3, t_in9, t_out9]]})
+
+est4 = PitWindowEstimator(hub4, TimingAnalyzer(hub4))
+bounds = est4.window_bounds()
+check(bounds is not None and abs(bounds[0] - 4375.0) < 1.0
+      and abs(bounds[1] - 1250.0) < 1.0,
+      f"ventana de box: 2 µsectores antes/después del pit ({bounds})")
+ref4 = est4.reference(*bounds)
+check(ref4 is not None and abs(ref4[0] - 25.0) < 0.3 and ref4[1] == 15,
+      f"ventana de box: referencia de 3 vueltas limpias del top 5 ({ref4})")
+est_val = est4.estimate()
+check(est_val is not None and 2.4 <= est_val[0] <= 3.6 and est_val[1] == 1,
+      f"ventana de box: pérdida con detención normalizada a 3 s ({est_val})")
+
+hub4.on_track_status([(100.0, 150.0, "4")])
+check(clean_at(hub4, 60.0, 99.0) and not clean_at(hub4, 140.0, 160.0),
+      "ventana de box: detección de tramo limpio")
+
+proj = project_rejoin({"1": 0.0, "2": 2.0, "3": 10.0}, "1", 5.0)
+check(proj is not None and proj[0] == 2 and proj[1] == ("2", 3.0)
+      and proj[2] == ("3", 5.0),
+      f"rejoin: posición y márgenes proyectados ({proj})")
+check(project_rejoin({"1": None, "2": 0.0}, "1", 5.0) is None,
+      "rejoin: sin gap (doblado) no proyecta")
+
 # --------------------------------------------- captura real (si existe)
 
 rec_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "f1telem", "recordings")

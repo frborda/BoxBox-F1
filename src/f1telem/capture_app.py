@@ -15,10 +15,11 @@ import time
 import urllib.parse
 import webbrowser
 
-from PySide6.QtCore import QTimer, Signal, QObject
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal, QObject
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPushButton, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from . import __version__, config
@@ -30,6 +31,25 @@ from .ui.update_dialog import run_check
 # archivo de trabajo ÚNICO de la reproducción importada: se sobrescribe en
 # cada importación y se borra al salir — reproducir no acumula archivos
 IMPORT_PLAYBACK_NAME = "import_live.jsonl"
+
+
+def _tray_icon() -> QIcon:
+    """Ícono de la bandeja: círculo rojo F1 con la C de capture."""
+    pix = QPixmap(32, 32)
+    pix.fill(Qt.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setBrush(QColor("#e10600"))
+    p.setPen(Qt.NoPen)
+    p.drawEllipse(2, 2, 28, 28)
+    p.setPen(QColor("#ffffff"))
+    font = p.font()
+    font.setBold(True)
+    font.setPointSize(12)
+    p.setFont(font)
+    p.drawText(pix.rect(), Qt.AlignCenter, "C")
+    p.end()
+    return QIcon(pix)
 
 
 def _pna_handler(base):
@@ -196,7 +216,7 @@ class CaptureWindow(QWidget):
         lay.addWidget(box)
 
         buttons = QHBoxLayout()
-        self.toggle_btn = QPushButton("Stop capture")
+        self.toggle_btn = QPushButton("Start live capture")
         self.toggle_btn.clicked.connect(self._toggle)
         self.auth_btn = QPushButton("Sign in with F1TV…")
         self.auth_btn.clicked.connect(self._sign_in)
@@ -248,7 +268,29 @@ class CaptureWindow(QWidget):
         self._timer.setInterval(500)
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
-        self._start()
+        # arranque INACTIVO a propósito: conectar al vivo recién cuando el
+        # usuario lo pide evita crear un archivo de captura fantasma (solo
+        # heartbeats) al que el visualizador se engancharía por error
+        self.status_label.setText(
+            "Idle — press Start live capture, or Import capture… to replay "
+            "a recording as live.")
+
+        # bandeja del sistema: minimizar o cerrar solo esconde la ventana
+        # (la captura sigue); salir de verdad es clic derecho -> Exit
+        self._really_quit = False
+        self._tray: QSystemTrayIcon | None = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = QSystemTrayIcon(_tray_icon(), self)
+            self._tray.setToolTip("F1 Telemetry Capture")
+            tray_menu = QMenu()
+            show_action = tray_menu.addAction("Show capturer")
+            show_action.triggered.connect(self._show_from_tray)
+            tray_menu.addSeparator()
+            quit_action = tray_menu.addAction("Exit")
+            quit_action.triggered.connect(self._quit)
+            self._tray.setContextMenu(tray_menu)
+            self._tray.activated.connect(self._on_tray_activated)
+            self._tray.show()
 
         if (bool(self.cfg.get("updates", {}).get("check_on_startup", True))
                 and not os.environ.get("F1TELEM_NO_UPDATE_CHECK")):
@@ -300,7 +342,7 @@ class CaptureWindow(QWidget):
         source.driversDiscovered.connect(self._on_drivers)
         self.source = source
         source.start()
-        self.toggle_btn.setText("Stop capture")
+        self.toggle_btn.setText("Stop live capture")
 
     def _stop(self) -> None:
         if self.source is not None:
@@ -309,15 +351,16 @@ class CaptureWindow(QWidget):
             source.wait(8000)
             source.deleteLater()
         self.status_label.setText("Stopped.")
-        self.toggle_btn.setText("Start capture")
+        self.toggle_btn.setText("Start live capture")
 
     def _toggle(self) -> None:
         if self._import_mode:
+            # frenar la importación deja el capturador inactivo (el vivo se
+            # arranca a mano, nunca solo)
             self._stop()
             self._import_mode = False
             self.import_btn.setEnabled(True)
             self._cleanup_playback_file()
-            self._start()  # volver a captura en vivo
             return
         if self.source is not None:
             self._stop()
@@ -379,16 +422,35 @@ class CaptureWindow(QWidget):
         player.progress.connect(self._on_import_progress)
         player.failed.connect(self.status_label.setText)
         player.statusChanged.connect(self.status_label.setText)
+        player.finished.connect(self._on_import_finished)
         self.source = player
         self._import_mode = True
         self.import_btn.setEnabled(False)
-        self.toggle_btn.setText("Back to live capture")
+        self.toggle_btn.setText("Stop import")
         player.start()
 
     def _on_import_progress(self, t0: float, t_now: float, t_end: float) -> None:
         self.counter_label.setText(
             f"import: {self._fmt_mmss(t_now)} / {self._fmt_mmss(t_end)}"
         )
+
+    def _on_import_finished(self) -> None:
+        """La reproducción terminó sola: liberar la UI (volver a inactivo)
+        sin borrar el archivo de trabajo — el visualizador puede seguir
+        navegando lo reproducido hasta que se importe otra cosa."""
+        if not self._import_mode:
+            return  # ya la frenó el usuario con Stop import
+        if self.source is not None and not self.source.isFinished():
+            return  # finished espurio (no debería pasar)
+        if self.source is not None:
+            self.source.deleteLater()
+            self.source = None
+        self._import_mode = False
+        self.import_btn.setEnabled(True)
+        self.toggle_btn.setText("Start live capture")
+        self.status_label.setText(
+            "Import finished — the recording stays available in the main "
+            "app. Import another capture or start a live capture.")
 
     def _sign_in(self) -> None:
         self.auth_btn.setEnabled(False)
@@ -414,6 +476,15 @@ class CaptureWindow(QWidget):
             f"samples: {self._samples:,} · positions: {self._positions:,}"
             f" · drivers: {self._drivers}"
         )
+        # el visualizador puede pedir que la ventana (escondida en la
+        # bandeja) se muestre: aparece al frente y se consume el pedido
+        show_req = config.capture_show_path()
+        if show_req.exists():
+            try:
+                show_req.unlink()
+            except OSError:
+                pass
+            self._show_from_tray()
         # otro proceso pudo guardar el token (enlace f1telemetry:// del
         # navegador): reflejarlo sin reiniciar
         self._refresh_n += 1
@@ -435,7 +506,39 @@ class CaptureWindow(QWidget):
         except OSError:
             pass
 
+    # -------------------------------------------------- bandeja del sistema
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit(self) -> None:
+        self._really_quit = True
+        self.close()
+
+    def changeEvent(self, event) -> None:
+        # minimizar -> esconder a la bandeja (la captura sigue corriendo)
+        if (event.type() == QEvent.WindowStateChange and self.isMinimized()
+                and self._tray is not None):
+            QTimer.singleShot(0, self.hide)
+        super().changeEvent(event)
+
     def closeEvent(self, event) -> None:
+        if self._tray is not None and not self._really_quit:
+            # la X solo esconde a la bandeja; salir es clic derecho -> Exit
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(
+                "F1 Telemetry Capture",
+                "Still running in the tray. Right-click the icon and choose "
+                "Exit to quit.")
+            return
         self._stop()
         if self._import_mode:
             self._cleanup_playback_file()
@@ -443,6 +546,8 @@ class CaptureWindow(QWidget):
             config.capture_lock_path().unlink(missing_ok=True)
         except OSError:
             pass
+        if self._tray is not None:
+            self._tray.hide()
         super().closeEvent(event)
 
 

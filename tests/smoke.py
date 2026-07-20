@@ -17,6 +17,12 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("F1TELEM_NO_UPDATE_CHECK", "1")  # sin red hacia GitHub
 os.environ.setdefault("F1TELEM_DEV_SOURCES", "1")      # fuente demo en el combo
+os.environ.setdefault("F1TELEM_NO_SCHEDULE", "1")      # sin calendario (red lenta)
+# sandbox: el smoke NUNCA debe leer ni escribir la config/los datos reales
+import tempfile  # noqa: E402
+
+os.environ["APPDATA"] = tempfile.mkdtemp(prefix="f1smoke_app_")
+os.environ["LOCALAPPDATA"] = tempfile.mkdtemp(prefix="f1smoke_local_")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 # la consola Windows (cp1252) no soporta Δ, →, −: degradar en vez de crashear
 sys.stdout.reconfigure(errors="replace")
@@ -25,7 +31,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from f1telem.sources.live import LiveSource, decompress_feed
-from f1telem.ui.main_window import MainWindow
+from f1telem.ui.main_window import LapRuler, MainWindow
 from f1telem.ui.theme import apply_theme
 
 FAILURES: list[str] = []
@@ -301,6 +307,23 @@ def test_app_demo(app: QApplication) -> None:
     # sin popups durante el smoke: el log del gestor alcanza para verificar
     win.cfg.setdefault("notifications", {})["popups"] = False
     win.show()
+    pump(app, 0.3)
+
+    # modelo todo-ventanas: arranque limpio (solo el hub, ninguna ventana)
+    open_now = sorted(pid for pid, p in win._panels.items()
+                      if getattr(p, "window_only", False) and p.is_panel_visible())
+    check(open_now == [], f"arranque limpio: sin ventanas abiertas ({open_now})")
+    check(len(win._catalog_checks) == len(win.PANEL_CATALOG)
+          and all(win._catalog_checks[p].isChecked() == win._panels[p].is_panel_visible()
+                  for p in win._catalog_checks),
+          "catálogo del hub refleja el estado de cada ventana")
+    # abrir el set de trabajo desde el catálogo (botones conmutables)
+    for pid in ("race_chart", "tower", "map", "session"):
+        win._catalog_checks[pid].setChecked(True)
+    pump(app, 0.3)
+    check(all(win._panels[p].is_panel_visible()
+              for p in ("race_chart", "tower", "map", "session")),
+          "catálogo abre las ventanas elegidas")
 
     # conectar fuente demo a x25
     win.source_combo.setCurrentIndex(win.source_combo.findData("demo"))
@@ -317,8 +340,7 @@ def test_app_demo(app: QApplication) -> None:
     pump(app, 6.0)
     check(win.hub.total_samples > 500, f"llegan muestras ({win.hub.total_samples})")
 
-    # modo Carrera (rolling)
-    win.mode_combo.setCurrentIndex(0)
+    # ventana Race chart (abierta por defecto)
     pump(app, 1.0)
     curve = next(iter(win.chart_rolling.curves.values()))
     x, y = curve.getData()
@@ -344,9 +366,11 @@ def test_app_demo(app: QApplication) -> None:
     r = float(np.corrcoef(np.interp(grid, xa, ya), np.interp(grid, xb, yb))[0, 1])
     check(r > 0.9, f"Carrera: perfiles alineados en X entre autos (r={r:.3f})")
 
-    # modo Carrera 2 (wrap)
-    win.mode_combo.setCurrentIndex(1)
+    # ventana Race 2 (wrap): se abre desde el catálogo del hub
+    win._catalog_checks["race2_chart"].setChecked(True)
     pump(app, 4.0)
+    check(win._panels["race2_chart"].is_panel_visible(),
+          "catálogo abre la ventana Race 2")
     curve = next(iter(win.chart_wrap.curves.values()))
     x, y = curve.getData()
     filled = 0 if y is None else int(np.isfinite(y).sum())
@@ -364,21 +388,27 @@ def test_app_demo(app: QApplication) -> None:
     laps = win.hub.buffers[first].completed_laps()
     check(bool(laps), f"hay vueltas cerradas para referencia ({laps})")
 
-    # modo Qualy con referencia
-    win.mode_combo.setCurrentIndex(2)
+    # ventana Qualy con referencia (el selector vive dentro de la vista)
+    win._catalog_checks["quali_view"].setChecked(True)
     pump(app, 0.5)
-    win.ref_driver_combo.setCurrentIndex(win.ref_driver_combo.findData(first))
-    win._refresh_ref_laps()
-    check(win.ref_lap_combo.count() > 0, "combo de vueltas de referencia poblado")
-    ref_text = win.ref_lap_combo.itemText(0)
+    qv = win.chart_qualy
+    qv.ref_driver_combo.setCurrentIndex(qv.ref_driver_combo.findData(first))
+    qv._refresh_ref_laps()
+    check(qv.ref_lap_combo.count() > 0, "combo de vueltas de referencia poblado")
+    ref_text = qv.ref_lap_combo.itemText(0)
     check(ref_text.startswith("Lap") and ":" in ref_text,
           f"referencia muestra tiempo de vuelta ({ref_text!r})")
-    win.ref_set_btn.click()
+    qv.ref_set_btn.click()
     pump(app, 1.0)
-    qv = win.chart_qualy
     rx, ry = qv.chart._ref_curve.getData()
     check(rx is not None and len(rx) > 50, f"Qualy: target dibujada ({0 if rx is None else len(rx)})")
+    # recién cruzada la meta la vuelta en curso puede estar vacía unos ms
+    # (cursor de reproducción): esperar a que aparezca
+    deadline = time.monotonic() + 8
     lx, ly = qv.chart.curves[first].getData()
+    while time.monotonic() < deadline and (lx is None or len(lx) == 0):
+        pump(app, 0.3)
+        lx, ly = qv.chart.curves[first].getData()
     check(lx is not None and len(lx) > 0, "Qualy: vuelta actual en vivo dibujada")
     check(qv.caption.text().startswith("Target:") and ":" in qv.caption.text(),
           f"Qualy: caption con la target ({qv.caption.text()[:40]!r})")
@@ -413,8 +443,8 @@ def test_app_demo(app: QApplication) -> None:
           f"Qualy: microsectores poblados sin scroll ({card.micro_filled})")
     check("S:" in qv.caption.text(), "Qualy: caption con sectores de la target")
 
-    # modo Tiempos / Gap
-    win.mode_combo.setCurrentIndex(3)
+    # ventana Tiempos / Gap
+    win._catalog_checks["times_gap"].setChecked(True)
     pump(app, 1.5)
     tv = win.chart_timing
     ref = tv.ref_combo.currentData()
@@ -480,18 +510,20 @@ def test_app_demo(app: QApplication) -> None:
     check(any(t.endswith("(ref)") for t in legend_texts),
           f"leyenda marca la referencia ({legend_texts})")
 
-    # ventana X configurable (en vueltas) del gráfico de gap — combo global
+    # ventana X configurable (en vueltas) del gap — combo propio de la vista
     L = win.hub.track_length
-    check(win.window_combo.isEnabled(), "combo de ventana habilitado en Tiempos/Gap")
-    win.window_combo.setCurrentIndex(win.window_combo.findData(1.0))
+    win.gap_window_combo.setCurrentIndex(win.gap_window_combo.findData(1.0))
     pump(app, 0.5)
     xr = tv.plot.getViewBox().viewRange()[0]
     width = xr[1] - xr[0]
     check(abs(width - L) < L * 0.02, f"Gap: ventana X de 1 vuelta aplicada ({width:.0f} m)")
     gx2, _ = tv.curves[other].getData()
-    # el borde suavizado extrapola un poco entre lotes (mucho a x25)
-    check(abs(xr[1] - float(gx2[-1])) < 900.0, "Gap: la ventana termina en la posición actual")
-    win.window_combo.setCurrentIndex(win.window_combo.findData(0.0))
+    # el borde suavizado extrapola entre lotes (mucho a x25, y con todas las
+    # ventanas abiertas el recálculo escalonado agrega hasta ~1 s de datos)
+    check(abs(xr[1] - float(gx2[-1])) < 1800.0,
+          f"Gap: la ventana termina en la posición actual "
+          f"(borde a {abs(xr[1] - float(gx2[-1])):.0f} m)")
+    win.gap_window_combo.setCurrentIndex(win.gap_window_combo.findData(0.0))
     pump(app, 0.5)
     xr = tv.plot.getViewBox().viewRange()[0]
     check(xr[1] - xr[0] > L * 1.5, f"Gap: 'Todo' vuelve al rango completo ({xr[1] - xr[0]:.0f} m)")
@@ -549,8 +581,8 @@ def test_app_demo(app: QApplication) -> None:
           f"torre: AVG5/AVG10 ({a5:.3f}, {a10:.3f})")
     check(all(len(r.segs) == 3 and len(r.sectors) == 3 for r in rows),
           "torre: rayitas y sectores por fila")
-    check(rows[0].gear > 0 and rows[0].speed > 0 and rows[0].rpm > 0,
-          f"torre: telemetría en fila (G{rows[0].gear} · {rows[0].speed:.0f} km/h)")
+    check(rows[0].speed > 0 and not hasattr(rows[0], "gear"),
+          f"torre: velocidad sin gear/rpm/drs ({rows[0].speed:.0f} km/h)")
     check(any(k > 0 for r in rows for g in r.segs for k in g),
           "torre: microsectores calculados con estado")
     check(win.tower.lap_label.text().startswith("LAP"),
@@ -605,16 +637,13 @@ def test_app_demo(app: QApplication) -> None:
     check(win._selected_gp() == "Saudi Arabian Grand Prix",
           f"evento elegido del calendario ({win._selected_gp()})")
     win.gp_combo.setEditText("Bahrain")
-    check(win.right_split.orientation() == Qt.Vertical
-          and win.right_split.widget(0) is win.tower_panel
-          and win.right_split.widget(1) is win.map_panel
-          and win.tower_panel.content is win.tower
-          and win.map_panel.content is win.track_map,
-          "mapa del circuito debajo de la torre (paneles desacoplables)")
+    check(win._panels["tower"].window_only
+          and win._panels["tower"].content is win.tower
+          and win._panels["map"].content is win.track_map,
+          "torre y mapa en ventanas propias (todo-ventanas)")
 
     # tooltip crosshair: valores de todas las series en el punto del mouse
     from PySide6.QtCore import QPointF
-    win.mode_combo.setCurrentIndex(0)
     pump(app, 0.5)
     vb = win.chart_rolling.getViewBox()
     (x0, x1), (y0, y1) = vb.viewRange()
@@ -625,7 +654,6 @@ def test_app_demo(app: QApplication) -> None:
     codes = {r[0] for r in probe.rows}
     check("VER" in codes or "NOR" in codes, f"tooltip identifica pilotos ({codes})")
     probe._on_move(vb.mapViewToScene(QPointF(x1 + (x1 - x0), y1)))  # fuera de rango de datos
-    win.mode_combo.setCurrentIndex(3)
     pump(app, 0.5)
     vbg = tv.plot.getViewBox()
     (gx0, gx1), (gy0, gy1) = vbg.viewRange()
@@ -634,7 +662,6 @@ def test_app_demo(app: QApplication) -> None:
           f"tooltip Gap: {len(tv._probe.rows)} series en el punto")
 
     # doble click sobre una línea la oculta; en zona vacía las restaura
-    win.mode_combo.setCurrentIndex(0)
     pump(app, 0.5)
     # sin pump entre medio: la vista deslizante queda congelada para el test
     target = sel[1]
@@ -707,83 +734,66 @@ def test_app_demo(app: QApplication) -> None:
     got_x, got_y = win.hub.positions[drv0].x[-1], win.hub.positions[drv0].y[-1]
     dpos = float(np.hypot(exp_x - got_x, exp_y - got_y))
     check(dpos < 60, f"mapa: posición coherente con la distancia graficada ({dpos:.1f} m)")
-    win.map_panel.set_panel_visible(False)
-    check(not mp.isVisible(), "mapa se oculta desde el menú de paneles")
-    win.map_panel.set_panel_visible(True)
+    map_panel = win._panels["map"]
+    map_panel.set_panel_visible(False)
+    check(not mp.isVisible(), "mapa se oculta desde el catálogo")
+    check(not win._catalog_checks["map"].isChecked(),
+          "checkbox del catálogo refleja el cierre")
+    map_panel.set_panel_visible(True)
     check(mp.isVisible(), "mapa se vuelve a mostrar")
     check(win.cfg["panels"]["visible"].get("map") is True,
-          "visibilidad de paneles persistida (global, independiente del modo)")
+          "visibilidad de ventanas persistida")
 
-    # desacoplar con el BOTÓN real (clicked(bool) no debe romper detach)
-    win.map_panel.float_btn.click()
-    pump(app, 0.3)
-    check(win.map_panel.floating and win.map_panel._win.isVisible(),
-          "botón ⧉ abre la ventana flotante de inmediato")
-    win.map_panel.attach()
+    # cerrar la ventana con la X solo la oculta (geometría conservada)
+    g_before = map_panel._win.geometry()
+    map_panel._win.close()
     pump(app, 0.2)
+    check(not map_panel.is_panel_visible() and map_panel._win is not None,
+          "cerrar la ventana la oculta sin destruirla")
+    win._catalog_checks["map"].setChecked(True)
+    pump(app, 0.2)
+    check(mp.isVisible() and map_panel._win.geometry() == g_before,
+          "reabrir desde el catálogo conserva la geometría")
 
-    # desacoplar / fijar / reacoplar paneles
-    win.tower_panel.detach()
-    pump(app, 0.3)
-    check(win.tower_panel.floating and win.tower.isVisible(),
-          "torre desacoplada en ventana propia")
-    check(not win.tower_panel.isVisible(), "el hueco de la torre se colapsa")
-    win.tower_panel._win.pin_btn.setChecked(True)
-    check(win.tower_panel.pinned, "panel flotante fijado (sin marco, encima)")
-    st = win.tower_panel.save_state()
+    # fijar (pin) una ventana y persistir su estado
+    tower_panel = win._panels["tower"]
+    tower_panel._win.pin_btn.setChecked(True)
+    check(tower_panel.pinned, "ventana fijada (sin marco, encima)")
+    st = tower_panel.save_state()
     check(st["floating"] and st["pinned"] and len(st["geom"]) == 4,
-          f"estado flotante persistible ({st})")
-    win.tower_panel.attach()
-    pump(app, 0.3)
-    check(not win.tower_panel.floating and win.tower.isVisible()
-          and win.right_split.widget(0) is win.tower_panel,
-          "torre reacoplada en su lugar")
+          f"estado de ventana persistible ({st})")
+    tower_panel._win.pin_btn.setChecked(False)
+
+    # subpanel interno: las tablas de Times/Gap flotadas aparte siguen
+    # refrescando aunque su ventana madre esté cerrada
     tp = win.chart_timing.tables_panel
     tp.detach()
     pump(app, 0.3)
     check(tp.floating and win.chart_timing.tabs.isVisible(),
           "tablas de Times/Gap flotantes")
-    win.mode_combo.setCurrentIndex(0)   # en otro modo siguen refrescando
+    win._catalog_checks["times_gap"].setChecked(False)
     pump(app, 1.2)
     check(win.chart_timing.summary_table.rowCount() > 0,
-          "tablas flotantes se refrescan fuera de su modo")
+          "tablas flotantes se refrescan con su ventana madre cerrada")
     tp.attach()
+    win._catalog_checks["times_gap"].setChecked(True)
     pump(app, 0.3)
-    check(not tp.floating, "tablas reacopladas")
-    rc = win.chart_panels[0]
-    rc.detach()
-    pump(app, 0.3)
-    check(rc.floating and win.chart_rolling.isVisible(),
-          "gráfico central desacoplado en ventana propia")
-    check(rc._placeholder is not None and not rc._placeholder.isHidden(),
-          "placeholder con botón de reacople en el centro")
-    win.mode_combo.setCurrentIndex(3)   # flotante sigue refrescando en otro modo
-    pump(app, 0.8)
-    x_rc, _ = win.chart_rolling.curves[sel[0]].getData() if hasattr(
-        win.chart_rolling, "curves") else (None, None)
-    check(rc.floating and win.chart_rolling.isVisible(),
-          "gráfico central flotante vivo en otro modo")
-    win.mode_combo.setCurrentIndex(0)
-    rc.attach()
-    pump(app, 0.3)
-    check(not rc.floating and win.chart_rolling.isVisible()
-          and win.stack.currentWidget() is rc,
-          "gráfico central reacoplado en su modo")
+    check(not tp.floating, "tablas reacopladas dentro de su ventana")
 
-    # paneles laterales y línea de tiempo también desacoplables
-    dp = win.drivers_panel
-    dp.detach()
-    pump(app, 0.3)
-    check(dp.floating and win.driver_list.isVisible(),
-          "selección de pilotos flotante en ventana propia")
-    dp.attach()
+    # el hub concentra fuente, catálogo y perfiles; Drivers y Timeline son
+    # ventanas destacadas (borde de acento), cerradas por defecto
+    check(win.source_combo.isVisible()
+          and len(win._catalog_checks) == len(win.PANEL_CATALOG)
+          and "border" in win._catalog_checks["drivers"].styleSheet()
+          and "border" in win._catalog_checks["timeline"].styleSheet(),
+          "hub: fuente + catálogo + perfiles; Drivers/Timeline destacados")
+    win._catalog_checks["drivers"].setChecked(True)
     pump(app, 0.2)
-    check(not dp.floating and win.driver_list.isVisible(),
-          "selección de pilotos reacoplada")
-    check(win.timeline_panel.content is win.seek_row
-          and win.source_panel.content.isVisible()
-          and win.mode_panel.content.isVisible(),
-          "fuente, modo y línea de tiempo envueltos como paneles")
+    check(win._panels["drivers"].is_panel_visible()
+          and win.driver_list.isVisible(),
+          "pilotos: ventana propia desde el catálogo")
+    win._catalog_checks["drivers"].setChecked(False)
+    pump(app, 0.2)
 
     # torre: tamaño de fuente A+/A−
     s0 = win.tower.scale
@@ -795,16 +805,18 @@ def test_app_demo(app: QApplication) -> None:
           "torre: escala persistida en config")
     win.tower._change_scale(-0.2)
 
-    # cambio de canal (volviendo al modo Carrera, que es el que se refresca)
-    win.channel_combo.setCurrentIndex(1)  # acelerador
-    win.mode_combo.setCurrentIndex(0)
+    # canal POR VISTA: cambiar el del Race no toca el de Race 2
+    win.race_channel_combo.setCurrentIndex(
+        win.race_channel_combo.findData("throttle"))
     pump(app, 1.5)
     x, y = win.chart_rolling.curves[first].getData()
     check(y is not None and float(max(y)) <= 105.0, "cambio de canal a acelerador aplicado")
+    check(win.chart_wrap.channel == "speed",
+          f"canal independiente por ventana (Race 2 sigue en {win.chart_wrap.channel})")
 
     # valores en picos (máx de rectas / mín de curvas)
-    win.channel_combo.setCurrentIndex(0)  # velocidad
-    win.mode_combo.setCurrentIndex(0)
+    win.race_channel_combo.setCurrentIndex(
+        win.race_channel_combo.findData("speed"))
     win.peaks_check.setChecked(True)
     pump(app, 0.5)
     visible_peaks = [p for p in win.chart_rolling._peak_pool if p.isVisible()]
@@ -822,11 +834,9 @@ def test_app_demo(app: QApplication) -> None:
     check(not any(p.isVisible() for p in win.chart_rolling._peak_pool),
           "toggle apaga los valores en picos")
 
-    # ventana X configurable del modo Carrera (por defecto 1 vuelta)
-    win.mode_combo.setCurrentIndex(0)
+    # ventana X configurable de la vista Race (por defecto 1 vuelta)
     pump(app, 0.3)
-    check(win.window_combo.isEnabled(), "combo de ventana habilitado en Carrera")
-    win.window_combo.setCurrentIndex(win.window_combo.findData(2.0))
+    win.race_window_combo.setCurrentIndex(win.race_window_combo.findData(2.0))
     pump(app, 0.5)
     xr = win.chart_rolling.getViewBox().viewRange()[0]
     expected = win.hub.track_length * 2.0 * (1 + win.chart_rolling.RIGHT_MARGIN_FRAC)
@@ -837,21 +847,22 @@ def test_app_demo(app: QApplication) -> None:
           f"Carrera: datos cubren la ventana ampliada "
           f"({0 if xy2 is None else float(xy2[0][-1] - xy2[0][0]):.0f} m)")
     cx2, _cy2 = win.chart_rolling.curves[first].getData()
-    check(float(cx2[-1] - cx2[0]) >= win.hub.track_length * 2.0 * 0.93,
+    # el cursor de reproducción va como mucho ~1 horizonte detrás del último
+    # dato (a x25 el horizonte en metros escala con la velocidad)
+    sm2 = win.chart_rolling._tip_sm.get(first)
+    horizon = (sm2._rate * max(2.0 * sm2._gap, 0.2)
+               if sm2 is not None and sm2._rate > 0 else 500.0)
+    allowed = max(500.0, horizon * 1.3)
+    check(float(cx2[-1] - cx2[0]) >= win.hub.track_length * 2.0 - allowed,
           f"Carrera: dibujado cubre la ventana menos el retardo de reproducción "
-          f"({float(cx2[-1] - cx2[0]):.0f} m)")
-    win.window_combo.setCurrentIndex(win.window_combo.findData(0.0))
+          f"({float(cx2[-1] - cx2[0]):.0f} m, tolerancia {allowed:.0f})")
+    win.race_window_combo.setCurrentIndex(win.race_window_combo.findData(0.0))
     pump(app, 1.0)
     xr = win.chart_rolling.getViewBox().viewRange()[0]
     check(xr[0] <= 1.0 and xr[1] - xr[0] > win.hub.track_length * 3,
           f"Carrera: 'Todo' muestra desde el inicio ({xr[0]:.0f}..{xr[1]:.0f} m)")
-    win.window_combo.setCurrentIndex(win.window_combo.findData(1.0))
+    win.race_window_combo.setCurrentIndex(win.race_window_combo.findData(1.0))
     pump(app, 0.3)
-    win.mode_combo.setCurrentIndex(1)
-    pump(app, 0.2)
-    check(not win.window_combo.isEnabled(), "combo de ventana deshabilitado en Carrera 2")
-    win.mode_combo.setCurrentIndex(0)
-    pump(app, 0.2)
 
     # seleccionar todos
     win.all_check.setChecked(True)
@@ -867,7 +878,6 @@ def test_app_demo(app: QApplication) -> None:
     check(not win.all_check.isChecked(), "checkbox refleja selección parcial")
 
     # correlación mouse gráfico <-> mapa
-    win.mode_combo.setCurrentIndex(0)
     pump(app, 0.5)
     vb0 = win.chart_rolling.getViewBox()
     (cx0, cx1), (cy0, cy1) = vb0.viewRange()
@@ -991,8 +1001,132 @@ def test_app_demo(app: QApplication) -> None:
     check(win.notifications_view.list.count() == len(win.notifier.log),
           f"notificaciones: panel refleja el log ({win.notifications_view.list.count()})")
 
+    # pit strategy: Ventana de Box editable con traba + proyección de rejoin
+    from f1telem.ui.pit_strategy import project_rejoin
+    win._panels["pit_strategy"].set_panel_visible(True)
+    pump(app, 0.2)
+    ps = win.pit_strategy_view
+    ps.lock_check.setChecked(True)
+    ps.window_spin.setValue(20.0)
+    ps.apply_auto(5.0, 2, 9)
+    check(abs(ps.window_spin.value() - 20.0) < 1e-9,
+          "ventana de box: la traba impide que el cálculo automático la pise")
+    ps.lock_check.setChecked(False)
+    ps.apply_auto(6.5, 2, 9)
+    check(abs(ps.window_spin.value() - 6.5) < 1e-9
+          and "6.5" in ps.auto_label.text(),
+          f"ventana de box: sin traba el automático aplica ({ps.auto_label.text()})")
+    ps.window_spin.setValue(20.0)
+    ps._last_table = 0.0
+    ps.refresh()
+    check(ps.table.rowCount() == 6,
+          f"undercut: una fila por auto ({ps.table.rowCount()})")
+    check(ps.table.item(0, 3) is not None
+          and ps.table.item(0, 3).text().startswith("P"),
+          f"undercut: posición proyectada ({ps.table.item(0, 3).text()!r})")
+    ordered_ps, gaps_ps = ps.current_gaps()
+    proj_big = project_rejoin(gaps_ps, ordered_ps[0], 999.0)
+    n_classif = sum(1 for g in gaps_ps.values() if g is not None)
+    check(proj_big is not None and proj_big[0] == n_classif,
+          f"undercut: ventana enorme manda al líder al fondo (P{proj_big[0]})")
+
+    # estado del capturador en el hub (sandbox: no hay capturador)
+    win._update_capturer_status()
+    check(win.capturer_status.text() == "Capturer: not running",
+          f"hub: estado del capturador ({win.capturer_status.text()})")
+
+    # opacidad de overlays fijados (persistida por ventana)
+    tower_win = win._panels["tower"]._win
+    tower_win.pin_btn.setChecked(True)
+    tower_win.opacity_slider.setValue(70)
+    check(abs(tower_win.windowOpacity() - 0.7) < 0.05,
+          "overlay: opacidad aplicada al fijar")
+    st_op = win._panels["tower"].save_state()
+    check(st_op.get("opacity") == 70, "overlay: opacidad persistida")
+    tower_win.pin_btn.setChecked(False)
+    check(abs(tower_win.windowOpacity() - 1.0) < 0.05,
+          "overlay: al des-fijar vuelve opaco")
+    tower_win.opacity_slider.setValue(100)
+
+    # regla de la línea de tiempo: preview y salto a incidentes
+    ruler = LapRuler(lambda t: None)
+    ruler.resize(400, 18)
+    ruler.set_range(0.0, 100.0)
+    ruler.set_marks([(1, 0.0), (2, 50.0)])
+    ruler.set_status([(60.0, 70.0, "4")])
+    hint = ruler.hint_at(65.0)
+    check("L2" in hint and "SAFETY" in hint,
+          f"regla: preview con vuelta y estado ({hint!r})")
+    check(ruler._target_for_click(65.0) == 60.0,
+          "regla: click en banda salta al inicio del incidente")
+    check(ruler._target_for_click(30.0) == 50.0,
+          "regla: click normal va a la vuelta más cercana")
+
+    # rueda de vuelta: ángulo por auto (norte = meta), sectores y fantasma
+    win._catalog_checks["lap_wheel"].setChecked(True)
+    pump(app, 0.6)
+    lw = win.lap_wheel
+    check(len(lw._dots) == 6, f"rueda: un punto por auto ({len(lw._dots)})")
+    L_w = win.hub.track_length
+    worst_deg = 0.0
+    for drv, (angle, _code, _color) in lw._dots.items():
+        real = float(win.hub.buffers[drv].col("dist_lap")[-1]) % L_w / L_w * 360.0
+        diff = abs((angle - real + 180.0) % 360.0 - 180.0)
+        worst_deg = max(worst_deg, diff)
+    check(worst_deg < 30.0,
+          f"rueda: ángulos coherentes con la posición real (peor {worst_deg:.1f}°)")
+    b1_deg, b2_deg = lw._sector_bounds_deg()
+    check(0.0 < b1_deg < b2_deg < 360.0,
+          f"rueda: límites de sector ({b1_deg:.0f}° / {b2_deg:.0f}°)")
+    check(len(win.hub.corners) == 8, "rueda: curvas disponibles para pintar")
+    lw.sim_combo.setCurrentIndex(lw.sim_combo.findData(first))
+    win.cfg.setdefault("strategy", {})["pit_window"] = 20.0
+    lw.refresh()
+    check(lw._ghost is not None and lw._ghost[0] == first,
+          "rueda: fantasma de parada para el piloto elegido")
+    car_angle = lw._dots[first][0]
+    ghost_angle = lw._ghost[1]
+    behind_deg = (car_angle - ghost_angle) % 360.0
+    check(10.0 < behind_deg < 200.0,
+          f"rueda: el fantasma cae detrás del auto ({behind_deg:.0f}°)")
+    check(lw.result_label.text().startswith(win.hub.drivers[first].code)
+          and "→ P" in lw.result_label.text(),
+          f"rueda: proyección de posición ({lw.result_label.text()!r})")
+    check(lw._ghost_sm is not None, "rueda: fantasma con motor de reproducción")
+    # anillo interno: un intervalo entre cada par de autos consecutivos
+    check(len(lw._intervals) == 5,
+          f"rueda: intervalos entre autos consecutivos ({len(lw._intervals)})")
+    check(all(secs > 0 for _b, _a, secs, _ba, _sp in lw._intervals),
+          "rueda: intervalos positivos (de atrás hacia adelante)")
+    _ordered_w, gaps_w = ps.current_gaps()
+    last_gap = gaps_w.get(_ordered_w[-1])
+    if last_gap is not None:
+        total_int = sum(secs for _b, _a, secs, _ba, _sp in lw._intervals)
+        check(abs(total_int - last_gap) < 0.6,
+              f"rueda: la suma de intervalos cierra con el gap total "
+              f"({total_int:.2f} vs {last_gap:.2f})")
+    for _b, _a, _secs, b_ang, span in lw._intervals:
+        check(0.0 <= b_ang < 360.0 and 0.0 <= span <= 360.0,
+              "rueda: geometría de arco válida")
+        break
+    check(lw._pit_arc is not None and 0.0 <= lw._pit_arc[0] < 360.0
+          and lw._pit_arc[1] > 0.0,
+          f"rueda: tramo de boxes dibujado ({lw._pit_arc})")
+    # amarillas por sector pintadas como arcos (igual que el mapa)
+    win.hub.on_sector_yellows([(0.0, float("inf"), 2600.0, 3200.0)])
+    arcs = lw._active_yellows_deg()
+    exp0 = 2600.0 / L_w * 360.0
+    exp1 = 3200.0 / L_w * 360.0
+    check(len(arcs) == 1 and abs(arcs[0][0] - exp0) < 1.0
+          and abs(arcs[0][1] - exp1) < 1.0,
+          f"rueda: arco amarillo del sector con bandera ({arcs})")
+    win.hub.on_sector_yellows([])
+    lw.sim_combo.setCurrentIndex(0)
+    win._catalog_checks["lap_wheel"].setChecked(False)
+    pump(app, 0.2)
+
     # race trace: gap por microsector contra referencia elegible
-    win.mode_combo.setCurrentIndex(4)
+    win._catalog_checks["race_trace"].setChecked(True)
     pump(app, 0.3)
     tc = win.chart_trace
     tc._dirty = True
@@ -1036,23 +1170,29 @@ def test_app_demo(app: QApplication) -> None:
     tc.x_spin.setValue(0)
     tc.y_spin.setValue(0.0)
     tc.ref_combo.setCurrentIndex(0)
-    win.mode_combo.setCurrentIndex(0)
+    win._catalog_checks["race_trace"].setChecked(False)
     pump(app, 0.2)
 
-    # perfiles de layout: aplicar restaura visibilidad, flotantes y divisores
+    # perfiles de ventanas: aplicar restaura el set completo con geometría
     win._panels["map"].set_panel_visible(False)
     win.cfg.setdefault("layouts", {})["smoke"] = {
-        "visible": {pid: True for pid in win._PERSIST_VISIBLE},
+        "visible": {"race_chart": True, "tower": True, "map": True,
+                    "session": True, "race2_chart": True,
+                    "quali_view": True, "times_gap": True},
         "float": {"tower": {"floating": True, "visible": True,
                             "geom": [60, 60, 420, 520], "pinned": True}},
         "win_max": False,
     }
+    win._reload_profiles()
     win._apply_layout_profile("smoke")
     pump(app, 0.3)
-    check(win._panels["map"].is_panel_visible(), "perfil: visibilidad reaplicada")
-    check(win._panels["tower"].floating and win._panels["tower"].pinned,
-          "perfil: panel flotante y fijado restaurado")
-    win._panels["tower"].attach()
+    check(win._panels["map"].is_panel_visible(), "perfil: ventana reabierta")
+    check(win._panels["tower"].pinned
+          and win._panels["tower"]._win.geometry().height() == 520,
+          "perfil: geometría y fijado restaurados")
+    check(not win._panels["race_trace"].is_panel_visible(),
+          "perfil: ventana fuera del perfil queda cerrada")
+    win._panels["tower"]._win.pin_btn.setChecked(False)
     win._delete_layout_profile("smoke")
     check("smoke" not in win.cfg.get("layouts", {}), "perfil: borrado")
     pump(app, 0.2)
@@ -1104,6 +1244,9 @@ def test_app_demo(app: QApplication) -> None:
     lock.parent.mkdir(parents=True, exist_ok=True)
     lock.write_text("1")
     win.source_combo.setCurrentIndex(win.source_combo.findData("capture"))
+    pump(app, 0.1)
+    check(win.connect_btn.text() == "Open capturer",
+          f"captura: el botón dice qué hace ({win.connect_btn.text()!r})")
     win.connect_btn.click()
     pump(app, 0.4)
     check(win.source is None and win._cap_waiting
@@ -1111,9 +1254,12 @@ def test_app_demo(app: QApplication) -> None:
           "captura: sin datos queda esperando al capturador")
     check("aiting" in win.status_label.text(),
           f"captura: estado de espera ({win.status_label.text()[:60]})")
+    check(f1cfg.capture_show_path().exists(),
+          "captura: pedido de mostrar al capturador en bandeja")
+    f1cfg.capture_show_path().unlink(missing_ok=True)
     win.connect_btn.click()  # cancelar la espera
     pump(app, 0.2)
-    check(not win._cap_waiting and win.connect_btn.text() == "Connect"
+    check(not win._cap_waiting and win.connect_btn.text() == "Open capturer"
           and win.source is None, "captura: espera cancelable")
     win.connect_btn.click()  # esperar de nuevo
     pump(app, 0.3)
@@ -1135,6 +1281,27 @@ def test_app_demo(app: QApplication) -> None:
           "captura: conexión automática al empezar a fluir datos")
     check(not win._cap_waiting and win.connect_btn.text() == "Disconnect",
           "captura: la espera termina al conectar")
+    check("timeline" in win._catalog_checks
+          and not win._panels["timeline"].is_panel_visible()
+          and win.seek_row.isEnabled(),
+          "timeline: panel del catálogo (cerrado por defecto), habilitado con captura")
+
+    # watchdog: si el capturador arranca OTRO archivo (import) y el actual
+    # queda quieto, el visualizador lo sigue solo (crecimiento sostenido)
+    old_t = time.time() - 30
+    os.utime(cap_path, (old_t, old_t))
+    cap2 = f1cfg.recordings_dir() / "capture_wait_test2.jsonl"
+    cap2.write_text(json.dumps({"R": {"DriverList": {"1": {
+        "RacingNumber": "1", "Tla": "VER", "TeamColour": "3671C6"}}}}) + "\n",
+        encoding="utf-8")
+    for _k in range(3):
+        with open(cap2, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"M": [{"H": "Streaming", "M": "feed",
+                                       "A": ["Heartbeat", {}, ""]}]}) + "\n")
+        win._poll_capture_follow()
+        pump(app, 0.15)
+    check(isinstance(win.source, _CapSrc) and win.source.path == str(cap2),
+          f"captura: watchdog sigue al archivo nuevo ({Path(win.source.path).name})")
     win.connect_btn.click()  # desconectar
     pump(app, 0.4)
     lock.unlink()

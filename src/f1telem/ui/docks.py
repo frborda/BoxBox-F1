@@ -7,7 +7,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QToolButton, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QPushButton, QSlider, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 from . import theme
@@ -41,14 +42,25 @@ class _FloatWindow(QWidget):
         title.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-weight: bold;")
         bar.addWidget(title)
         bar.addStretch(1)
+        # opacidad para overlays fijados sobre una transmisión
+        self.opacity_slider = QSlider(Qt.Horizontal)
+        self.opacity_slider.setRange(55, 100)
+        self.opacity_slider.setValue(100)
+        self.opacity_slider.setFixedWidth(64)
+        self.opacity_slider.setToolTip("Opacity (only while pinned)")
+        self.opacity_slider.valueChanged.connect(
+            lambda v: self.setWindowOpacity(v / 100.0) if self.pinned else None)
+        self.opacity_slider.setVisible(False)
+        bar.addWidget(self.opacity_slider)
         self.pin_btn = _mini_btn(
             "📌", "Pin: keep on top, frameless and immovable", checkable=True
         )
         self.pin_btn.toggled.connect(self._set_pinned)
         bar.addWidget(self.pin_btn)
-        dock_btn = _mini_btn("⇱", "Dock back into the main window")
-        dock_btn.clicked.connect(holder.attach)
-        bar.addWidget(dock_btn)
+        if not holder.window_only:
+            dock_btn = _mini_btn("⇱", "Dock back into the main window")
+            dock_btn.clicked.connect(holder.attach)
+            bar.addWidget(dock_btn)
         lay.addLayout(bar)
         self._lay = lay
 
@@ -65,6 +77,8 @@ class _FloatWindow(QWidget):
         self.setStyleSheet(
             f"QWidget#floatwin {{ border: 1px solid {theme.ACCENT}; }}" if on else ""
         )
+        self.opacity_slider.setVisible(on)
+        self.setWindowOpacity(self.opacity_slider.value() / 100.0 if on else 1.0)
         self.show()
         self.setGeometry(geom)
         self.raise_()
@@ -86,11 +100,15 @@ class Detachable(QWidget):
 
     def __init__(self, panel_id: str, title: str, content: QWidget,
                  parent=None, keep_placeholder: bool = False,
-                 closable: bool = True):
+                 closable: bool = True, window_only: bool = False):
         super().__init__(parent)
         self.panel_id = panel_id
         self.title = title
         self.content = content
+        # ventana-pura: el panel vive SIEMPRE en su propia ventana; el
+        # contenedor acoplado nunca se muestra y "visible" = ventana mostrada
+        # (ocultar conserva la ventana para no perder geometría ni fijado)
+        self.window_only = window_only
         self._win: _FloatWindow | None = None
         # paneles centrales: al flotar dejan un aviso en su lugar en vez de
         # colapsar el hueco (el centro del modo no queda vacío sin aviso)
@@ -120,6 +138,8 @@ class Detachable(QWidget):
         lay.addLayout(bar)
         self._lay = lay
         lay.addWidget(content, stretch=1)
+        if window_only:
+            self.hide()  # el contenedor acoplado jamás se muestra
 
     # ------------------------------------------------------------ estado
 
@@ -132,6 +152,8 @@ class Detachable(QWidget):
         return self._win is not None and self._win.pinned
 
     def is_panel_visible(self) -> bool:
+        if self.window_only:
+            return self._win is not None and self._win.isVisible()
         return self._win.isVisible() if self._win else not self._user_hidden
 
     def _hide_docked(self) -> None:
@@ -140,6 +162,18 @@ class Detachable(QWidget):
         self.stateChanged.emit()
 
     def set_panel_visible(self, on: bool) -> None:
+        if self.window_only:
+            if on:
+                if self._win is None:
+                    self.detach()
+                else:
+                    self._win.show()
+                    self._win.raise_()
+                    self._win.activateWindow()
+            elif self._win is not None:
+                self._win.hide()
+            self.stateChanged.emit()
+            return
         self._user_hidden = not on
         if self._win is not None:
             self._win.setVisible(on)
@@ -150,6 +184,15 @@ class Detachable(QWidget):
     def apply_visible(self, on: bool) -> None:
         """Aplicación programática (cambio de modo / restauración): fija el
         estado sin emitir stateChanged ni tocar ventanas flotantes."""
+        if self.window_only:
+            if on:
+                if self._win is None:
+                    self.detach()
+                else:
+                    self._win.show()
+            elif self._win is not None:
+                self._win.hide()
+            return
         if self._win is not None:
             return
         self._user_hidden = not on
@@ -157,7 +200,8 @@ class Detachable(QWidget):
 
     # ---------------------------------------------------- flotar / acoplar
 
-    def detach(self, geometry: QRect | None = None, pinned: bool = False) -> None:
+    def detach(self, geometry: QRect | None = None, pinned: bool = False,
+               show: bool = True) -> None:
         if self._win is not None:
             return
         win = _FloatWindow(self)
@@ -176,14 +220,18 @@ class Detachable(QWidget):
         else:
             win.resize(max(size.width(), 320), max(size.height(), 240))
             win.move(origin)
-        win.show()
-        win.raise_()          # al frente: si no, nace detrás de la ventana
-        win.activateWindow()  # principal y parece que no se abrió
+        if show:
+            win.show()
+            win.raise_()          # al frente: si no, nace detrás de la ventana
+            win.activateWindow()  # principal y parece que no se abrió
         if pinned:
             win.pin_btn.setChecked(True)
         self.stateChanged.emit()
 
     def attach(self) -> None:
+        if self.window_only:  # sin acople: "cerrar" es ocultar la ventana
+            self.set_panel_visible(False)
+            return
         win, self._win = self._win, None
         if win is None:
             return
@@ -229,22 +277,38 @@ class Detachable(QWidget):
     # ------------------------------------------------------- persistencia
 
     def save_state(self) -> dict:
-        state = {"floating": self.floating, "visible": self.is_panel_visible()}
+        state = {"floating": self.floating or self.window_only,
+                 "visible": self.is_panel_visible()}
         if self._win is not None:
             g = self._win.geometry()
             state["geom"] = [g.x(), g.y(), g.width(), g.height()]
             state["pinned"] = self._win.pinned
+            state["opacity"] = self._win.opacity_slider.value()
         return state
 
     def restore_state(self, state: dict) -> None:
         if not isinstance(state, dict):
             return
-        if state.get("floating"):
+        if state.get("floating") or self.window_only:
             geom = state.get("geom")
             rect = QRect(*geom) if isinstance(geom, list) and len(geom) == 4 else None
-            self.detach(rect, bool(state.get("pinned")))
-            if not state.get("visible", True) and self._win is not None:
-                self._win.hide()
+            visible = bool(state.get("visible", True))
+            opacity = state.get("opacity")
+            if self.window_only and self._win is not None:
+                # re-aplicar sobre una ventana ya creada (cambio de perfil)
+                if rect is not None:
+                    self._win.setGeometry(rect)
+                if isinstance(opacity, (int, float)):
+                    self._win.opacity_slider.setValue(int(opacity))
+                if self._win.pin_btn.isChecked() != bool(state.get("pinned")):
+                    self._win.pin_btn.setChecked(bool(state.get("pinned")))
+                self._win.setVisible(visible)
+                return
+            self.detach(rect, bool(state.get("pinned")), show=visible)
+            if self._win is not None and isinstance(opacity, (int, float)):
+                self._win.opacity_slider.setValue(int(opacity))
+                if self._win.pinned:
+                    self._win.setWindowOpacity(int(opacity) / 100.0)
         elif not state.get("visible", True):
             self._user_hidden = True
             self.setVisible(False)

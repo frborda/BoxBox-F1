@@ -35,6 +35,12 @@ def capture_lock_path() -> Path:
     return data_dir() / "capture.lock"
 
 
+def capture_show_path() -> Path:
+    """Pedido de "mostrate": el visualizador lo crea y el capturador (que
+    puede estar escondido en la bandeja del sistema) se trae al frente."""
+    return data_dir() / "capture.show"
+
+
 def capture_running(max_age: float = 5.0) -> bool:
     import time
 
@@ -57,6 +63,10 @@ DEFAULTS = {
     "updates": {
         "check_on_startup": True,    # buscar nuevas versiones al abrir
         "skip_version": "",          # versión que el usuario eligió omitir
+    },
+    "strategy": {
+        "pit_window": 20.0,          # Ventana de Box en segundos
+        "pit_window_locked": False,  # True: el cálculo automático no la pisa
     },
     "panels": {
         "visible": {},  # global, independiente del modo: {panel: visible}

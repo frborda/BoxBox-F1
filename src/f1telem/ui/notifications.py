@@ -19,8 +19,9 @@ import time
 from PySide6.QtCore import QObject, Qt, QTimer
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
-    QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QDialog, QDialogButtonBox, QFrame, QGridLayout, QGroupBox,
+    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QPushButton,
+    QVBoxLayout, QWidget,
 )
 
 from .. import config
@@ -275,40 +276,38 @@ class NotificationCenter(QObject):
         self._rcm_n = len(rows)
 
 
-class NotificationsPanel(QWidget):
-    """Log de notificaciones + interruptores por categoría y de popups."""
+class NotificationSettingsDialog(QDialog):
+    """Configuración de notificaciones: popups sí/no y qué categorías
+    anunciar. Los cambios se aplican y persisten al instante."""
 
-    def __init__(self, center: NotificationCenter, cfg: dict, parent=None):
+    def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
-        self.center = center
+        self.setWindowTitle("Notification settings")
         self.cfg = cfg
-        self._count = 0
         ncfg = cfg.setdefault("notifications", {})
         kinds_cfg = ncfg.setdefault("kinds", {})
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(4, 2, 4, 4)
-        lay.setSpacing(2)
-        self.popups_check = QCheckBox("Show popups")
+        self.popups_check = QCheckBox("Show popup toasts (bottom-right)")
         self.popups_check.setChecked(bool(ncfg.get("popups", True)))
         self.popups_check.toggled.connect(self._popups_toggled)
         lay.addWidget(self.popups_check)
-        grid = QGridLayout()
-        grid.setSpacing(2)
-        self._kind_checks: dict[str, QCheckBox] = {}
+        box = QGroupBox("Notify about")
+        grid = QGridLayout(box)
+        grid.setVerticalSpacing(4)
+        self.kind_checks: dict[str, QCheckBox] = {}
         for i, (key, label, color) in enumerate(KINDS):
-            box = QCheckBox(label)
-            box.setStyleSheet(f"color: {color}; font-size: 8pt;")
-            box.setChecked(bool(kinds_cfg.get(key, True)))
-            box.toggled.connect(
-                lambda on, k=key: self._kind_toggled(k, on))
-            self._kind_checks[key] = box
-            grid.addWidget(box, i // 2, i % 2)
-        lay.addLayout(grid)
-        self.list = QListWidget()
-        self.list.setWordWrap(True)
-        self.list.setStyleSheet("QListWidget { font-size: 8pt; }")
-        lay.addWidget(self.list, stretch=1)
+            check = QCheckBox(label)
+            check.setStyleSheet(f"color: {color};")
+            check.setChecked(bool(kinds_cfg.get(key, True)))
+            check.toggled.connect(lambda on, k=key: self._kind_toggled(k, on))
+            self.kind_checks[key] = check
+            grid.addWidget(check, i // 2, i % 2)
+        lay.addWidget(box)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        buttons.clicked.connect(lambda _b: self.accept())
+        lay.addWidget(buttons)
 
     def _popups_toggled(self, on: bool) -> None:
         self.cfg.setdefault("notifications", {})["popups"] = on
@@ -318,6 +317,35 @@ class NotificationsPanel(QWidget):
         kinds = self.cfg.setdefault("notifications", {}).setdefault("kinds", {})
         kinds[kind] = on
         config.save_config(self.cfg)
+
+
+class NotificationsPanel(QWidget):
+    """Log de notificaciones, con acceso a la configuración."""
+
+    def __init__(self, center: NotificationCenter, cfg: dict, parent=None):
+        super().__init__(parent)
+        self.center = center
+        self.cfg = cfg
+        self._count = 0
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 2, 4, 4)
+        lay.setSpacing(2)
+        row = QHBoxLayout()
+        self.configure_btn = QPushButton("Configure…")
+        self.configure_btn.setToolTip(
+            "Choose which events to announce and whether popups show")
+        self.configure_btn.clicked.connect(self._configure)
+        row.addWidget(self.configure_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.list = QListWidget()
+        self.list.setWordWrap(True)
+        self.list.setStyleSheet("QListWidget { font-size: 8pt; }")
+        lay.addWidget(self.list, stretch=1)
+
+    def _configure(self) -> None:
+        NotificationSettingsDialog(self.cfg, self).exec()
 
     def clear_data(self) -> None:
         self.list.clear()

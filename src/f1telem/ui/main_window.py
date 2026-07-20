@@ -7,13 +7,15 @@ import sys
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, Signal
-from PySide6.QtGui import QColor, QPainter, QPixmap, QPolygonF, QIcon
+from PySide6.QtCore import (
+    QEvent, Qt, QRect, QThread, QTimer, QPointF, QRectF, Signal,
+)
+from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap, QPolygonF, QIcon
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFormLayout, QGroupBox,
+    QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QSlider, QSpinBox,
-    QSplitter, QStackedWidget, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QPushButton, QSlider, QSpinBox,
+    QToolTip, QVBoxLayout, QWidget,
 )
 
 from .. import __version__, config
@@ -23,28 +25,24 @@ from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplayS
 from . import theme
 from .charts import RollingChart, WrapChart
 from .docks import Detachable
-from .notifications import NotificationCenter, NotificationsPanel
+from .lap_wheel import LapWheelView
+from .notifications import (
+    NotificationCenter, NotificationSettingsDialog, NotificationsPanel,
+)
+from .pit_strategy import PitStrategyView
 from .pitlane import PitlaneView
 from .qualy_view import QualyView
 from .race_control import RaceControlPanel
 from .session_strip import SessionStrip
 from .strategy import StrategyView
-from .timing_view import TimingView, fmt_laptime
+from .timing_view import TimingView
 from .tower import TimingTower
 from .trace_chart import TraceChart
 from .track_map import TrackMapView
 from .update_dialog import run_check
 from .weather import WeatherChart, WeatherNowPanel
 
-MODES = [
-    ("Race (rolling window)", 0),
-    ("Race 2 (fixed track)", 1),
-    ("Quali (comparison)", 2),
-    ("Times / Gap", 3),
-    ("Race trace (gap evolution)", 4),
-]
-
-# ventana X en vueltas para los modos sin ventana fija (0 = toda la sesión)
+# ventana X en vueltas para las vistas con ventana móvil (0 = toda la sesión)
 X_WINDOWS = [
     ("½ lap", 0.5),
     ("1 lap", 1.0),
@@ -100,8 +98,7 @@ class LapRuler(QWidget):
         self._seek = seek_callback
         self.setFixedHeight(18)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("Click: jump to the start of that lap\n"
-                        "Diamonds: pit stops · Bands: flags/SC")
+        self.setMouseTracking(True)  # preview de vuelta/estado al pasar
 
     def set_marks(self, marks) -> None:
         self._marks = list(marks)
@@ -176,21 +173,93 @@ class LapRuler(QWidget):
             ]))
         painter.end()
 
-    def mousePressEvent(self, event) -> None:
+    def _t_at(self, x: float) -> float:
+        return self._t0 + x / max(self.width(), 1) * (self._t1 - self._t0)
+
+    def _status_at(self, t: float):
+        for t0, t1, code in self._status:
+            if t0 <= t <= t1 and code in theme.TRACK_STATUS:
+                return t0, theme.TRACK_STATUS[code][0]
+        return None
+
+    def hint_at(self, t: float) -> str:
+        """Texto de preview: vuelta, tiempo de sesión y estado de pista."""
+        lap_txt = ""
+        laps = [(lap, mt) for lap, mt in self._marks if mt <= t]
+        if laps:
+            lap_txt = f"L{laps[-1][0]} · "
+        rel = max(0.0, t - self._t0)
+        hint = f"{lap_txt}{int(rel // 60)}:{int(rel % 60):02d}"
+        status = self._status_at(t)
+        if status is not None:
+            hint += f" · {status[1]}"
+        return hint
+
+    def _target_for_click(self, t_click: float) -> float | None:
+        """Dentro de una banda de bandera/SC se salta al INICIO del
+        incidente; si no, al inicio de la vuelta más cercana."""
+        status = self._status_at(t_click)
+        if status is not None:
+            return max(status[0], self._t0)
         if not self._marks:
-            return
-        t_click = self._t0 + event.position().x() / max(self.width(), 1) * (self._t1 - self._t0)
+            return None
         _lap, t = min(self._marks, key=lambda m: abs(m[1] - t_click))
-        self._seek(t)
+        return t
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._marks or self._status:
+            t = self._t_at(event.position().x())
+            QToolTip.showText(event.globalPosition().toPoint(),
+                              self.hint_at(t), self)
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        target = self._target_for_click(self._t_at(event.position().x()))
+        if target is not None:
+            self._seek(target)
+
+
+class _ViewHost(QWidget):
+    """Vista + su propia barra de controles: en el modelo todo-ventanas cada
+    gráfico lleva canal / ventana X propios (dos ventanas Race pueden mostrar
+    canales distintos)."""
+
+    def __init__(self, view: QWidget, controls: list, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        row = QHBoxLayout()
+        row.setContentsMargins(4, 2, 4, 0)
+        for label, widget in controls:
+            row.addWidget(QLabel(label + ":"))
+            row.addWidget(widget)
+            row.addSpacing(10)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addWidget(view, stretch=1)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("F1 Live Telemetry")
-        self.resize(1360, 820)
+        self.setWindowTitle("F1 Live Telemetry — Control hub")
+        self.resize(400, 900)
 
         self.cfg = config.load_config()
+        # perfiles de fábrica en la primera corrida (solo visibilidad: las
+        # ventanas se abren en cascada y el usuario las acomoda y re-guarda)
+        if not self.cfg.get("layouts"):
+            base = {"tower": True, "map": True, "session": True}
+            self.cfg["layouts"] = {
+                "Race": {"visible": {**base, "race_chart": True,
+                                     "race_trace": True}, "float": {}},
+                "Quali": {"visible": {**base, "quali_view": True,
+                                      "times_gap": True}, "float": {}},
+                "Strategy": {"visible": {**base, "race_trace": True,
+                                         "strategy": True, "pitlane": True,
+                                         "notifications": True}, "float": {}},
+            }
         self.hub = DataHub(self)
         self.source: BaseSource | None = None
         self._progress: tuple[float, float, float] | None = None
@@ -204,16 +273,34 @@ class MainWindow(QMainWindow):
         self.charts = [self.chart_rolling, self.chart_wrap, self.chart_qualy,
                        self.chart_timing, self.chart_trace]
         self.track_map = TrackMapView(self.hub)
+        self.lap_wheel = LapWheelView(self.hub, self.cfg)
         self.tower = TimingTower(self.hub, self.cfg)
         self.session_strip = SessionStrip(self.hub)
         self.race_control_view = RaceControlPanel(self.hub)
         self.strategy_view = StrategyView(self.hub)
         self.pitlane_view = PitlaneView(self.hub)
+        self.pit_strategy_view = PitStrategyView(self.hub, self.cfg)
         self.notifier = NotificationCenter(self.hub, self.cfg, self)
         self.notifications_view = NotificationsPanel(self.notifier, self.cfg)
         self.weather_now = WeatherNowPanel(self.hub)
         self.weather_chart = WeatherChart(self.hub)
         self._tick_n = 0
+        # espera de la fuente Capture: sondear hasta que el capturador
+        # empiece a escribir datos y conectar solo (definido antes de la UI:
+        # _source_kind_changed consulta _cap_waiting durante el cableado)
+        self._cap_timer = QTimer(self)
+        self._cap_timer.setInterval(700)
+        self._cap_timer.timeout.connect(self._poll_capture_ready)
+        self._cap_waiting = False
+        self._cap_baseline: dict = {}
+        # watchdog conectado: si el capturador empieza a escribir OTRO
+        # archivo (p. ej. arranca una importación) y el actual queda quieto,
+        # el visualizador lo sigue solo — sin esto, la primera apertura
+        # automática podía quedar mirando la captura en vivo vacía
+        self._cap_follow_timer = QTimer(self)
+        self._cap_follow_timer.setInterval(2000)
+        self._cap_follow_timer.timeout.connect(self._poll_capture_follow)
+        self._follow_cand: tuple | None = None
 
         self._build_ui()
         self._wire()
@@ -222,17 +309,6 @@ class MainWindow(QMainWindow):
         self._timer.setInterval(33)  # 30 fps: el paneo suavizado lo necesita
         self._timer.timeout.connect(self._tick)
         self._timer.start()
-        # espera de la fuente Capture: sondear hasta que el capturador
-        # empiece a escribir datos y conectar solo
-        self._cap_timer = QTimer(self)
-        self._cap_timer.setInterval(700)
-        self._cap_timer.timeout.connect(self._poll_capture_ready)
-        self._cap_waiting = False
-        self._cap_baseline: dict = {}
-        self._laps_timer = QTimer(self)
-        self._laps_timer.setInterval(2000)
-        self._laps_timer.timeout.connect(self._refresh_ref_laps)
-        self._laps_timer.start()
 
         if (bool(self.cfg.get("updates", {}).get("check_on_startup", True))
                 and not os.environ.get("F1TELEM_NO_UPDATE_CHECK")):
@@ -240,31 +316,71 @@ class MainWindow(QMainWindow):
                 3000, lambda: run_check(self, self.cfg, silent=True)
             )
 
-        # restaurar la disposición guardada de la ventana y los divisores
+        # restaurar la geometría guardada del hub
         ui = self.cfg.get("ui", {})
         geom = ui.get("win_geom")
         if isinstance(geom, list) and len(geom) == 4:
             self.setGeometry(*[int(v) for v in geom])
-        if ui.get("win_max"):
-            self.setWindowState(Qt.WindowMaximized)
-        for key, split in (("split_main", self.splitter),
-                           ("split_right", self.right_split)):
-            sizes = ui.get(key)
-            if isinstance(sizes, list) and sizes and all(
-                    isinstance(v, (int, float)) for v in sizes):
-                split.setSizes([int(v) for v in sizes])
 
     # ------------------------------------------------------------------- UI
 
+    # Catálogo de ventanas: título + descripción visibles en el hub, para
+    # que el usuario sepa exactamente qué es cada una. El hub solo gestiona
+    # datos, perfiles y ajustes: TODAS las vistas viven en su propia ventana.
+    PANEL_CATALOG = [
+        ("race_chart", "Race chart",
+         "Rolling telemetry vs track position (same corner = same vertical)"),
+        ("race2_chart", "Race 2",
+         "Fixed 0→L lap axis; each car overwrites its previous lap"),
+        ("quali_view", "Quali comparison",
+         "Current laps vs a target lap: traces, cumulative delta and cards"),
+        ("times_gap", "Times / Gap",
+         "Gap chart vs a reference driver plus timing tables"),
+        ("race_trace", "Race trace",
+         "Gap evolution per microsector vs a selectable reference"),
+        ("tower", "Timing tower",
+         "Broadcast-style tower: positions, gaps, tyres, sectors"),
+        ("map", "Track map",
+         "Live car positions and trails on the circuit outline"),
+        ("lap_wheel", "Lap wheel",
+         "Circular lap view: cars by lap position (north = start line), "
+         "sectors, corners and the pit-drop ghost"),
+        ("session", "Session status",
+         "Flag, lap counter, session clock and latest race control message"),
+        ("drivers", "Drivers",
+         "Driver selection: which cars appear in every chart and the map"),
+        ("timeline", "Timeline",
+         "Race progress: scrubber, lap ruler, pause and LIVE (replay/capture)"),
+        ("strategy", "Tyre strategy",
+         "Stint bars per driver, colored by compound"),
+        ("pitlane", "Pit lane",
+         "Who is in the pits right now, entry compound and live clocks"),
+        ("pit_strategy", "Pit strategy",
+         "Pit window loss (Ventana de Box) and rejoin projections"),
+        ("race_control", "Race control",
+         "Chronological log of official messages"),
+        ("weather", "Weather",
+         "Current air/track temperature, wind and rain"),
+        ("weather_chart", "Weather evolution",
+         "Temperatures and wind over the session (X = leader lap)"),
+        ("notifications", "Notifications",
+         "Event popups and log: pits, fastest lap, flags, penalties"),
+    ]
+    _CHART_IDS = ("race_chart", "race2_chart", "quali_view", "times_gap",
+                  "race_trace")
+    # botones destacados del catálogo (fila propia arriba, con acento)
+    _FEATURED = ("drivers", "timeline")
+    # arranque limpio: solo el hub (fuente + pilotos + catálogo); las
+    # ventanas se abren a demanda o aplicando un perfil
+    _DEFAULT_OPEN = frozenset()
+
     def _build_ui(self) -> None:
         root = QWidget()
-        layout = QHBoxLayout(root)
-        layout.setContentsMargins(8, 8, 8, 8)
+        column = QVBoxLayout(root)
+        column.setContentsMargins(8, 8, 8, 8)
+        column.setSpacing(8)
 
-        side = QVBoxLayout()
-        side.setSpacing(8)
-
-        # --- fuente ---
+        # --- fuente de datos + línea de tiempo ---
         src_box = QGroupBox("Data source")
         src_lay = QVBoxLayout(src_box)
         self.source_combo = QComboBox()
@@ -305,130 +421,7 @@ class MainWindow(QMainWindow):
 
         self.connect_btn = QPushButton("Connect")
         src_lay.addWidget(self.connect_btn)
-        self.source_panel = Detachable("source", "Data source", src_box)
-        side.addWidget(self.source_panel)
-
-        # --- pilotos ---
-        drv_box = QGroupBox("Drivers (chart series)")
-        drv_lay = QVBoxLayout(drv_box)
-        self.all_check = QCheckBox("Select all")
-        drv_lay.addWidget(self.all_check)
-        self.driver_list = QListWidget()
-        self.driver_list.setMinimumHeight(180)
-        drv_lay.addWidget(self.driver_list)
-        self.drivers_panel = Detachable("drivers", "Drivers", drv_box)
-        side.addWidget(self.drivers_panel, stretch=1)
-
-        # --- modo y canal ---
-        mode_box = QGroupBox("Mode")
-        mode_lay = QFormLayout(mode_box)
-        self.mode_combo = QComboBox()
-        for name, _ in MODES:
-            self.mode_combo.addItem(name)
-        self.channel_combo = QComboBox()
-        for ch in CHANNEL_ORDER:
-            self.channel_combo.addItem(CHANNELS[ch][0], ch)
-        self.window_combo = QComboBox()
-        for label, laps in X_WINDOWS:
-            self.window_combo.addItem(label, laps)
-        self.trails_check = QCheckBox("Map trails")
-        self.trails_check.setChecked(bool(self.cfg["ui"].get("show_trails", True)))
-        self.peaks_check = QCheckBox("Peak values (max/min)")
-        self.peaks_check.setChecked(bool(self.cfg["ui"].get("show_peaks", False)))
-        self.panels_btn = QPushButton("Panels…")
-        self.panels_btn.setToolTip(
-            "Choose which panels to show in this mode; each panel can also\n"
-            "be detached into its own window from its ⧉ button"
-        )
-        mode_lay.addRow("Mode", self.mode_combo)
-        mode_lay.addRow("Channel", self.channel_combo)
-        mode_lay.addRow("X window", self.window_combo)
-        mode_lay.addRow(self.trails_check)
-        mode_lay.addRow(self.peaks_check)
-        mode_lay.addRow(self.panels_btn)
-        # el panel Mode lleva el botón Panels…: se puede flotar pero no ocultar
-        self.mode_panel = Detachable("mode", "Mode", mode_box, closable=False)
-        side.addWidget(self.mode_panel)
-
-        # --- referencia de qualy ---
-        self.ref_box = QGroupBox("Quali: target lap")
-        ref_lay = QFormLayout(self.ref_box)
-        self.ref_driver_combo = QComboBox()
-        self.ref_lap_combo = QComboBox()
-        ref_btns = QHBoxLayout()
-        self.ref_set_btn = QPushButton("Set")
-        self.ref_clear_btn = QPushButton("Clear")
-        ref_btns.addWidget(self.ref_set_btn)
-        ref_btns.addWidget(self.ref_clear_btn)
-        ref_lay.addRow("Driver", self.ref_driver_combo)
-        ref_lay.addRow("Lap", self.ref_lap_combo)
-        ref_lay.addRow(ref_btns)
-        self.ref_panel = Detachable("quali_ref", "Quali target", self.ref_box,
-                                    closable=False)
-        self.ref_panel.apply_visible(False)
-        side.addWidget(self.ref_panel)
-
-        side_widget = QWidget()
-        side_widget.setLayout(side)
-        side_widget.setFixedWidth(300)
-        layout.addWidget(side_widget)
-
-        self.stack = QStackedWidget()
-        self.chart_panels: list[Detachable] = []
-        chart_meta = [
-            ("race_chart", "Race chart"),
-            ("race2_chart", "Race 2 chart"),
-            ("quali_view", "Quali comparison"),
-            ("times_gap", "Times / Gap"),
-            ("race_trace", "Race trace"),
-        ]
-        for chart, (pid, title) in zip(self.charts, chart_meta):
-            holder = Detachable(pid, title, chart, keep_placeholder=True)
-            self.chart_panels.append(holder)
-            self.stack.addWidget(holder)
-        # panel derecho: torre arriba, mapa debajo (ambos desacoplables) y
-        # los paneles de contexto (estrategia, dirección de carrera, clima),
-        # ocultos por defecto — se activan desde Panels…
-        self.tower_panel = Detachable("tower", "Timing tower", self.tower)
-        self.map_panel = Detachable("map", "Track map", self.track_map)
-        self.strategy_panel = Detachable("strategy", "Tyre strategy",
-                                         self.strategy_view)
-        self.pitlane_panel = Detachable("pitlane", "Pit lane",
-                                        self.pitlane_view)
-        self.notifications_panel = Detachable("notifications", "Notifications",
-                                              self.notifications_view)
-        self.race_control_panel = Detachable("race_control", "Race control",
-                                             self.race_control_view)
-        self.weather_panel = Detachable("weather", "Weather", self.weather_now)
-        self.weather_chart_panel = Detachable("weather_chart",
-                                              "Weather evolution",
-                                              self.weather_chart)
-        self.right_split = QSplitter(Qt.Vertical)
-        self.right_split.addWidget(self.tower_panel)
-        self.right_split.addWidget(self.map_panel)
-        for panel in (self.strategy_panel, self.pitlane_panel,
-                      self.race_control_panel, self.weather_panel,
-                      self.weather_chart_panel, self.notifications_panel):
-            self.right_split.addWidget(panel)
-        self.right_split.setStretchFactor(0, 1)
-        self.right_split.setStretchFactor(1, 1)
-        self.right_split.setMinimumWidth(300)
-        self.splitter = QSplitter(Qt.Horizontal)
-        self.splitter.addWidget(self.stack)
-        self.splitter.addWidget(self.right_split)
-        self.splitter.setStretchFactor(0, 3)
-        self.splitter.setStretchFactor(1, 1)
-        self.splitter.setCollapsible(1, False)
-        self.splitter.setSizes([810, 480])
-
-        # línea de tiempo del replay: avanzar/retroceder en toda la tanda
-        center = QWidget()
-        center_lay = QVBoxLayout(center)
-        center_lay.setContentsMargins(0, 0, 0, 0)
-        # tira de estado de sesión (bandera, vuelta, reloj, race control)
-        self.session_panel = Detachable("session", "Session", self.session_strip)
-        center_lay.addWidget(self.session_panel)
-        center_lay.addWidget(self.splitter, stretch=1)
+        # línea de tiempo del replay/captura (solo visible cuando aplica)
         self.seek_row = QWidget()
         seek_lay = QHBoxLayout(self.seek_row)
         seek_lay.setContentsMargins(0, 0, 0, 0)
@@ -442,7 +435,6 @@ class MainWindow(QMainWindow):
         self.live_btn.setToolTip("Jump to the latest captured data")
         self.live_btn.setVisible(False)
         seek_lay.addWidget(self.live_btn)
-        seek_lay.addWidget(QLabel("Time:"))
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 1000)
         self.lap_ruler = LapRuler(self._seek_to_time)
@@ -453,33 +445,166 @@ class MainWindow(QMainWindow):
         seek_lay.addLayout(mid, stretch=1)
         self.time_label = QLabel("0:00 / 0:00")
         seek_lay.addWidget(self.time_label)
-        self.timeline_panel = Detachable("timeline", "Timeline", self.seek_row,
-                                         closable=False)
-        self.timeline_panel.apply_visible(False)
+        # la línea de tiempo es un panel más del catálogo (ventana propia);
+        # acá solo se deshabilita hasta que la fuente sea replay/captura
+        self.seek_row.setEnabled(False)
         self._timeline_on = False
-        center_lay.addWidget(self.timeline_panel)
-        layout.addWidget(center, stretch=1)
+        # estado vivo del capturador (heartbeat + crecimiento del archivo)
+        self.capturer_status = QLabel("Capturer: not running")
+        self.capturer_status.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-size: 7.5pt;")
+        src_lay.addWidget(self.capturer_status)
+        self._caprate: tuple | None = None
+        column.addWidget(src_box)
 
-        self._panels = {
-            "tower": self.tower_panel,
-            "map": self.map_panel,
-            "strategy": self.strategy_panel,
-            "pitlane": self.pitlane_panel,
-            "notifications": self.notifications_panel,
-            "race_control": self.race_control_panel,
-            "weather": self.weather_panel,
-            "weather_chart": self.weather_chart_panel,
-            "session": self.session_panel,
-            "times_tables": self.chart_timing.tables_panel,
-            "quali_cards": self.chart_qualy.cards_panel,
-            "source": self.source_panel,
-            "drivers": self.drivers_panel,
-            "mode": self.mode_panel,
-            "quali_ref": self.ref_panel,
-            "timeline": self.timeline_panel,
+        # --- catálogo de ventanas: grilla de botones conmutables, arriba de
+        # todo y sin scroll (resaltado = ventana abierta; descripción al
+        # pasar el mouse y en el renglón de ayuda) ---
+        panels_box = QGroupBox("Windows")
+        panels_lay = QVBoxLayout(panels_box)
+        featured_row = QHBoxLayout()
+        featured_row.setSpacing(4)
+        grid = QGridLayout()
+        grid.setSpacing(4)
+        self._catalog_checks: dict[str, QPushButton] = {}
+        self._catalog_desc: dict[str, str] = {}
+        grid_i = 0
+        for pid, title, desc in self.PANEL_CATALOG:
+            btn = QPushButton(title)
+            btn.setCheckable(True)
+            btn.setToolTip(desc)
+            if pid in self._FEATURED:
+                btn.setStyleSheet(
+                    "QPushButton { text-align: left; padding: 6px 8px;"
+                    f" font-weight: bold; border: 1px solid {theme.ACCENT};"
+                    " border-radius: 4px; }"
+                    f"QPushButton:checked {{ background: {theme.ACCENT};"
+                    " color: #ffffff; }}")
+            else:
+                btn.setStyleSheet(
+                    "QPushButton { text-align: left; padding: 4px 8px; }"
+                    f"QPushButton:checked {{ background: {theme.ACCENT};"
+                    " color: #ffffff; font-weight: bold; }}")
+            btn.toggled.connect(lambda on, p=pid: self._catalog_toggled(p, on))
+            btn.installEventFilter(self)
+            self._catalog_checks[pid] = btn
+            self._catalog_desc[pid] = desc
+            if pid in self._FEATURED:
+                featured_row.addWidget(btn)
+            else:
+                grid.addWidget(btn, grid_i // 2, grid_i % 2)
+                grid_i += 1
+        panels_lay.addLayout(featured_row)
+        panels_lay.addLayout(grid)
+        self.catalog_hint = QLabel(
+            "Click a window to open or close it — every view opens in its "
+            "own window.")
+        self.catalog_hint.setWordWrap(True)
+        self.catalog_hint.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-size: 7.5pt;")
+        self.catalog_hint.setMinimumHeight(30)
+        panels_lay.addWidget(self.catalog_hint)
+        btn_row = QHBoxLayout()
+        self.open_all_btn = QPushButton("Open all")
+        self.open_all_btn.clicked.connect(lambda: self._set_all_panels(True))
+        self.close_all_btn = QPushButton("Close all")
+        self.close_all_btn.clicked.connect(lambda: self._set_all_panels(False))
+        btn_row.addWidget(self.open_all_btn)
+        btn_row.addWidget(self.close_all_btn)
+        btn_row.addStretch(1)
+        panels_lay.addLayout(btn_row)
+        column.addWidget(panels_box, stretch=1)
+
+        # --- pilotos (ventana propia, destacada en el catálogo) ---
+        self._drivers_box = QWidget()
+        drv_lay = QVBoxLayout(self._drivers_box)
+        drv_lay.setContentsMargins(4, 2, 4, 4)
+        self.all_check = QCheckBox("Select all")
+        drv_lay.addWidget(self.all_check)
+        self.driver_list = QListWidget()
+        self.driver_list.setMinimumHeight(120)
+        drv_lay.addWidget(self.driver_list, stretch=1)
+
+        # --- perfiles de ventanas ---
+        prof_box = QGroupBox("Window profiles")
+        prof_lay = QVBoxLayout(prof_box)
+        prow = QHBoxLayout()
+        self.profile_combo = QComboBox()
+        prow.addWidget(self.profile_combo, stretch=1)
+        self.profile_apply_btn = QPushButton("Apply")
+        prow.addWidget(self.profile_apply_btn)
+        prof_lay.addLayout(prow)
+        prow2 = QHBoxLayout()
+        self.profile_save_btn = QPushButton("Save current as…")
+        self.profile_delete_btn = QPushButton("Delete")
+        prow2.addWidget(self.profile_save_btn)
+        prow2.addWidget(self.profile_delete_btn)
+        prow2.addStretch(1)
+        prof_lay.addLayout(prow2)
+        column.addWidget(prof_box)
+
+        # --- ajustes generales ---
+        set_box = QGroupBox("Settings")
+        set_lay = QVBoxLayout(set_box)
+        self.trails_check = QCheckBox("Map trails")
+        self.trails_check.setChecked(bool(self.cfg["ui"].get("show_trails", True)))
+        self.peaks_check = QCheckBox("Peak values (max/min)")
+        self.peaks_check.setChecked(bool(self.cfg["ui"].get("show_peaks", False)))
+        set_lay.addWidget(self.trails_check)
+        set_lay.addWidget(self.peaks_check)
+        self.notif_settings_btn = QPushButton("Notifications…")
+        self.notif_settings_btn.setToolTip(
+            "Choose which events to announce and whether popups show")
+        self.notif_settings_btn.clicked.connect(
+            lambda: NotificationSettingsDialog(self.cfg, self).exec())
+        set_lay.addWidget(self.notif_settings_btn)
+        column.addWidget(set_box)
+
+        # --- vistas: cada una en su propia ventana, con controles propios ---
+        self.race_channel_combo = self._make_channel_combo(
+            "race_channel", self.chart_rolling)
+        self.race_window_combo = self._make_window_combo(
+            "carrera_window_laps", 1.0, self.chart_rolling)
+        self.race2_channel_combo = self._make_channel_combo(
+            "race2_channel", self.chart_wrap)
+        self.quali_channel_combo = self._make_channel_combo(
+            "quali_channel", self.chart_qualy)
+        self.gap_window_combo = self._make_window_combo(
+            "gap_window_laps", 0.0, self.chart_timing)
+        hosts = {
+            "race_chart": _ViewHost(self.chart_rolling, [
+                ("Channel", self.race_channel_combo),
+                ("X window", self.race_window_combo)]),
+            "race2_chart": _ViewHost(self.chart_wrap, [
+                ("Channel", self.race2_channel_combo)]),
+            "quali_view": _ViewHost(self.chart_qualy, [
+                ("Channel", self.quali_channel_combo)]),
+            "times_gap": _ViewHost(self.chart_timing, [
+                ("X window", self.gap_window_combo)]),
+            "race_trace": self.chart_trace,  # ya lleva sus controles
+            "tower": self.tower,
+            "map": self.track_map,
+            "lap_wheel": self.lap_wheel,
+            "session": self.session_strip,
+            "drivers": self._drivers_box,
+            "timeline": self.seek_row,
+            "strategy": self.strategy_view,
+            "pitlane": self.pitlane_view,
+            "pit_strategy": self.pit_strategy_view,
+            "race_control": self.race_control_view,
+            "weather": self.weather_now,
+            "weather_chart": self.weather_chart,
+            "notifications": self.notifications_view,
         }
-        for holder in self.chart_panels:
-            self._panels[holder.panel_id] = holder
+        self._panels: dict[str, Detachable] = {}
+        for pid, title, _desc in self.PANEL_CATALOG:
+            self._panels[pid] = Detachable(pid, title, hosts[pid],
+                                           window_only=True)
+        # subpaneles internos (siguen acoplados dentro de su ventana, con la
+        # opción de flotarlos aparte desde su propio botón ⧉)
+        self._panels["times_tables"] = self.chart_timing.tables_panel
+        self._panels["quali_cards"] = self.chart_qualy.cards_panel
+        self._cascade_n = 0
 
         self.setCentralWidget(root)
         self.status_label = QLabel(self._source_status)
@@ -492,15 +617,47 @@ class MainWindow(QMainWindow):
         self.version_btn.setToolTip("Check for updates")
         self.statusBar().addPermanentWidget(self.version_btn)
 
+    def _make_channel_combo(self, cfg_key: str, chart) -> QComboBox:
+        """Combo de canal propio de una vista (persistido por vista)."""
+        combo = QComboBox()
+        for ch in CHANNEL_ORDER:
+            combo.addItem(CHANNELS[ch][0], ch)
+        idx = combo.findData(str(self.cfg["ui"].get(cfg_key, "speed")))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        chart.set_channel(combo.currentData())
+
+        def apply(_i: int = 0) -> None:
+            chart.set_channel(combo.currentData())
+            self.cfg.setdefault("ui", {})[cfg_key] = combo.currentData()
+            config.save_config(self.cfg)
+
+        combo.currentIndexChanged.connect(apply)
+        return combo
+
+    def _make_window_combo(self, cfg_key: str, default: float,
+                           chart) -> QComboBox:
+        """Combo de ventana X en vueltas propio de una vista."""
+        combo = QComboBox()
+        for label, laps in X_WINDOWS:
+            combo.addItem(label, laps)
+        idx = combo.findData(float(self.cfg["ui"].get(cfg_key, default)))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        chart.set_window_laps(float(combo.currentData()))
+
+        def apply(_i: int = 0) -> None:
+            chart.set_window_laps(float(combo.currentData()))
+            self.cfg.setdefault("ui", {})[cfg_key] = float(combo.currentData())
+            config.save_config(self.cfg)
+
+        combo.currentIndexChanged.connect(apply)
+        return combo
+
     def _wire(self) -> None:
         self.connect_btn.clicked.connect(self._toggle_connection)
-        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
-        self.channel_combo.currentIndexChanged.connect(self._channel_changed)
         self.driver_list.itemChanged.connect(self._selection_changed)
         self.hub.driversChanged.connect(self._rebuild_driver_list)
-        self.ref_set_btn.clicked.connect(self._set_reference)
-        self.ref_clear_btn.clicked.connect(lambda: self.chart_qualy.set_reference(None))
-        self.ref_driver_combo.currentIndexChanged.connect(self._refresh_ref_laps)
         # correlación mouse gráfico <-> mapa
         for chart in (self.chart_rolling, self.chart_wrap,
                       self.chart_qualy.chart, self.chart_timing):
@@ -509,23 +666,17 @@ class MainWindow(QMainWindow):
         self.trails_check.toggled.connect(self._trails_toggled)
         self.track_map.set_trails_enabled(self.trails_check.isChecked())
         self.peaks_check.toggled.connect(self._peaks_toggled)
-        self.panels_btn.clicked.connect(self._show_panels_menu)
         for panel in self._panels.values():
             panel.stateChanged.connect(self._on_panel_state)
         self._restore_panels()
         self.all_check.toggled.connect(self._select_all_toggled)
-        self.window_combo.currentIndexChanged.connect(self._window_changed)
         self.seek_slider.sliderReleased.connect(self._seek_released)
+        self.seek_slider.sliderMoved.connect(self._seek_preview)
         self.pause_btn.toggled.connect(self._pause_toggled)
         self.live_btn.clicked.connect(self._go_live)
         self.speed_combo.currentIndexChanged.connect(self._speed_changed)
         if self.peaks_check.isChecked():
             self._peaks_toggled(True)
-        # aplicar las ventanas guardadas y reflejar la del modo activo
-        self.chart_rolling.set_window_laps(
-            float(self.cfg["ui"].get("carrera_window_laps", 1.0))
-        )
-        self._sync_window_combo()
         self.year_spin.valueChanged.connect(self._load_schedule)
         self._load_schedule()
         self.source_combo.currentIndexChanged.connect(self._source_kind_changed)
@@ -533,6 +684,16 @@ class MainWindow(QMainWindow):
         self.version_btn.clicked.connect(
             lambda: run_check(self, self.cfg, silent=False)
         )
+        self.profile_apply_btn.clicked.connect(self._apply_selected_profile)
+        self.profile_save_btn.clicked.connect(self._save_layout_profile)
+        self.profile_delete_btn.clicked.connect(self._delete_selected_profile)
+        self._reload_profiles()
+
+    def _idle_connect_label(self) -> str:
+        """Con la fuente Capture el botón dice qué hace de verdad: abrir el
+        capturador (y conectar solo cuando fluyan datos)."""
+        return ("Open capturer" if self.source_combo.currentData() == "capture"
+                else "Connect")
 
     def _source_kind_changed(self, _index: int) -> None:
         """Year/GP/Session solo aplican a Replay; Speed no aplica a Live."""
@@ -540,6 +701,8 @@ class MainWindow(QMainWindow):
         for row in (0, 1, 2):
             self._replay_form.setRowVisible(row, kind == "replay")
         self._replay_form.setRowVisible(3, kind != "live")
+        if self.source is None and not self._cap_waiting:
+            self.connect_btn.setText(self._idle_connect_label())
 
     # ------------------------------------------------------------- conexión
 
@@ -598,9 +761,15 @@ class MainWindow(QMainWindow):
                 active, speed=float(self.speed_combo.currentData())))
             return
         launched = False
-        if (not config.capture_running()
-                and not os.environ.get("F1TELEM_NO_CAPTURE_SPAWN")):
+        running = config.capture_running()
+        if not running and not os.environ.get("F1TELEM_NO_CAPTURE_SPAWN"):
             launched = self._launch_capturer()
+        elif running:
+            # puede estar escondido en la bandeja: pedirle que se muestre
+            try:
+                config.capture_show_path().write_text("1", encoding="utf-8")
+            except OSError:
+                pass
         self._cap_baseline = {}
         for p in rec.glob("*.jsonl"):
             try:
@@ -611,10 +780,11 @@ class MainWindow(QMainWindow):
         self.connect_btn.setText("Cancel")
         self.source_combo.setEnabled(False)
         self._on_source_status(
-            ("Capturer opened — waiting for it to send data (start a live "
-             "capture or an import there)..." if launched else
-             "Waiting for capturer data (start a live capture or an import "
-             "in the capturer)..."))
+            ("Opening the capturer — this takes a few seconds... start a "
+             "live capture or an import there and the data will connect by "
+             "itself." if launched else
+             "Capturer already running (check the tray) — waiting for data: "
+             "start a live capture or an import there..."))
         self._cap_timer.start()
 
     def _launch_capturer(self) -> bool:
@@ -636,23 +806,59 @@ class MainWindow(QMainWindow):
             return False
 
     def _poll_capture_ready(self) -> None:
-        """Conecta apenas algún archivo de captura crece (o aparece)."""
+        """Conecta apenas algún archivo de captura crece (o aparece); con
+        varios creciendo gana el modificado más recientemente."""
+        best = None
         try:
             for p in config.recordings_dir().glob("*.jsonl"):
-                size = p.stat().st_size
-                if size > self._cap_baseline.get(p, 0):
-                    self._end_capture_wait()
-                    self._start_source(CaptureSource(
-                        p, speed=float(self.speed_combo.currentData())))
-                    return
+                stat = p.stat()
+                if stat.st_size > self._cap_baseline.get(p, 0):
+                    if best is None or stat.st_mtime > best[1]:
+                        best = (p, stat.st_mtime)
         except OSError:
-            pass
+            return
+        if best is not None:
+            self._end_capture_wait()
+            self._start_source(CaptureSource(
+                best[0], speed=float(self.speed_combo.currentData())))
+
+    def _poll_capture_follow(self) -> None:
+        """Con la fuente Capture conectada: si aparece otro archivo con
+        crecimiento sostenido (import o captura nueva) mientras el actual
+        está quieto, cambiar a ese archivo automáticamente. El crecimiento
+        debe verse en 3 sondeos seguidos: los heartbeats sueltos del stream
+        fuera de sesión no cuentan."""
+        source = self.source
+        if not isinstance(source, CaptureSource):
+            self._cap_follow_timer.stop()
+            return
+        current = Path(source.path)
+        active = self._active_capture()
+        if active is None or str(active) == str(current):
+            self._follow_cand = None
+            return
+        try:
+            size = active.stat().st_size
+            cur_stale = time.time() - current.stat().st_mtime > 5.0
+        except OSError:
+            return
+        cand = self._follow_cand
+        hits = cand[2] + 1 if (cand is not None and cand[0] == str(active)
+                               and size > cand[1]) else 0
+        self._follow_cand = (str(active), size, hits)
+        if hits < 2 or not cur_stale:
+            return
+        self._follow_cand = None
+        speed = float(self.speed_combo.currentData())
+        self._disconnect()
+        self._start_source(CaptureSource(active, speed=speed))
+        self._on_source_status(f"Following new capture: {active.name}")
 
     def _end_capture_wait(self) -> None:
         self._cap_timer.stop()
         self._cap_waiting = False
         self._cap_baseline = {}
-        self.connect_btn.setText("Connect")
+        self.connect_btn.setText(self._idle_connect_label())
         self.source_combo.setEnabled(True)
 
     def _start_source(self, source: BaseSource) -> None:
@@ -661,6 +867,12 @@ class MainWindow(QMainWindow):
             chart.clear_data()
         self.chart_qualy.set_reference(None)
         self.track_map.clear_data()
+        self.lap_wheel.clear_data()
+        self._follow_cand = None
+        if isinstance(source, CaptureSource):
+            self._cap_follow_timer.start()
+        else:
+            self._cap_follow_timer.stop()
 
         source.batch.connect(self._on_batch)
         source.positions.connect(self.hub.on_positions)
@@ -691,6 +903,7 @@ class MainWindow(QMainWindow):
         self.race_control_view.clear_data()
         self.strategy_view.clear_data()
         self.pitlane_view.clear_data()
+        self.pit_strategy_view.clear_data()
         self.notifier.reset()
         self.notifications_view.clear_data()
         self.weather_now.clear_data()
@@ -718,13 +931,14 @@ class MainWindow(QMainWindow):
         source.start()
 
     def _disconnect(self) -> None:
+        self._cap_follow_timer.stop()
         if self.source is None:
             return
         source, self.source = self.source, None
         source.stop()
         source.wait(8000)
         source.deleteLater()
-        self.connect_btn.setText("Connect")
+        self.connect_btn.setText(self._idle_connect_label())
         self.source_combo.setEnabled(True)
         self._set_timeline_available(False)
         self.live_btn.setVisible(False)
@@ -733,9 +947,10 @@ class MainWindow(QMainWindow):
     def _on_source_finished(self) -> None:
         if self.source is not None and self.source.isFinished():
             # la fuente terminó sola (error fatal en la carga, etc.)
+            self._cap_follow_timer.stop()
             source, self.source = self.source, None
             source.deleteLater()
-            self.connect_btn.setText("Connect")
+            self.connect_btn.setText(self._idle_connect_label())
             self.source_combo.setEnabled(True)
             self._set_timeline_available(False)
             self.live_btn.setVisible(False)
@@ -768,7 +983,9 @@ class MainWindow(QMainWindow):
 
     def _on_map_hover(self, dist) -> None:
         """Hover en el mapa -> línea de referencia en el gráfico activo."""
-        self.charts[self.stack.currentIndex()].show_track_marker(dist)
+        for pid, chart in zip(self._CHART_IDS, self.charts):
+            if self._panels[pid].is_panel_visible():
+                chart.show_track_marker(dist)
 
     def _on_pits(self, data) -> None:
         self.hub.on_pits(data)
@@ -809,6 +1026,15 @@ class MainWindow(QMainWindow):
         self.seek_slider.blockSignals(False)
         self.time_label.setText(f"{self._fmt_mmss(t - t0)} / {self._fmt_mmss(t1 - t0)}")
 
+    def _seek_preview(self, value: int) -> None:
+        """Tooltip con vuelta/tiempo/estado mientras se arrastra el scrub."""
+        if self._progress is None:
+            return
+        t0, _t, t1 = self._progress
+        t = t0 + value / 1000.0 * (t1 - t0)
+        QToolTip.showText(QCursor.pos(), self.lap_ruler.hint_at(t),
+                          self.seek_slider)
+
     def _seek_released(self) -> None:
         if self._progress is None or not isinstance(self.source, (ReplaySource, CaptureSource)):
             return
@@ -847,6 +1073,8 @@ class MainWindow(QMainWindow):
         return self.gp_combo.currentText().strip()
 
     def _load_schedule(self) -> None:
+        if os.environ.get("F1TELEM_NO_SCHEDULE"):
+            return  # tests: sin red, el hilo lento bloquearía el teardown
         self._sched_loader = ScheduleLoader(self.year_spin.value(), self)
         self._sched_loader.loaded.connect(self._on_schedule)
         self._sched_loader.start()
@@ -896,17 +1124,6 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.Checked if info.number in checked else Qt.Unchecked)
             self.driver_list.addItem(item)
         self.driver_list.blockSignals(False)
-
-        ref_current = self.ref_driver_combo.currentData()
-        self.ref_driver_combo.blockSignals(True)
-        self.ref_driver_combo.clear()
-        for info in drivers:
-            self.ref_driver_combo.addItem(info.label, info.number)
-        if ref_current is not None:
-            idx = self.ref_driver_combo.findData(ref_current)
-            if idx >= 0:
-                self.ref_driver_combo.setCurrentIndex(idx)
-        self.ref_driver_combo.blockSignals(False)
         self._selection_changed()
 
     def _selected_drivers(self) -> list[str]:
@@ -935,204 +1152,166 @@ class MainWindow(QMainWindow):
         )
         self.all_check.blockSignals(False)
 
-    # ----------------------------------------------------------- modo/canal
-
-    def _mode_changed(self, index: int) -> None:
-        self.stack.setCurrentIndex(index)
-        self._set_ref_available(index == 2)
-        if index == 2:
-            self._refresh_ref_laps()
-        self._sync_window_combo()
-
-    # ------------------------------------------------------- ventana X
-
-    _WINDOW_CFG_KEY = {0: "carrera_window_laps", 3: "gap_window_laps"}
-
-    def _sync_window_combo(self) -> None:
-        """El combo refleja y edita la ventana del modo activo; en los modos
-        de pista fija (Carrera 2, Qualy) queda deshabilitado."""
-        mode = self.mode_combo.currentIndex()
-        key = self._WINDOW_CFG_KEY.get(mode)
-        self.window_combo.blockSignals(True)
-        if key is None:
-            self.window_combo.setEnabled(False)
-            self.window_combo.setToolTip("This mode has a fixed 1-lap window")
-        else:
-            self.window_combo.setEnabled(True)
-            self.window_combo.setToolTip("")
-            default = 1.0 if mode == 0 else 0.0
-            value = float(self.cfg["ui"].get(key, default))
-            idx = self.window_combo.findData(value)
-            if idx >= 0:
-                self.window_combo.setCurrentIndex(idx)
-        self.window_combo.blockSignals(False)
-
-    def _window_changed(self) -> None:
-        mode = self.mode_combo.currentIndex()
-        key = self._WINDOW_CFG_KEY.get(mode)
-        if key is None:
-            return
-        laps = float(self.window_combo.currentData())
-        self.cfg.setdefault("ui", {})[key] = laps
-        config.save_config(self.cfg)
-        if mode == 0:
-            self.chart_rolling.set_window_laps(laps)
-        else:
-            self.chart_timing.set_window_laps(laps)
-
-    def _channel_changed(self) -> None:
-        channel = self.channel_combo.currentData()
-        for chart in self.charts:
-            chart.set_channel(channel)
-
-    # ---------------------------------------------------------------- qualy
-
-    def _refresh_ref_laps(self) -> None:
-        if not self.ref_box.isVisible():
-            return
-        drv = self.ref_driver_combo.currentData()
-        if drv is None:
-            return
-        buf = self.hub.buffers.get(drv)
-        laps = buf.completed_laps() if buf else []
-        current = self.ref_lap_combo.currentData()
-        if laps == [self.ref_lap_combo.itemData(i) for i in range(self.ref_lap_combo.count())]:
-            return
-        self.ref_lap_combo.blockSignals(True)
-        self.ref_lap_combo.clear()
-        for lap in laps:
-            lap_time = self.chart_timing.analyzer.lap_time(drv, lap)
-            self.ref_lap_combo.addItem(f"Lap {lap} — {fmt_laptime(lap_time)}", lap)
-        if current is not None:
-            idx = self.ref_lap_combo.findData(current)
-            if idx >= 0:
-                self.ref_lap_combo.setCurrentIndex(idx)
-        self.ref_lap_combo.blockSignals(False)
-
-    def _set_reference(self) -> None:
-        drv = self.ref_driver_combo.currentData()
-        lap = self.ref_lap_combo.currentData()
-        if drv is None or lap is None:
-            QMessageBox.information(
-                self, "F1 Live Telemetry",
-                "That driver has no completed laps to use as target yet.",
-            )
-            return
-        self.chart_qualy.set_reference(drv, int(lap))
-
     def _trails_toggled(self, on: bool) -> None:
         self.track_map.set_trails_enabled(on)
         self.cfg.setdefault("ui", {})["show_trails"] = on
         config.save_config(self.cfg)
 
-    # ------------------------------------------------------------- paneles
+    # ------------------------------------------------ ventanas (catálogo)
 
-    # visibilidad global elegida por el usuario (independiente del modo);
-    # quali_ref y timeline se auto-administran y los centrales acoplados son
-    # la página de su modo
-    _PERSIST_VISIBLE = ("tower", "map", "times_tables", "quali_cards",
-                        "source", "drivers", "mode", "session", "strategy",
-                        "pitlane", "notifications", "race_control", "weather",
-                        "weather_chart")
-    # paneles de contexto: ocultos hasta que el usuario los active
-    _DEFAULT_HIDDEN = frozenset(
-        {"strategy", "pitlane", "notifications", "race_control", "weather",
-         "weather_chart"})
+    def eventFilter(self, obj, event) -> bool:
+        # hover sobre un botón del catálogo -> descripción en el renglón de
+        # ayuda (además del tooltip)
+        if event.type() == QEvent.Enter:
+            for pid, btn in getattr(self, "_catalog_checks", {}).items():
+                if btn is obj:
+                    self.catalog_hint.setText(
+                        f"{btn.text()}: {self._catalog_desc[pid]}")
+                    break
+        return super().eventFilter(obj, event)
 
-    def _show_panels_menu(self) -> None:
-        """Menú de paneles: mostrar/ocultar cada uno (con ⧉ en la barrita de
-        cada panel se desacopla a una ventana propia)."""
-        menu = QMenu(self)
-        auto = {h.panel_id for h in self.chart_panels} | {"quali_ref", "timeline"}
+    def _catalog_toggled(self, pid: str, on: bool) -> None:
+        panel = self._panels[pid]
+        if on and panel._win is None:
+            panel.detach(self._next_cascade_rect(pid))
+        else:
+            panel.set_panel_visible(on)
+
+    def _set_all_panels(self, on: bool) -> None:
+        for pid, _title, _desc in self.PANEL_CATALOG:
+            self._catalog_toggled(pid, on)
+
+    def _next_cascade_rect(self, pid: str) -> QRect:
+        """Posición por defecto de una ventana nueva: cascada a la derecha
+        del hub, con tamaño según el tipo de vista."""
+        base = self.geometry()
+        wide = pid in self._CHART_IDS or pid in ("strategy", "weather_chart",
+                                                 "timeline")
+        width = 860 if wide else (320 if pid == "drivers" else 420)
+        height = (620 if wide else 520)
+        if pid in ("session", "timeline"):
+            height = 110
+        elif pid == "lap_wheel":
+            width, height = 520, 580
+        offset = 34 * (self._cascade_n % 8)
+        self._cascade_n += 1
+        return QRect(base.right() + 16 + offset, base.y() + offset,
+                     width, height)
+
+    def _sync_catalog(self) -> None:
+        for pid, box in self._catalog_checks.items():
+            box.blockSignals(True)
+            box.setChecked(self._panels[pid].is_panel_visible())
+            box.blockSignals(False)
+
+    def _on_panel_state(self) -> None:
+        """Persiste el estado de cada ventana (geometría, fijado, visible)."""
+        panels_cfg = self.cfg.setdefault("panels", {})
+        float_cfg = panels_cfg.setdefault("float", {})
+        visible = panels_cfg.setdefault("visible", {})
         for pid, panel in self._panels.items():
-            if pid in auto and not panel.floating:
-                continue  # acoplado se administra solo: nada que elegir
-            action = menu.addAction(
-                panel.title + ("  (floating)" if panel.floating else "")
-            )
-            action.setCheckable(True)
-            action.setChecked(panel.is_panel_visible())
-            action.toggled.connect(
-                lambda on, p=panel: p.set_panel_visible(on)
-            )
-        # perfiles de disposición con nombre: guardan y reaplican la
-        # combinación completa de paneles (flotantes, fijados, visibilidad,
-        # divisores y geometría de la ventana)
-        menu.addSeparator()
-        layouts = self.cfg.get("layouts", {})
-        lay_menu = menu.addMenu("Layout profiles")
-        save_action = lay_menu.addAction("Save current as…")
-        save_action.triggered.connect(self._save_layout_profile)
-        if layouts:
-            lay_menu.addSeparator()
-            for name in sorted(layouts):
-                action = lay_menu.addAction(name)
-                action.triggered.connect(
-                    lambda _=False, n=name: self._apply_layout_profile(n))
-            delete_menu = lay_menu.addMenu("Delete profile")
-            for name in sorted(layouts):
-                action = delete_menu.addAction(name)
-                action.triggered.connect(
-                    lambda _=False, n=name: self._delete_layout_profile(n))
-        menu.exec(self.panels_btn.mapToGlobal(self.panels_btn.rect().bottomLeft()))
+            if getattr(panel, "window_only", False):
+                if panel._win is not None:
+                    float_cfg[pid] = panel.save_state()
+                visible[pid] = panel.is_panel_visible()
+            elif panel.floating:  # subpaneles internos (tablas, tarjetas)
+                float_cfg[pid] = panel.save_state()
+            else:
+                float_cfg.pop(pid, None)
+        config.save_config(self.cfg)
+        self._sync_catalog()
+
+    def _restore_panels(self) -> None:
+        """Reabre las ventanas tal cual quedaron (geometría, fijado); sin
+        estado previo, abre el conjunto por defecto en cascada."""
+        panels_cfg = self.cfg.get("panels", {})
+        float_cfg = panels_cfg.get("float", {})
+        visible = panels_cfg.get("visible", {})
+        # plan primero, aplicar después: cada detach dispara _on_panel_state,
+        # que reescribe estos mismos dicts mientras se itera
+        plan = []
+        for pid, _title, _desc in self.PANEL_CATALOG:
+            state = float_cfg.get(pid)
+            plan.append((pid,
+                         dict(state) if isinstance(state, dict) else None,
+                         bool(visible.get(pid, pid in self._DEFAULT_OPEN))))
+        subs = [(pid, dict(float_cfg[pid]))
+                for pid in ("times_tables", "quali_cards")
+                if isinstance(float_cfg.get(pid), dict)
+                and float_cfg[pid].get("floating")]
+        for pid, state, open_it in plan:
+            panel = self._panels[pid]
+            if state is not None and state.get("geom"):
+                panel.restore_state({**state, "floating": True,
+                                     "visible": open_it})
+            elif open_it:
+                panel.detach(self._next_cascade_rect(pid))
+        # subpaneles internos flotados aparte (tablas de tiempos, tarjetas)
+        for pid, state in subs:
+            self._panels[pid].restore_state(state)
+        self._sync_catalog()
 
     # -------------------------------------------------- perfiles de layout
 
+    def _reload_profiles(self) -> None:
+        current = self.profile_combo.currentText()
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        for name in sorted(self.cfg.get("layouts", {})):
+            self.profile_combo.addItem(name)
+        idx = self.profile_combo.findText(current)
+        if idx >= 0:
+            self.profile_combo.setCurrentIndex(idx)
+        self.profile_combo.blockSignals(False)
+
     def _save_layout_profile(self) -> None:
         name, ok = QInputDialog.getText(
-            self, "Save layout profile",
+            self, "Save window profile",
             "Profile name (e.g. \"Race 3 monitors\"):")
         name = name.strip()
         if not ok or not name:
             return
         profile = {
-            "visible": {pid: self._panels[pid].is_panel_visible()
-                        for pid in self._PERSIST_VISIBLE},
+            "visible": {pid: panel.is_panel_visible()
+                        for pid, panel in self._panels.items()},
             "float": {pid: panel.save_state()
-                      for pid, panel in self._panels.items() if panel.floating},
+                      for pid, panel in self._panels.items()
+                      if panel._win is not None or panel.floating},
             "win_max": self.isMaximized(),
         }
         g = self.normalGeometry()
         profile["win_geom"] = [g.x(), g.y(), g.width(), g.height()]
-        for key, split in (("split_main", self.splitter),
-                           ("split_right", self.right_split)):
-            sizes = split.sizes()
-            if all(v > 0 for v in sizes):
-                profile[key] = sizes
         self.cfg.setdefault("layouts", {})[name] = profile
         config.save_config(self.cfg)
+        self._reload_profiles()
+        self.profile_combo.setCurrentIndex(self.profile_combo.findText(name))
+
+    def _apply_selected_profile(self) -> None:
+        self._apply_layout_profile(self.profile_combo.currentText())
+
+    def _delete_selected_profile(self) -> None:
+        self._delete_layout_profile(self.profile_combo.currentText())
 
     def _apply_layout_profile(self, name: str) -> None:
         profile = self.cfg.get("layouts", {}).get(name)
         if not isinstance(profile, dict):
             return
         float_states = profile.get("float", {})
-        # primero acoplar todo lo flotante que el perfil no quiere flotante
-        for pid, panel in self._panels.items():
-            if panel.floating:
-                panel.attach()
         visible = profile.get("visible", {})
-        for pid in self._PERSIST_VISIBLE:
-            self._panels[pid].apply_visible(
-                bool(visible.get(pid, pid not in self._DEFAULT_HIDDEN)))
-        for pid, state in float_states.items():
-            panel = self._panels.get(pid)
-            if panel is not None:
-                panel.restore_state(state)
+        for pid, _title, _desc in self.PANEL_CATALOG:
+            panel = self._panels[pid]
+            state = float_states.get(pid)
+            open_it = bool(visible.get(pid, False))
+            if isinstance(state, dict) and state.get("geom"):
+                panel.restore_state({**state, "floating": True,
+                                     "visible": open_it})
+            elif open_it and panel._win is None:
+                panel.detach(self._next_cascade_rect(pid))
+            else:
+                panel.apply_visible(open_it)
         geom = profile.get("win_geom")
         if isinstance(geom, list) and len(geom) == 4:
             self.setGeometry(*[int(v) for v in geom])
-        self.setWindowState(
-            Qt.WindowMaximized if profile.get("win_max") else Qt.WindowNoState)
-        for key, split in (("split_main", self.splitter),
-                           ("split_right", self.right_split)):
-            sizes = profile.get(key)
-            if isinstance(sizes, list) and sizes and all(
-                    isinstance(v, (int, float)) for v in sizes):
-                split.setSizes([int(v) for v in sizes])
-        self._set_timeline_available(self._timeline_on)
-        self._set_ref_available(self.mode_combo.currentIndex() == 2)
-        self._sync_right_panel()
         self._on_panel_state()  # el perfil aplicado pasa a ser el estado actual
 
     def _delete_layout_profile(self, name: str) -> None:
@@ -1140,67 +1319,45 @@ class MainWindow(QMainWindow):
         if name in layouts:
             del layouts[name]
             config.save_config(self.cfg)
+            self._reload_profiles()
 
     def _set_timeline_available(self, on: bool) -> None:
-        """La línea de tiempo aplica solo a replay/captura; acoplada se
-        colapsa cuando no hay, flotante queda la ventana vacía."""
+        """La línea de tiempo aplica solo a replay/captura: la ventana la
+        abre/cierra el usuario desde el catálogo; acá solo se habilita."""
         self._timeline_on = on
-        self.seek_row.setVisible(on)
-        if not self.timeline_panel.floating:
-            self.timeline_panel.apply_visible(on)
+        self.seek_row.setEnabled(on)
 
-    def _set_ref_available(self, on: bool) -> None:
-        self.ref_box.setVisible(on)
-        if not self.ref_panel.floating:
-            self.ref_panel.apply_visible(on)
-
-    def _on_panel_state(self) -> None:
-        """Persiste la visibilidad global y el estado flotante de cada panel."""
-        panels_cfg = self.cfg.setdefault("panels", {})
-        float_cfg = panels_cfg.setdefault("float", {})
-        visible = panels_cfg.setdefault("visible", {})
-        for pid, panel in self._panels.items():
-            if panel.floating:
-                float_cfg[pid] = panel.save_state()
-            else:
-                float_cfg.pop(pid, None)
-                if pid in self._PERSIST_VISIBLE:
-                    visible[pid] = panel.is_panel_visible()
-        config.save_config(self.cfg)
-        # tras acoplar/desacoplar, reaplicar la disponibilidad automática
-        self._set_timeline_available(self._timeline_on)
-        self._set_ref_available(self.mode_combo.currentIndex() == 2)
-        self._sync_right_panel()
-
-    def _restore_panels(self) -> None:
-        """Restaura la disposición guardada tal cual: visibilidad global y
-        paneles flotantes con su geometría y fijado."""
-        panels_cfg = self.cfg.get("panels", {})
-        visible = panels_cfg.get("visible", {})
-        for pid in self._PERSIST_VISIBLE:
-            self._panels[pid].apply_visible(
-                bool(visible.get(pid, pid not in self._DEFAULT_HIDDEN)))
-        # copia: restore_state dispara stateChanged -> _on_panel_state, que
-        # reescribe este mismo dict mientras se itera
-        for pid, state in list(panels_cfg.get("float", {}).items()):
-            panel = self._panels.get(pid)
-            if panel is not None:
-                panel.restore_state(state)
-        if isinstance(panels_cfg, dict):  # claves del esquema por-modo viejo
-            panels_cfg.pop("mode_visible", None)
-            panels_cfg.pop("views", None)
-        self._set_timeline_available(self._timeline_on)
-        self._set_ref_available(self.mode_combo.currentIndex() == 2)
-        self._sync_right_panel()
-
-    def _sync_right_panel(self) -> None:
-        self.right_split.setVisible(any(
-            not p.floating and p.is_panel_visible()
-            for p in (self.tower_panel, self.map_panel, self.strategy_panel,
-                      self.pitlane_panel, self.race_control_panel,
-                      self.weather_panel, self.weather_chart_panel,
-                      self.notifications_panel)
-        ))
+    def _update_capturer_status(self) -> None:
+        """Línea viva en el hub: qué está haciendo el capturador (latido +
+        crecimiento del archivo activo, con tasa en MB/min)."""
+        if not config.capture_running():
+            self.capturer_status.setText("Capturer: not running")
+            self._caprate = None
+            return
+        active = self._active_capture()
+        if active is None:
+            self.capturer_status.setText(
+                "Capturer: running (idle — no data flowing)")
+            self._caprate = None
+            return
+        try:
+            size = active.stat().st_size
+        except OSError:
+            return
+        now = time.time()
+        rate_txt = ""
+        if self._caprate is not None and self._caprate[0] == str(active):
+            dt = now - self._caprate[2]
+            if dt >= 3.0:
+                rate = (size - self._caprate[1]) / dt / (1024 * 1024) * 60.0
+                rate_txt = f" · {rate:.1f} MB/min"
+                self._caprate = (str(active), size, now)
+        else:
+            self._caprate = (str(active), size, now)
+        kind = ("importing" if active.name == "import_live.jsonl"
+                else "capturing")
+        self.capturer_status.setText(
+            f"Capturer: {kind} → {active.name}{rate_txt}")
 
     def _pause_toggled(self, on: bool) -> None:
         if self.source is not None:
@@ -1223,35 +1380,37 @@ class MainWindow(QMainWindow):
         self._tick_n += 1
         if self._tick_n % 30 == 0:  # 1 Hz: límites oficiales de sector
             self.hub.maybe_derive_sector_bounds()
-        cur = self.stack.currentIndex()
-        self.charts[cur].refresh()
-        # gráficos centrales flotantes: siguen vivos en cualquier modo
-        for i, holder in enumerate(self.chart_panels):
-            if i != cur and holder.floating and holder.is_panel_visible():
-                self.charts[i].refresh()
+        # cada gráfico refresca solo si su ventana está abierta
+        for pid, chart in zip(self._CHART_IDS, self.charts):
+            if self._panels[pid].is_panel_visible():
+                chart.refresh()
         if self.track_map.isVisible():
             self.track_map.refresh()
+        if self.lap_wheel.isVisible():
+            self.lap_wheel.refresh()
         if self.tower.isVisible() and self._tick_n % 15 == 0:
             self.tower.refresh()
+        if self._tick_n % 30 == 0:
+            self._update_capturer_status()
         if self._tick_n % 15 == 0:
             # el gestor de notificaciones corre siempre (los popups no
             # dependen de que su panel esté visible)
             self.notifier.check()
-            # paneles de contexto (isVisible cubre acoplado y flotante)
             if self.session_strip.isVisible():
                 self.session_strip.refresh()
             for view in (self.race_control_view, self.strategy_view,
-                         self.pitlane_view, self.weather_now,
-                         self.weather_chart, self.notifications_view):
+                         self.pitlane_view, self.pit_strategy_view,
+                         self.weather_now, self.weather_chart,
+                         self.notifications_view):
                 if view.isVisible():
                     view.refresh()
-            # sub-paneles flotantes de vistas no activas (y no flotantes)
+            # sub-paneles flotados aparte con su ventana madre cerrada
             tables = self.chart_timing.tables_panel
-            if (cur != 3 and not self.chart_panels[3].floating
+            if (not self._panels["times_gap"].is_panel_visible()
                     and tables.floating and tables.is_panel_visible()):
                 self.chart_timing.refresh_tables()
             cards = self.chart_qualy.cards_panel
-            if (cur != 2 and not self.chart_panels[2].floating
+            if (not self._panels["quali_view"].is_panel_visible()
                     and cards.floating and cards.is_panel_visible()):
                 self.chart_qualy._update_cards()
         meta = f"Lap: {self.hub.track_length:,.0f} m  ·  Samples: {self.hub.total_samples:,}"
@@ -1264,21 +1423,18 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._cap_timer.stop()
+        # el cargador de calendario es hijo de la ventana: destruirlo con el
+        # hilo corriendo aborta el proceso al salir
+        loader = getattr(self, "_sched_loader", None)
+        if loader is not None and loader.isRunning():
+            loader.wait(5000)
         self._disconnect()
-        self._on_panel_state()  # persiste la geometría flotante actual
+        self._on_panel_state()  # persiste la geometría de cada ventana
         for panel in self._panels.values():
             panel.close_float()
         self._timer.stop()
-        self._laps_timer.stop()
         ui = self.cfg.setdefault("ui", {})
-        ui["win_max"] = self.isMaximized()
         g = self.normalGeometry()
         ui["win_geom"] = [g.x(), g.y(), g.width(), g.height()]
-        # con un lado colapsado el splitter reporta 0: no pisar lo guardado
-        for key, split in (("split_main", self.splitter),
-                           ("split_right", self.right_split)):
-            sizes = split.sizes()
-            if all(v > 0 for v in sizes):
-                ui[key] = sizes
         config.save_config(self.cfg)
         super().closeEvent(event)

@@ -1,5 +1,5 @@
 """Torre de tiempos estilo broadcast: cada auto en una fila de dos líneas
-con caja de posición y sigla en color de equipo, marcha/RPM/velocidad, DRS,
+con caja de posición y sigla en color de equipo, neumático, velocidad,
 píldoras LAST/BEST (violeta = mejor de la sesión, verde = mejor personal),
 INT/LDR y los microsectores como rayitas de colores con los tiempos de
 sector debajo (en vivo usa los segmentos oficiales del feed; si no, se
@@ -47,10 +47,7 @@ class TowerRow:
     pos: int
     ready: bool                # posición de pista confiable (ancla o proyección)
     delta: int | None          # posiciones ganadas (+) desde el inicio
-    gear: int
-    rpm: float
     speed: float
-    drs: bool
     gap_txt: str               # al líder
     int_txt: str               # al de adelante
     last: float
@@ -434,10 +431,7 @@ class TimingTower(QWidget):
                 pos=i + 1,
                 ready=row_ready,
                 delta=(base0 - (i + 1)) if base0 is not None and row_ready else None,
-                gear=int(buf.col("gear")[-1]),
-                rpm=float(buf.col("rpm")[-1]),
                 speed=float(buf.col("speed")[-1]),
-                drs=int(buf.col("drs")[-1]) >= 10,
                 gap_txt=gap_txt,
                 int_txt=int_txt,
                 last=last_time,
@@ -535,7 +529,7 @@ class TimingTower(QWidget):
                            str(row.tyre_age))
             x += 20 * s
 
-            # Δ posición (arriba) y DRS (abajo)
+            # Δ posición desde el inicio (columna centrada)
             if width >= 270 * s:
                 p.setFont(f_small)
                 if row.delta is None:
@@ -549,26 +543,11 @@ class TimingTower(QWidget):
                 else:
                     p.setPen(QColor("#ff6b6b"))
                     d_txt = f"▼{-row.delta}"
-                p.drawText(QRectF(x, top, 26 * s, line_h), Qt.AlignCenter, d_txt)
-                drs_color = QColor("#2fbf71") if row.drs else QColor(255, 255, 255, 30)
-                p.setPen(Qt.NoPen)
-                p.setBrush(drs_color)
-                p.drawRoundedRect(QRectF(x + s, bot + 1, 24 * s, line_h - 2), 2, 2)
-                p.setPen(_text_on(drs_color) if row.drs else QColor(theme.TEXT_MUTED))
-                p.drawText(QRectF(x + s, bot, 24 * s, line_h), Qt.AlignCenter, "DRS")
+                p.drawText(QRectF(x, y, 26 * s, row_h), Qt.AlignCenter, d_txt)
                 x += 30 * s
 
-            # marcha + rpm, velocidad
-            if width >= 330 * s:
-                p.setPen(QColor(theme.ACCENT))
-                p.setFont(f_big)
-                p.drawText(QRectF(x, top, 22 * s, line_h + 2), Qt.AlignCenter,
-                           str(row.gear))
-                p.setPen(QColor(theme.TEXT_MUTED))
-                p.setFont(f_small)
-                p.drawText(QRectF(x - 4 * s, bot, 30 * s, line_h), Qt.AlignCenter,
-                           f"{row.rpm:,.0f}")
-                x += 28 * s
+            # velocidad
+            if width >= 320 * s:
                 p.setPen(QColor(theme.TEXT))
                 p.setFont(f_val)
                 p.drawText(QRectF(x, top, 34 * s, line_h + 2), Qt.AlignCenter,
