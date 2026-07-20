@@ -5,7 +5,18 @@ brake, RPM, gear) for one or several cars at once, with **distance on the X
 axis** and one series per driver. Built with
 [Fast-F1](https://github.com/theOehrly/Fast-F1), PySide6 and pyqtgraph.
 
-![F1 Live Telemetry — Race mode replaying a race, with timing tower and track map](docs/screenshot.png)
+![F1 Live Telemetry — multi-window layout during a Safety Car: timing tower, Race 2 chart, lap wheel with live intervals, drivers, race trace, track map with a yellow sector and the timeline](docs/data.png)
+
+**Control hub** — the whole app is driven from one narrow window: data
+source, the window catalog (Drivers and Timeline featured), window
+profiles and settings. Every view opens in its own window:
+
+![Control hub with the window catalog and profiles](docs/main.png)
+
+**Race mode** — telemetry charts while replaying a race, with timing tower
+and track map:
+
+![Race mode replaying a race, with timing tower and track map](docs/screenshot.png)
 
 **Times / Gap** — gap to a reference driver over the whole race, tyre
 degradation per stint and the timing tower with pit stops and averages:
@@ -200,10 +211,14 @@ follows the most recent capture file.
 - **Lap wheel**: a circular lap view — north is the start/finish line,
   south is half distance, and each car sits at its lap-fraction angle in
   real time (smoothed). The ring is split into the three sectors (official
-  boundaries once derived) and carries every numbered corner as a tick.
-  Pick a driver in **Pit sim** and a dashed **PIT ghost** marks where they
-  would drop if they pitted now — using the Pit strategy window value —
-  with the projected position and margin in the header.
+  boundaries once derived), carries every numbered corner as a tick, paints
+  **yellow-flag sectors** like the track map and marks the **pit lane** as a
+  dashed arc once the first stop locates it. An inner **interval ring**
+  draws an arc between each pair of consecutive cars with the live gap in
+  seconds (1 decimal), rotating and re-scaling as the race evolves. Pick a
+  driver in **Pit sim** and a dashed **PIT ghost** marks where they would
+  drop if they pitted now — using the Pit strategy window value — with the
+  projected position and margin in the header.
 - **Pit strategy panel (Ventana de Box)**: the real cost of a pit stop is
   not the pit-lane time — braking in and accelerating out also lose time.
   The app measures a **box window on track** (from 2 microsectors before
