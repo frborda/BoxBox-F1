@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 
 from .. import __version__, config, updater
 
-_TITLE = "F1 Live Telemetry"
+_TITLE = "BoxBox-F1"
 
 
 class UpdateChecker(QObject):

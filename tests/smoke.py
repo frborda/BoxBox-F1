@@ -254,16 +254,30 @@ def test_capture_source() -> None:
     delay = time.monotonic() - t_write
     check(arrived and delay < 1.0, f"capture: cola en vivo con delay mínimo ({delay * 1000:.0f} ms)")
 
+    # torre vs saltos de tiempo: los datos jamás deben desaparecer
+    from f1telem.ui.tower import TimingTower
+    tower_c = TimingTower(hub)
+    tower_c.refresh()
+    check(len(tower_c.rows) == 1, "torre+seek: fila presente en vivo")
+
     # salto hacia atrás
     src.request_seek(20.0)
     check(wait_for(lambda: resets[0] == 1 and not src.live_mode
                    and 15.0 <= hub.latest_t <= 26.0, 5.0),
           f"capture: seek atrás reconstruye hasta el punto (t={hub.latest_t:.0f})")
+    tower_c.clear_data()  # como hace la app en cada seekReset
+    tower_c.refresh()
+    check(len(tower_c.rows) == 1,
+          f"torre+seek: fila reaparece tras el salto atrás ({len(tower_c.rows)})")
 
     # volver al vivo
     src.go_live()
     check(wait_for(lambda: src.live_mode and hub.latest_t >= 64.0, 5.0),
           f"capture: LIVE vuelve al último dato (t={hub.latest_t:.0f})")
+    tower_c.clear_data()
+    tower_c.refresh()
+    check(len(tower_c.rows) == 1,
+          f"torre+seek: fila reaparece tras volver al vivo ({len(tower_c.rows)})")
 
     src.stop()
     src.wait(5000)
@@ -300,6 +314,101 @@ def test_catch_projection() -> None:
     laps = tower._catch_laps("B", "A", pts, L)
     check(laps is not None and 1.6 < laps < 2.5,
           f"proyección de alcance ~2 vueltas ({None if laps is None else round(laps, 2)})")
+
+
+def test_delta_wave() -> None:
+    """Delta gráfico con la lógica JRT: delta = REL − REL_al_inicio_de_la_
+    vuelta del cursor (que avanza con el auto que va DETRÁS de la pareja),
+    reset por vuelta con la anterior atenuada; rojo/arriba = la referencia
+    pierde contra ese rival esta vuelta, verde/abajo = le gana."""
+    import numpy as np
+
+    from f1telem.hub import DataHub
+    from f1telem.models import Sample
+    from f1telem.ui.tower import TimingTower
+
+    hub = DataHub()
+    L = 5000.0
+    V = 50.0  # m/s: vuelta de 100 s
+    hub.on_track_length(L)
+
+    def gap_b(t: float) -> float:
+        # constante 10 s hasta t=300; después crece 2 s por vuelta
+        return 10.0 if t <= 300.0 else 10.0 + 2.0 * (t - 300.0) / 100.0
+
+    def mk(drv: str, t: float, gap: float) -> Sample | None:
+        pos = V * (t - gap)
+        if pos < 0:
+            return None
+        lap = int(pos // L) + 1
+        return Sample(drv, t, lap, pos % L, pos, V * 3.6,
+                      100.0, 0.0, 10000.0, 7, 0)
+
+    tower = TimingTower(hub)
+
+    def feed(t0: float, t1: float) -> None:
+        batch = []
+        t = t0
+        while t <= t1 + 1e-9:
+            for drv, gap in (("A", 0.0), ("B", gap_b(t)), ("C", 10.0)):
+                s = mk(drv, t, gap)
+                if s is not None:
+                    batch.append(s)
+            t += 0.5
+        hub.on_batch(batch)
+        tower.refresh()
+
+    feed(0.0, 300.0)
+    for t_end in range(310, 401, 10):  # refrescos periódicos, como en vivo
+        feed(t_end - 9.5, float(t_end))
+    rows = {r.drv: r for r in tower.rows}
+    check(rows["A"].wave is None and rows["B"].wave is not None,
+          "delta: rivales con gráfico, la referencia (líder) sin")
+    y_c = rows["C"].wave[1]
+    check(float(np.nanmax(np.abs(y_c))) < 0.2,
+          f"delta: REL clavado queda neutro "
+          f"(max {float(np.nanmax(np.abs(y_c))):.2f})")
+    y_b, prev_b = rows["B"].wave[1], rows["B"].wave[2]
+    n = len(y_b)
+    bi = int(((V * (400.0 - gap_b(400.0))) % L) / L * n)
+    y_line = float(y_b[bi % n])
+    check(-2.1 < y_line < -1.3,
+          f"delta: B alejándose pinta verde creciente ({y_line:+.2f})")
+    check(abs(float(y_b[2])) < 0.4,
+          f"delta: cada vuelta arranca en ~0 ({float(y_b[2]):+.2f})")
+    check(prev_b is not None,
+          "delta: la vuelta anterior queda guardada para atenuar")
+    check(float(np.nanmax(y_b)) < 0.15,
+          "delta: la referencia ganando jamás pinta rojo")
+
+    # referencia B (mitad del pelotón): el rival de ADELANTE escapándose
+    # pinta rojo, y el cursor avanza con la referencia (la rezagada)
+    tower.set_reference("B")
+    for t_end in range(410, 471, 10):
+        feed(t_end - 9.5, float(t_end))
+    rows_b = {r.drv: r for r in tower.rows}
+    check(rows_b["A"].wave is not None,
+          "delta: el rival de adelante también se grafica")
+    y_a = rows_b["A"].wave[1]
+    bi_a = int(((V * (470.0 - gap_b(470.0))) % L) / L * len(y_a))
+    y_probe = float(y_a[bi_a % len(y_a)])
+    check(0.4 < y_probe < 1.5,
+          f"delta: adelante escapándose pinta rojo con el cursor de la "
+          f"referencia ({y_probe:+.2f})")
+
+    # pintado incremental: 2 s más solo repintan los bins del cursor
+    snap = tower._wave_store["A"].copy()
+    feed(470.5, 472.0)
+    y2 = tower._wave_store["A"]
+    same = (y2 == snap) | (np.isnan(y2) & np.isnan(snap))
+    check(0 < int((~same).sum()) <= 8,
+          f"delta: pintado incremental ({int((~same).sum())} bins)")
+
+    # escala de color: gris→rojo/verde hasta 1 s, magenta/cian en ±2 s
+    check(tower._wave_color(2.0).name() == "#c852ff"
+          and tower._wave_color(-2.0).name() == "#35d0c8"
+          and tower._wave_color(0.5).red() > tower._wave_color(0.0).red(),
+          "delta: gradiente y saturación de color JRT")
 
 
 def test_app_demo(app: QApplication) -> None:
@@ -366,6 +475,35 @@ def test_app_demo(app: QApplication) -> None:
     r = float(np.corrcoef(np.interp(grid, xa, ya), np.interp(grid, xb, yb))[0, 1])
     check(r > 0.9, f"Carrera: perfiles alineados en X entre autos (r={r:.3f})")
 
+    # selector local 👥 de cada gráfico: nace del panel Drivers, se retoca
+    # por ventana sin afectar al resto, y Drivers lo pisa al cambiar
+    btn_rc = win._chart_sel_btns[0]
+    check(btn_rc.selection() == sel,
+          "gráficos: selector local arranca igual al panel Drivers")
+    extra = next(win.driver_list.item(i).data(Qt.UserRole)
+                 for i in range(win.driver_list.count())
+                 if win.driver_list.item(i).checkState() != Qt.Checked)
+    item_x = next(btn_rc.list.item(i) for i in range(btn_rc.list.count())
+                  if btn_rc.list.item(i).data(Qt.UserRole) == extra)
+    item_x.setCheckState(Qt.Checked)
+    check(set(win.chart_rolling.curves) == set(sel) | {extra},
+          f"gráficos: retoque local suma el auto en esa ventana "
+          f"({len(win.chart_rolling.curves)})")
+    check(win._chart_sel_btns[1].selection() == sel,
+          "gráficos: el retoque no toca a los otros gráficos")
+    check(win._selected_drivers() == sel,
+          "gráficos: el retoque no toca al panel Drivers")
+    idx_extra = next(i for i in range(win.driver_list.count())
+                     if win.driver_list.item(i).data(Qt.UserRole) == extra)
+    win.driver_list.item(idx_extra).setCheckState(Qt.Checked)
+    sel5 = win._selected_drivers()
+    check(btn_rc.selection() == sel5
+          and set(win.chart_rolling.curves) == set(sel5),
+          "gráficos: el panel Drivers pisa la selección local")
+    win.driver_list.item(idx_extra).setCheckState(Qt.Unchecked)
+    check(btn_rc.selection() == sel and win._selected_drivers() == sel,
+          "gráficos: estado restaurado tras el cambio en Drivers")
+
     # ventana Race 2 (wrap): se abre desde el catálogo del hub
     win._catalog_checks["race2_chart"].setChecked(True)
     pump(app, 4.0)
@@ -398,6 +536,28 @@ def test_app_demo(app: QApplication) -> None:
     ref_text = qv.ref_lap_combo.itemText(0)
     check(ref_text.startswith("Lap") and ":" in ref_text,
           f"referencia muestra tiempo de vuelta ({ref_text!r})")
+    # cambiar el Target debe reescribir los tiempos del combo de vueltas
+    # aunque los números de vuelta coincidan
+    def _other_with_laps():
+        for i in range(qv.ref_driver_combo.count()):
+            d = qv.ref_driver_combo.itemData(i)
+            if (d != first and win.hub.buffers.get(d)
+                    and win.hub.buffers[d].completed_laps()):
+                return i
+        return None
+    deadline = time.monotonic() + 20
+    other_idx = _other_with_laps()
+    while time.monotonic() < deadline and other_idx is None:
+        pump(app, 0.3)
+        other_idx = _other_with_laps()
+    ref_text = qv.ref_lap_combo.itemText(0)  # re-leer tras la espera
+    qv.ref_driver_combo.setCurrentIndex(other_idx)
+    other_text = qv.ref_lap_combo.itemText(0)
+    check(qv.ref_lap_combo.count() > 0 and other_text != ref_text,
+          f"cambiar Target actualiza los tiempos ({ref_text!r} -> {other_text!r})")
+    qv.ref_driver_combo.setCurrentIndex(qv.ref_driver_combo.findData(first))
+    check(qv.ref_lap_combo.itemText(0) == ref_text,
+          "volver al Target original restaura sus tiempos")
     qv.ref_set_btn.click()
     pump(app, 1.0)
     rx, ry = qv.chart._ref_curve.getData()
@@ -718,7 +878,53 @@ def test_app_demo(app: QApplication) -> None:
     ox, oy = mp.outline_curve.getData()
     check(ox is not None and len(ox) > 300, f"mapa: trazado del circuito ({0 if ox is None else len(ox)} pts)")
     pts = mp.dots.points()
-    check(len(pts) == len(sel), f"mapa: un punto por piloto seleccionado ({len(pts)})")
+    check(len(pts) == win.driver_list.count(),
+          f"mapa: todos los autos visibles por defecto ({len(pts)})")
+    # filtro 👥 propio de la ventana: ocultar un auto saca su punto, sin
+    # tocar la selección de comparación del panel Drivers
+    item0 = mp.filter_btn.list.item(0)
+    hidden_drv = item0.data(Qt.UserRole)
+    item0.setCheckState(Qt.Unchecked)
+    pump(app, 0.3)
+    check(len(mp.dots.points()) == win.driver_list.count() - 1
+          and hidden_drv not in mp.selected,
+          f"mapa: filtro 👥 oculta el auto ({len(mp.dots.points())})")
+    check(len(win._selected_drivers()) == len(sel),
+          "filtro 👥 no toca la selección del panel Drivers")
+    check(win.cfg["ui"].get("map_hidden_cars") == [hidden_drv],
+          "filtro 👥 persistido por ventana")
+    item0.setCheckState(Qt.Checked)
+    pump(app, 0.3)
+    check(len(mp.dots.points()) == win.driver_list.count(),
+          "mapa: filtro 👥 restaurado muestra todo")
+
+    # torre: mismo filtro por ventana; solo saca filas de la vista (las
+    # demás conservan su posición y gap reales)
+    win.tower.refresh()
+    n_rows0 = len(win.tower.rows)
+    t_item = win.tower.filter_btn.list.item(0)
+    t_drv = t_item.data(Qt.UserRole)
+    t_item.setCheckState(Qt.Unchecked)
+    check(len(win.tower.rows) == n_rows0 - 1
+          and all(r.drv != t_drv for r in win.tower.rows),
+          "torre: filtro 👥 saca la fila del auto oculto")
+    t_item.setCheckState(Qt.Checked)
+    check(len(win.tower.rows) == n_rows0, "torre: filtro 👥 restaurado")
+
+    # ↺: los subpaneles internos ocultados con ✕ vuelven de fábrica
+    tg_win = win._panels["times_gap"]._win
+    tables = win._panels["times_tables"]
+    check(tg_win.reset_btn.isVisible(), "ventana con subpaneles muestra ↺")
+    tables._hide_docked()
+    check(not tables.is_panel_visible(), "subpanel oculto con ✕")
+    tg_win.reset_btn.click()
+    check(tables.is_panel_visible() and not tables.floating,
+          "↺ restaura el subpanel oculto")
+    tables.detach()
+    pump(app, 0.2)
+    tg_win.reset_btn.click()
+    check(tables.is_panel_visible() and not tables.floating,
+          "↺ re-acopla el subpanel flotado")
     # cada auto debe estar sobre la pista (cerca del trazado) y coherente con
     # su dist_lap (el mapa demo se genera desde la misma distancia de arco)
     from f1telem.sources.demo import track_pos
@@ -948,6 +1154,129 @@ def test_app_demo(app: QApplication) -> None:
     check(stints0[0] == ("SOFT", 1, 4) and stints0[1][0] == "MEDIUM",
           f"estrategia: stints SOFT 1-4 y MEDIUM ({stints0[:2]})")
 
+    win.tyre_stints_view.refresh()
+    check(len(win.tyre_stints_view.rows) == 6,
+          f"tyre stints: una fila por auto ({len(win.tyre_stints_view.rows)})")
+    chips0 = win.tyre_stints_view.rows[0][3]
+    check(chips0[0] == ("SOFT", 1, 4, True)
+          and chips0[1][0] == "MEDIUM" and chips0[1][3],
+          f"tyre stints: compuesto, vueltas y N de juego nuevo ({chips0[:2]})")
+    # juego usado (edad inicial > 1): el chip sale sin la "N" — inyectado
+    # en vueltas PASADAS (las futuras quedan clipeadas por el timeline)
+    drv_ts = win.tyre_stints_view.rows[0][0]
+    saved_tyres = dict(win.hub.tyres[drv_ts])
+    lap_ts = win.hub.buffers[drv_ts].current_lap()
+    win.hub.tyres[drv_ts][lap_ts - 3] = ("HARD", 6)
+    win.hub.tyres[drv_ts][lap_ts - 2] = ("HARD", 7)
+    win.tyre_stints_view.refresh()
+    chips_ts = next(r[3] for r in win.tyre_stints_view.rows if r[0] == drv_ts)
+    check(("HARD", lap_ts - 3, lap_ts - 2, False) in chips_ts,
+          f"tyre stints: juego usado sin N ({chips_ts[1:3]})")
+    win.hub.tyres[drv_ts].clear()
+    win.hub.tyres[drv_ts].update(saved_tyres)
+    win.tyre_stints_view.refresh()
+
+    # anti-spoiler: los stints nunca pasan la vuelta actual del timeline
+    win.strategy_view.refresh()
+    lead_now = max(b.current_lap() for b in win.hub.buffers.values() if b.n)
+    check(all(s[2] <= lead_now for _d, _c, _col, st in win.strategy_view.rows
+              for s in st),
+          f"estrategia: stints cortados en la vuelta actual (lider {lead_now})")
+    check(all(c[2] <= lead_now for r in win.tyre_stints_view.rows
+              for c in r[3]),
+          "tyre stints: sin vueltas futuras")
+
+    # panel Microsectors: cortes en tabla y mapa, persistentes por circuito
+    win._catalog_checks["micro_config"].setChecked(True)
+    pump(app, 0.4)
+    mcv = win.micro_config_view
+    mcv.refresh()
+    check(mcv.table.rowCount() == 21 and len(mcv.cut_xy) == 21,
+          f"µconfig: 21 cortes automáticos en tabla y mapa "
+          f"({mcv.table.rowCount()}/{len(mcv.cut_xy)})")
+    mkey = win.hub.circuit_key()
+    check(mkey == "demo-grand-prix", f"µconfig: clave de circuito ({mkey!r})")
+    mcv._add_cut()
+    pump(app, 0.6)
+    check(win.hub.custom_micro is not None and mcv.table.rowCount() == 22,
+          "µconfig: agregar corte pasa a modo custom")
+    check(win.cfg.get("microsectors", {}).get(mkey) == win.hub.custom_micro,
+          "µconfig: config guardada por circuito+año")
+    win.chart_timing._update_micro(win._selected_drivers()[0])
+    check(win.tower.analyzer.n_micro() == 25
+          and win.chart_timing.micro_table.columnCount() == 25,
+          f"µconfig: torre y tabla siguen la cantidad nueva "
+          f"({win.tower.analyzer.n_micro()} µ)")
+    # tarjetas de Qualy: target vieja + config nueva no puede romper (las
+    # marcas de la target se releen del analyzer) y la grilla se rearma
+    win.chart_qualy._update_cards()
+    any_card = next(iter(win.chart_qualy.cards.values()))
+    check(len(any_card.micros) == 25,
+          f"µconfig: tarjetas de Qualy siguen la cantidad nueva "
+          f"({len(any_card.micros)})")
+    # regresión: seek (clear_data) con config custom activa — la torre debe
+    # re-dimensionar sus acumuladores a la config, no al default de 24
+    win.tower.clear_data()
+    win.tower.refresh()
+    check(len(win.tower._sess_micro) == 25,
+          f"µconfig: la torre re-dimensiona tras un seek "
+          f"({len(win.tower._sess_micro)} µ)")
+    mcv.select_cut(0)
+    d_new = float(mcv.cuts()[0]) + 40.0
+    idx_new = mcv.move_cut(0, d_new)
+    check(abs(mcv.cuts()[idx_new] - round(d_new, 1)) < 0.2,
+          f"µconfig: mover corte ({mcv.cuts()[idx_new]:.1f} m)")
+    mcv.select_cut(0)
+    mcv._remove_cut()
+    check(mcv.table.rowCount() == 21, "µconfig: quitar corte")
+    # persistente por fin de semana: recargar la trae tal cual
+    saved_cuts = list(win.hub.custom_micro)
+    win.hub.custom_micro = None
+    win._micro_cfg_key = None
+    win._load_micro_cfg()
+    check(win.hub.custom_micro == saved_cuts,
+          "µconfig: la config del circuito se recarga sola")
+    mcv._reset_auto()
+    pump(app, 0.6)
+    check(win.hub.custom_micro is None
+          and mkey not in win.cfg.get("microsectors", {})
+          and win.tower.analyzer.n_micro() == 24,
+          "µconfig: reset vuelve a los cortes automáticos")
+
+    # candado: congela los cortes tal como están; los ajustes automáticos
+    # que llegan con los autos girando ya no los mueven
+    mcv.lock_btn.click()
+    check(win.hub.custom_micro is not None
+          and len(win.hub.custom_micro) == 21
+          and win.cfg.get("microsectors", {}).get(mkey) == win.hub.custom_micro,
+          "µconfig: candado congela y guarda los cortes actuales")
+    cuts_locked = list(mcv.cuts())
+    bd_prev = win.hub.brake_dists
+    win.hub.brake_dists = {float(win.hub.corners[0][1]): 250.0}  # "llega" dato
+    check(mcv.cuts() == cuts_locked,
+          "µconfig: con candado, una derivación nueva no mueve los cortes")
+    win.hub.brake_dists = bd_prev
+    mcv.lock_btn.click()
+    pump(app, 0.4)
+    check(win.hub.custom_micro is None,
+          "µconfig: soltar el candado vuelve al automático")
+
+    # abandonos: fuera del mapa, al fondo de la torre con RET y sin gaps
+    # (por la vía oficial: la heurística de movimiento se prueba en la
+    # rueda, donde el refresh es síncrono y el demo no repone los datos)
+    win.hub.on_retirements([first])
+    pump(app, 0.5)
+    check(len(win.track_map.dots.points()) == win.driver_list.count() - 1,
+          "map: el auto fuera de carrera desaparece del mapa")
+    win.tower.refresh()
+    row_ret = win.tower.rows[-1]
+    check(row_ret.drv == first and row_ret.retired and row_ret.gap_txt == "—",
+          "torre: fuera de carrera al fondo con RET y sin gaps")
+    win.hub.on_retirements([])
+    pump(app, 0.3)
+    check(len(win.track_map.dots.points()) == win.driver_list.count(),
+          "map: vuelve al des-retirarse")
+
     win.weather_now.refresh()
     check(win.weather_now._values["air"].text().endswith("°"),
           f"clima: temperatura de aire ({win.weather_now._values['air'].text()})")
@@ -960,16 +1289,181 @@ def test_app_demo(app: QApplication) -> None:
     check(len(win.weather_chart._rain_items) == 1,
           f"clima: banda de lluvia ({len(win.weather_chart._rain_items)})")
 
+    # anti-spoiler: nada posterior al timeline en race control/strip/clima
+    n_rc = win.race_control_view.list.count()
+    win.hub.race_control.append({
+        "t": win.hub.latest_t + 500.0, "lap": 99, "category": "Other",
+        "flag": "RED", "scope": "Track", "sector": None, "mode": "",
+        "message": "FUTURE SPOILER"})
+    win.race_control_view.refresh()
+    check(win.race_control_view.list.count() == n_rc,
+          "race control: mensaje futuro oculto")
+    win.session_strip.refresh()
+    check("FUTURE" not in win.session_strip.rcm_label.text(),
+          "strip: el último mensaje respeta el timeline")
+    win.hub.race_control.pop()
+    n_wx = len(win.weather_chart.c_air.getData()[0])
+    win.hub.weather.append((win.hub.latest_t + 999.0, 30.0, 50.0, 9.9, True))
+    win.weather_chart._sig = None
+    win.weather_chart.refresh()
+    check(len(win.weather_chart.c_air.getData()[0]) == n_wx,
+          "clima: lectura futura fuera del gráfico")
+    win.hub.weather.pop()
+    win.weather_chart._sig = None
+
     win.tower.refresh()
     tyres_shown = {r.tyre for r in win.tower.rows}
     check(tyres_shown == {"MEDIUM"} and all(r.tyre_age > 0 for r in win.tower.rows),
           f"torre: compuesto y edad actuales ({tyres_shown})")
 
+    # violeta único: un solo mejor absoluto por vuelta, por sector y por µ
+    check(sum(1 for r in win.tower.rows if r.best_kind == 3) == 1,
+          "torre: un único violeta de mejor vuelta en la tanda")
+    for k in range(3):
+        n_p = sum(1 for r in win.tower.rows if r.sectors[k][1] == 3)
+        check(n_p <= 1, f"torre: a lo sumo un violeta en S{k + 1} ({n_p})")
+    mu_dup = {
+        (k, i)
+        for k in range(3)
+        for i in range(len(win.tower.rows[0].segs[k]))
+        if sum(1 for r in win.tower.rows if r.segs[k][i] == 3) > 1
+    }
+    check(not mu_dup, f"torre: violetas de µ únicos entre pilotos ({mu_dup})")
+
+    # referencia por click: los deltas se calculan contra el auto elegido
+    ref_pick = win.tower.rows[2].drv
+    win.tower.set_reference(ref_pick)
+    check(win.tower.ref_drv == ref_pick, "torre: referencia elegida")
+    r_ref = next(r for r in win.tower.rows if r.drv == ref_pick)
+    check(r_ref.ref_gap_txt == "—", "torre: la fila de referencia sin gap propio")
+    ahead_ref = [r for r in win.tower.rows if r.pos < r_ref.pos]
+    behind_ref = [r for r in win.tower.rows
+                  if r.pos > r_ref.pos and not r.retired]
+    check(ahead_ref and all(r.ref_gap_txt.startswith("+") for r in ahead_ref),
+          f"torre: adelante de la ref en POSITIVO (la ref pierde) "
+          f"({[r.ref_gap_txt for r in ahead_ref]})")
+    check(behind_ref and all(r.ref_gap_txt.startswith("-") for r in behind_ref),
+          f"torre: detrás de la ref en NEGATIVO (favorable) "
+          f"({[r.ref_gap_txt for r in behind_ref]})")
+    win.tower.set_reference(ref_pick)  # mismo click: la saca
+    check(win.tower.ref_drv is None and win.tower.rows[0].ref_gap_txt == "",
+          "torre: click de nuevo saca la referencia")
+    # convención de signo Y color desde la referencia: POSITIVO/rojo = la
+    # ref pierde contra esa fila, NEGATIVO/verde = le gana
+    check(win.tower._ref_color(1.0).name() == "#ff6b5e"
+          and win.tower._ref_color(-1.0).name() == "#2fbf71",
+          "torre: signo y color desde el punto de vista de la referencia")
+
+    # onda delta: ventana rodante de exactamente 1 vuelta contra el líder
+    win.tower.refresh()
+    waves = [r for r in win.tower.rows if r.wave is not None]
+    check(len(waves) >= 4, f"torre: ondas delta calculadas ({len(waves)})")
+    check(win.tower.rows[0].wave is None,
+          "torre: el líder (blanco de la onda) no se grafica a sí mismo")
+    fr_w = waves[0].wave[0]
+    check(len(fr_w) == 240 and bool((fr_w >= 0.0).all())
+          and bool((fr_w <= 1.0).all()),
+          "torre: onda en bins de fracción de vuelta")
+    check(all(0.0 <= r.wave_now <= 1.0 for r in waves),
+          "torre: línea blanca de posición actual en rango")
+
+    # columnas mostrar/ocultar (▦), persistidas en config
+    win.tower.set_column("pills", False)
+    win.tower.set_column("wave", False)
+    check(win.cfg["ui"]["tower_cols"] == {"pills": False, "wave": False},
+          "torre: columnas ocultas persistidas")
+    check(not win.tower._col_checks["pills"].isChecked(),
+          "torre: popup ▦ refleja el estado")
+    pump(app, 0.4)  # repinta sin esas columnas, sin romper
+    win.tower.set_column("pills", True)
+    win.tower.set_column("wave", True)
+    check(win.cfg["ui"]["tower_cols"] == {},
+          "torre: restaurar columnas limpia la config")
+
+    # chips de comisarios: ⚠ investigación → +5s sanción → SERVED limpia
+    code_f = win.hub.drivers[first].code
+    base_rc = len(win.hub.race_control)
+    win.hub.race_control.append({
+        "t": win.hub.latest_t - 3.0, "lap": 5, "category": "Other",
+        "flag": "", "scope": "Driver", "sector": None, "mode": "",
+        "message": f"TURN 4 INCIDENT INVOLVING CAR {first} ({code_f}) "
+                   f"UNDER INVESTIGATION"})
+    check(win.hub.stewards_flags().get(first) == "⚠",
+          "comisarios: investigación abre el chip ⚠")
+    win.hub.race_control.append({
+        "t": win.hub.latest_t - 2.0, "lap": 5, "category": "Other",
+        "flag": "", "scope": "Driver", "sector": None, "mode": "",
+        "message": f"FIA STEWARDS: 5 SECOND TIME PENALTY FOR CAR {first} "
+                   f"({code_f}) - TRACK LIMITS"})
+    check(win.hub.stewards_flags().get(first) == "+5s",
+          "comisarios: sanción pendiente +5s")
+    win.tower.refresh()
+    row_f = next(r for r in win.tower.rows if r.drv == first)
+    check(row_f.stew == "+5s", "torre: chip de sanción en la fila")
+    win.hub.race_control.append({
+        "t": win.hub.latest_t - 1.0, "lap": 6, "category": "Other",
+        "flag": "", "scope": "Driver", "sector": None, "mode": "",
+        "message": f"CAR {first} ({code_f}) PENALTY SERVED"})
+    check(win.hub.stewards_flags().get(first) is None,
+          "comisarios: SERVED limpia el chip")
+    while len(win.hub.race_control) > base_rc:
+        win.hub.race_control.pop()
+
+    # posición NETA del ciclo de paradas (Pit strategy): con una parada
+    # extra pagada y ventana grande, el auto queda neto P1
+    psv = win.pit_strategy_view
+    prev_window = psv.window_spin.value()
+    win.hub.pits.setdefault(first, []).append(
+        (win.hub.buffers[first].current_lap(), win.hub.latest_t - 5.0))
+    psv.window_spin.setValue(60.0)
+    psv._last_table = 0.0
+    psv.refresh()
+    row_i = next(i for i in range(psv.table.rowCount())
+                 if psv.table.item(i, 1).text() == code_f)
+    net_txt = psv.table.item(row_i, 3).text()
+    cur_p = row_i + 1
+    stops_t = sorted((len(win.hub.pit_stops_done(d))
+                      for d in win.hub.buffers), reverse=True)
+    check(net_txt.startswith("P")
+          and (int(net_txt[1:]) < cur_p or cur_p == 1),
+          f"pit strategy: la parada extra pagada mejora el neto "
+          f"(P{cur_p} -> {net_txt}; stops={stops_t})")
+    win.hub.pits[first].pop()
+    psv.window_spin.setValue(prev_window)
+
+    # momentos en la timeline: hover y click sobre un sobrepaso
+    t_m = win.hub.latest_t - 60.0
+    win.notifier.moments.append(
+        {"t": t_m, "lap": 3, "text": "L3: TST overtakes ZZZ for P4"})
+    win._moments_n = -1  # forzar el volcado en el próximo tick del notifier
+    deadline = time.monotonic() + 8.0  # bajo carga el tick pierde frecuencia
+    while time.monotonic() < deadline and win._moments_n == -1:
+        pump(app, 0.3)
+    check(len(win.lap_ruler._moments) == len(win.notifier.moments),
+          f"timeline: momentos volcados a la regla (regla="
+          f"{len(win.lap_ruler._moments)} notif={len(win.notifier.moments)} "
+          f"n={win._moments_n} tick={win._tick_n})")
+    check("overtakes" in win.lap_ruler.hint_at(t_m),
+          "timeline: hover muestra el momento")
+    target_m = win.lap_ruler._target_for_click(t_m)
+    check(target_m is not None and abs(target_m - (t_m - 5.0)) < 1e-6,
+          "timeline: click salta justo antes del momento")
+    # capas de la timeline: ocultar sobrepasos apaga dibujo, hover y click
+    win._timeline_layer_toggled("overtakes", False)
+    check(win.cfg["ui"]["timeline_layers"] == {"overtakes": False},
+          "timeline: capa oculta persistida")
+    check(win.lap_ruler._moment_near(t_m) is None,
+          "timeline: capa oculta apaga hover y click del momento")
+    win._timeline_layer_toggled("overtakes", True)
+    check(win.cfg["ui"].get("timeline_layers", {}) == {}
+          and win.lap_ruler._moment_near(t_m) is not None,
+          "timeline: capa restaurada limpia la persistencia")
+
     # pit lane: última pasada en la torre y panel con relojes corriendo
     row0 = win.tower.rows[0]
     check(row0.pit_lap == 4 and abs(row0.pit_lane_s - 21.0) < 0.6
           and row0.pit_stop_s == row0.pit_stop_s and row0.pit_stop_s < 0.5
-          and not row0.pit_open,
+          and not row0.pit_open and not row0.pit_out,
           f"torre: última pasada por boxes (L{row0.pit_lap}, "
           f"{row0.pit_lane_s:.1f}s en calle, {row0.pit_stop_s:.1f}s detenido)")
     win._panels["pitlane"].set_panel_visible(True)
@@ -982,14 +1476,80 @@ def test_app_demo(app: QApplication) -> None:
     win.pitlane_view.refresh()
     win.tower.refresh()
     check(len(win.pitlane_view.rows) == 1, "pit lane: piloto adentro listado")
-    _code, _color, compound, lane_s, _stop_s = win.pitlane_view.rows[0]
+    _code, _color, compound, lane_s, _stop_s, _out = win.pitlane_view.rows[0]
     check(compound == "MEDIUM" and lane_s >= 14.5,
           f"pit lane: compuesto de entrada y reloj corriendo ({compound}, {lane_s:.1f}s)")
+    # filtro 👥 propio: ocultar al piloto lo saca del panel
+    item_pl = next(win.pitlane_view.filter_btn.list.item(i)
+                   for i in range(win.pitlane_view.filter_btn.list.count())
+                   if win.pitlane_view.filter_btn.list.item(i)
+                   .data(Qt.UserRole) == first)
+    item_pl.setCheckState(Qt.Unchecked)
+    check(len(win.pitlane_view.rows) == 0, "pit lane: filtro 👥 oculta al piloto")
+    item_pl.setCheckState(Qt.Checked)
+    check(len(win.pitlane_view.rows) == 1, "pit lane: filtro 👥 restaurado")
     row_f = next(r for r in win.tower.rows if r.drv == first)
     check(row_f.pit_open and row_f.pit_lap == 9,
           "torre: pasada abierta marcada (en calle ahora)")
     win.hub.pit_lane[first].pop()
     win.pitlane_view.refresh()
+
+    # tag OUT: la última visita cerró hace menos de una vuelta
+    cur_out = win.hub.buffers[first].current_lap()
+    win.hub.pit_lane[first].append(
+        [cur_out, win.hub.latest_t - 30.0, win.hub.latest_t - 10.0])
+    win.tower.refresh()
+    row_f = next(r for r in win.tower.rows if r.drv == first)
+    check(row_f.pit_out and not row_f.pit_open,
+          "torre: tag OUT en la vuelta de salida")
+    win.hub.pit_lane[first].pop()
+    win.tower.refresh()
+
+    # replay: la historia completa llega por adelantado; una visita futura
+    # sin salida no debe listar al auto como "en boxes ahora"
+    win.hub.pit_lane.setdefault(first, []).append(
+        [12, win.hub.latest_t + 500.0, None])
+    win.pitlane_view.refresh()
+    win.tower.refresh()
+    check(len(win.pitlane_view.rows) == 0,
+          "pit lane: visita futura (replay) no lista al auto")
+    row_f = next(r for r in win.tower.rows if r.drv == first)
+    check(not row_f.pit_open and row_f.pit_lap == 4,
+          "torre: visita futura no marca 'en calle ahora'")
+    win.hub.pit_lane[first].pop()
+    win.pitlane_view.refresh()
+
+    # retención del que sale del pit: atenuado hasta fin de S2 o 2 minutos
+    from f1telem.hub import DataHub as _DH
+    from f1telem.models import Sample as _S
+    from f1telem.ui.pitlane import PitlaneView as _PLV
+    hub_pl = _DH()
+    hub_pl.on_track_length(3000.0)  # sin bounds: fin de S2 = 2000 m
+    plv = _PLV(hub_pl)
+    hub_pl.on_batch([_S("9", k * 0.5, 1, 50.0 * (k * 0.5), 50.0 * (k * 0.5),
+                        180.0, 0.0, 0.0, 0.0, 0, 0) for k in range(61)])
+    hub_pl.pit_lane["9"] = [[1, 2.0, 6.0]]  # salió en t=6 (pos 300 m)
+    plv.refresh()
+    check(len(plv.rows) == 1 and plv.rows[0][5] is True
+          and abs(plv.rows[0][3] - 4.0) < 1e-6,
+          "pit lane: el que salió queda atenuado con relojes congelados")
+    hub_pl.on_batch([_S("9", t, 1, 50.0 * t, 50.0 * t, 180.0,
+                        0.0, 0.0, 0.0, 0, 0)
+                     for t in [30.5 + k * 0.5 for k in range(24)]])  # 2100 m
+    plv.refresh()
+    check(not plv.rows, "pit lane: al cruzar el fin del S2 desaparece")
+    hub_pl.on_batch([_S("10", k * 2.0, 1, 400.0 + 0.2 * (k * 2.0),
+                        400.0 + 0.2 * (k * 2.0), 20.0, 0.0, 0.0, 0.0, 0, 0)
+                     for k in range(51)])  # nunca llega al S2
+    hub_pl.pit_lane["10"] = [[1, 2.0, 6.0]]
+    plv.refresh()
+    check(len(plv.rows) == 1 and plv.rows[0][5] is True,
+          "pit lane: sin cruzar el S2 sigue retenido (< 2 min)")
+    hub_pl.on_batch([_S("10", t, 1, 400.0 + 0.2 * t, 400.0 + 0.2 * t, 20.0,
+                        0.0, 0.0, 0.0, 0, 0)
+                     for t in [102.0 + k * 2.0 for k in range(15)]])
+    plv.refresh()
+    check(not plv.rows, "pit lane: a los 2 minutos expira la retención")
 
     # gestor de notificaciones: los eventos del demo quedaron en el log
     kinds_logged = {k for _s, k, _c, _t in win.notifier.log}
@@ -1067,6 +1627,66 @@ def test_app_demo(app: QApplication) -> None:
     pump(app, 0.6)
     lw = win.lap_wheel
     check(len(lw._dots) == 6, f"rueda: un punto por auto ({len(lw._dots)})")
+    lw_item = lw.filter_btn.list.item(0)
+    lw_item.setCheckState(Qt.Unchecked)
+    check(len(lw._dots) == 5, f"rueda: filtro 👥 oculta el auto ({len(lw._dots)})")
+    lw_item.setCheckState(Qt.Checked)
+    check(len(lw._dots) == 6, "rueda: filtro 👥 restaurado")
+    # fuera de carrera: sin punto y sin intervalos contra ese auto
+    win.hub.last_move_t[first] = -1e9
+    lw.refresh()
+    check(first not in lw._dots and len(lw._dots) == 5,
+          "rueda: fuera de carrera sin punto en la rueda")
+    check(all(first not in (iv[0], iv[1]) for iv in lw._intervals),
+          "rueda: sin intervalos contra un auto fuera de carrera")
+    win.hub.last_move_t[first] = win.hub.latest_t
+    lw.refresh()
+    check(len(lw._dots) == 6, "rueda: restaurado tras reaparecer datos")
+    # modo elástico (⏱ Gap): líder en el norte, ángulos crecen con el orden
+    win.tower.refresh()
+    lw.elastic_btn.click()
+    check(lw.elastic() and bool(win.cfg["ui"].get("wheel_elastic")),
+          "rueda: modo gap activado y persistido")
+    lead_drv = win.tower.rows[0].drv
+    check(lead_drv in lw._dots and lw._dots[lead_drv][0] < 1.0,
+          f"rueda: líder en el norte en modo gap "
+          f"({lw._dots.get(lead_drv, (99,))[0]:.1f}°)")
+    angs = [lw._dots[r.drv][0] for r in win.tower.rows if r.drv in lw._dots]
+    check(all(b >= a for a, b in zip(angs, angs[1:])),
+          f"rueda: ángulos por gap siguen el orden de carrera "
+          f"({[f'{a:.0f}' for a in angs]})")
+    lw.elastic_btn.click()
+    check(not lw.elastic(), "rueda: vuelta al modo físico")
+
+    # Track dominance: cada µ pintado con el color del más rápido
+    win._catalog_checks["dominance"].setChecked(True)
+    pump(app, 0.4)
+    dv = win.dominance_view
+    dv._invalidate()
+    n_mu_dom = win.tower.analyzer.n_micro()
+    check(len(dv._seg_items) == n_mu_dom == sum(dv.counts.values()),
+          f"dominance: todos los µ pintados "
+          f"({len(dv._seg_items)}/{n_mu_dom})")
+    check(len(dv.counts) >= 1 and all(v > 0 for v in dv.counts.values()),
+          f"dominance: leyenda con dominadores ({dv.counts})")
+    check(len(dv._label_items) >= 1,
+          f"dominance: iniciales sobre las zonas ({len(dv._label_items)})")
+    top_dom = max(dv.counts, key=dv.counts.get)
+    item_dom = next(dv.filter_btn.list.item(i)
+                    for i in range(dv.filter_btn.list.count())
+                    if dv.filter_btn.list.item(i).data(Qt.UserRole) == top_dom)
+    item_dom.setCheckState(Qt.Unchecked)
+    check(top_dom not in dv.counts
+          and sum(dv.counts.values()) == n_mu_dom,
+          "dominance: sin el dominador, sus µ pasan a los demás")
+    item_dom.setCheckState(Qt.Checked)
+    dv.from_spin.setValue(900)  # rango imposible: mapa sin pintar
+    check(not dv._seg_items and not dv._label_items
+          and "no timed laps" in dv.legend.text(),
+          "dominance: rango sin vueltas queda vacío")
+    dv.from_spin.setValue(0)
+    check(sum(dv.counts.values()) == n_mu_dom,
+          "dominance: rango restaurado repinta todo")
     L_w = win.hub.track_length
     worst_deg = 0.0
     for drv, (angle, _code, _color) in lw._dots.items():
@@ -1319,6 +1939,7 @@ def main() -> int:
     test_capture_source()
     test_gap_grid_offset()
     test_catch_projection()
+    test_delta_wave()
     test_app_demo(app)
     print()
     if FAILURES:

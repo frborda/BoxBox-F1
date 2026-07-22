@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..hub import DataHub
-from ..timing import N_MICRO, SECTOR_STEP, TimingAnalyzer
+from ..timing import SECTOR_STEP, TimingAnalyzer
 from . import theme
 from .charts import HoverProbe, QualyChart, series_pens
 from .docks import Detachable
@@ -44,9 +44,8 @@ def _chip_css(delta: float | None) -> str:
 class _DeltaCard(QFrame):
     """Tarjeta de un piloto contra la target: delta total de la vuelta bien
     visible y una fila por sector — el chip del sector a la izquierda y sus
-    8 microsectores alineados a la derecha, sin scroll horizontal."""
-
-    MICRO_COLS = N_MICRO // 3  # µ por sector (una fila por sector)
+    microsectores alineados a la derecha, sin scroll horizontal. La cantidad
+    de µ por sector puede variar (panel Microsectors)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -70,25 +69,43 @@ class _DeltaCard(QFrame):
         head.addWidget(self.total)
         lay.addLayout(head)
 
-        # fila s: [chip del sector | sus 8 microsectores alineados]
+        # fila s: [chip del sector | sus µ alineados]
         self.grid = QGridLayout()
         self.grid.setSpacing(3)
-        self.sectors = []
-        self.micros = []
+        self.sectors: list[QLabel] = []
+        self.micros: list[QLabel] = []
+        self._counts: tuple[int, ...] = ()
+        self._max_cols = 0
+        self.set_layout((SECTOR_STEP,) * 3)
+        lay.addLayout(self.grid)
+
+    def set_layout(self, counts) -> None:
+        """Rearma la grilla si cambió la cantidad de µ por sector."""
+        counts = tuple(int(c) for c in counts)
+        if counts == self._counts:
+            return
+        self._counts = counts
+        for w in self.sectors + self.micros:
+            self.grid.removeWidget(w)
+            w.deleteLater()
+        self.sectors, self.micros = [], []
+        for c in range(1, self._max_cols + 1):
+            self.grid.setColumnStretch(c, 0)
         for s in range(3):
             sec = QLabel(f"S{s + 1} —")
             sec.setAlignment(Qt.AlignCenter)
             sec.setMinimumWidth(72)
             self.grid.addWidget(sec, s, 0)
             self.sectors.append(sec)
-        for i in range(N_MICRO):
-            chip = QLabel("—")
-            chip.setAlignment(Qt.AlignCenter)
-            self.grid.addWidget(chip, i // self.MICRO_COLS, 1 + (i % self.MICRO_COLS))
-            self.micros.append(chip)
-        for c in range(1, self.MICRO_COLS + 1):
+        for s, cnt in enumerate(counts):
+            for j in range(cnt):
+                chip = QLabel("—")
+                chip.setAlignment(Qt.AlignCenter)
+                self.grid.addWidget(chip, s, 1 + j)
+                self.micros.append(chip)
+        self._max_cols = max(max(counts), 1)
+        for c in range(1, self._max_cols + 1):
             self.grid.setColumnStretch(c, 1)
-        lay.addLayout(self.grid)
 
     def show_empty(self, code_html: str) -> None:
         self.title.setText(code_html)
@@ -215,6 +232,7 @@ class QualyView(QWidget):
 
         hub.driversChanged.connect(self._restyle)
         hub.driversChanged.connect(self._rebuild_ref_drivers)
+        self._laps_shown: tuple = (None, [])  # (piloto, vueltas) del combo
         self.ref_driver_combo.currentIndexChanged.connect(self._refresh_ref_laps)
         self._laps_timer = QTimer(self)
         self._laps_timer.setInterval(2000)
@@ -245,9 +263,11 @@ class QualyView(QWidget):
             return
         buf = self.hub.buffers.get(drv)
         laps = buf.completed_laps() if buf else []
-        if laps == [self.ref_lap_combo.itemData(i)
-                    for i in range(self.ref_lap_combo.count())]:
+        # el guard incluye al piloto: al cambiar el Target hay que reescribir
+        # los tiempos aunque los números de vuelta coincidan
+        if (drv, laps) == self._laps_shown:
             return
+        self._laps_shown = (drv, list(laps))
         current = self.ref_lap_combo.currentData()
         self.ref_lap_combo.blockSignals(True)
         self.ref_lap_combo.clear()
@@ -266,7 +286,7 @@ class QualyView(QWidget):
         lap = self.ref_lap_combo.currentData()
         if drv is None or lap is None:
             QMessageBox.information(
-                self, "F1 Live Telemetry",
+                self, "BoxBox-F1",
                 "That driver has no completed laps to use as target yet.",
             )
             return
@@ -363,9 +383,10 @@ class QualyView(QWidget):
         lap_time = self.analyzer.lap_time(drv, lap)
         caption = f"Target: {self._code_of(drv)} · Lap {lap} · {fmt_laptime(lap_time)}"
         if marks is not None:
+            i1, i2 = self.analyzer._sector_idx
+            pts = (0, i1, i2, len(marks) - 1)
             sectors = [
-                float(marks[(k + 1) * SECTOR_STEP] - marks[k * SECTOR_STEP])
-                for k in range(3)
+                float(marks[pts[k + 1]] - marks[pts[k]]) for k in range(3)
             ]
             caption += " · S: " + " / ".join(fmt_secs(s) for s in sectors)
         caption += "   —   Δ: + losing / − gaining"
@@ -440,8 +461,15 @@ class QualyView(QWidget):
         )
 
     def _update_cards(self) -> None:
-        ref_marks = self._ref["marks"] if self._ref is not None else None
+        # marcas de la target releídas del analyzer (no las guardadas al
+        # apretar Set): si cambió la config del panel Microsectors, las
+        # viejas quedan con otro largo y la comparación sería inválida
+        ref_marks = (self.analyzer.lap_marks(self._ref["drv"], self._ref["lap"])
+                     if self._ref is not None else None)
+        slices = self.analyzer.sector_slices()
+        counts = tuple(b - a for a, b in slices)
         for drv, card in self.cards.items():
+            card.set_layout(counts)
             cur_data = self._current_elapsed(drv)
             marks = cur_data[2] if cur_data is not None else None
             cur_lap = cur_data[3] if cur_data is not None else 0
@@ -460,7 +488,7 @@ class QualyView(QWidget):
                 last_idx = i - 1 if i >= 1 else None  # µsector que termina en la marca i
             sector_deltas = []
             for k in range(3):
-                a, b = k * SECTOR_STEP, (k + 1) * SECTOR_STEP
+                a, b = slices[k][0], slices[k][1]
                 if both[a] and both[b]:
                     sector_deltas.append(
                         float((marks[b] - marks[a]) - (ref_marks[b] - ref_marks[a]))

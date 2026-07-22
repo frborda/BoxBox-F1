@@ -415,6 +415,7 @@ class ReplaySource(BaseSource):
                 "type": str(info.get("Type") or session.name or ""),
                 "meeting": str((info.get("Meeting") or {}).get("Name") or ""),
                 "name": str(info.get("Name") or session.name or ""),
+                "year": self.year,  # clave circuito+año de los microsectores
             })
         except Exception:
             pass

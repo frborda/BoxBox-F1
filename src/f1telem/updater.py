@@ -23,11 +23,11 @@ from . import __version__, config
 REPO = "frborda/F1-Live-Telemetry"
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_URL = f"https://github.com/{REPO}/releases"
-ASSET_NAME = "F1LiveTelemetry-win64.zip"
-EXE_NAME = "F1LiveTelemetry.exe"
+ASSET_NAME = "BoxBox-F1-win64.zip"
+EXE_NAME = "BoxBox-F1.exe"
 _HTTP_HEADERS = {
     "Accept": "application/vnd.github+json",
-    "User-Agent": "F1LiveTelemetry",
+    "User-Agent": "BoxBox-F1",
 }
 
 
@@ -120,7 +120,7 @@ def cleanup() -> None:
     if target is not None:
         leftovers = [
             target / (EXE_NAME + ".old"), target / "_internal.old",
-            target / "capture" / "F1TelemCapture.exe.old",
+            target / "capture" / "BoxBox-F1-Capture.exe.old",
             target / "capture" / "_internal.old",
         ]
         for leftover in leftovers:
@@ -185,7 +185,7 @@ def extract(zip_path: Path) -> Path:
     raise RuntimeError(f"{EXE_NAME} not found inside the downloaded zip.")
 
 
-# Script que aplica la actualización de la app principal (F1LiveTelemetry).
+# Script que aplica la actualización de la app principal (BoxBox-F1).
 # La carpeta del capturador (Target\capture) tiene su propio _internal y solo
 # se actualiza si NO hay un capturador corriendo — así una captura en vivo no
 # se frena. Respalda exe y _internal como *.old y hace rollback si la copia
@@ -215,7 +215,7 @@ function Retry([scriptblock]$Action, [int]$Times = 10) {
     }
 }
 
-$exe = Join-Path $Target "F1LiveTelemetry.exe"
+$exe = Join-Path $Target "BoxBox-F1.exe"
 try {
     if ($DoMain -eq "1") {
         Log "Waiting for process $ProcId to exit"
@@ -225,7 +225,7 @@ try {
         $deadline = (Get-Date).AddMinutes(10)
         $running = @()
         while ((Get-Date) -lt $deadline) {
-            $running = @(Get-Process -Name "F1LiveTelemetry" -ErrorAction SilentlyContinue |
+            $running = @(Get-Process -Name "BoxBox-F1" -ErrorAction SilentlyContinue |
                          Where-Object { $_.Path -eq $exe })
             if ($running.Count -eq 0) { break }
             Start-Sleep -Seconds 2
@@ -277,13 +277,13 @@ try {
         $capSrc = Join-Path $Source "capture"
         $capDst = Join-Path $Target "capture"
         if (Test-Path $capSrc) {
-            $capExe = Join-Path $capDst "F1TelemCapture.exe"
+            $capExe = Join-Path $capDst "BoxBox-F1-Capture.exe"
             # una captura en curso nunca se interrumpe: esperar (hasta 60 min)
             # a que el capturador se cierre para reemplazarlo
             $deadline = (Get-Date).AddMinutes(60)
             $capRun = @()
             while ((Get-Date) -lt $deadline) {
-                $capRun = @(Get-Process -Name "F1TelemCapture" -ErrorAction SilentlyContinue |
+                $capRun = @(Get-Process -Name "BoxBox-F1-Capture" -ErrorAction SilentlyContinue |
                             Where-Object { $_.Path -eq $capExe })
                 if ($capRun.Count -eq 0) { break }
                 Start-Sleep -Seconds 5

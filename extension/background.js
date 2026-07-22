@@ -1,4 +1,4 @@
-// F1 Live Telemetry Companion — service worker.
+// BoxBox-F1 Companion — service worker.
 //
 // Flujo: la app abre https://f1login.fastf1.dev?port=N (mismo disparador que
 // usa FastF1, así la app no cambia). Acá guardamos el puerto, llevamos al

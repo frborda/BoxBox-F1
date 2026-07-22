@@ -33,8 +33,11 @@ class RaceControlPanel(QWidget):
         self._count = 0
 
     def refresh(self) -> None:
-        rows = self.hub.race_control
-        if len(rows) < self._count:  # seek de la captura: historia re-emitida
+        # sin spoilers: solo mensajes hasta el instante actual del timeline
+        # (el replay publica la lista completa por adelantado)
+        rows = [r for r in self.hub.race_control
+                if float(r.get("t", 0.0)) <= self.hub.latest_t]
+        if len(rows) < self._count:  # seek atrás / historia re-emitida
             self.clear_data()
         if len(rows) == self._count:
             return

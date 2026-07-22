@@ -79,11 +79,11 @@ staging.mkdir(parents=True, exist_ok=True)
 zip_path = staging / updater.ASSET_NAME
 with zipfile.ZipFile(zip_path, "w") as zf:
     # Compress-Archive usa "\" como separador: reproducirlo tal cual
-    zf.writestr(r"F1LiveTelemetry\F1LiveTelemetry.exe", "new-exe")
-    zf.writestr(r"F1LiveTelemetry\capture.ps1", "new-launcher")
-    zf.writestr(r"F1LiveTelemetry\_internal\lib.dll", "new-lib")
+    zf.writestr(r"BoxBox-F1\BoxBox-F1.exe", "new-exe")
+    zf.writestr(r"BoxBox-F1\capture.ps1", "new-launcher")
+    zf.writestr(r"BoxBox-F1\_internal\lib.dll", "new-lib")
 payload = updater.extract(zip_path)
-check((payload / "F1LiveTelemetry.exe").read_text() == "new-exe",
+check((payload / "BoxBox-F1.exe").read_text() == "new-exe",
       "extract: encuentra la carpeta del exe")
 check((payload / "_internal" / "lib.dll").exists(), "extract: rutas con backslash")
 check(not zip_path.exists(), "extract: borra el zip")
@@ -92,16 +92,16 @@ check(not zip_path.exists(), "extract: borra el zip")
 
 target = Path(_TMP) / "install"
 (target / "_internal").mkdir(parents=True)
-(target / "F1LiveTelemetry.exe").write_text("old-exe")
+(target / "BoxBox-F1.exe").write_text("old-exe")
 (target / "_internal" / "lib.dll").write_text("old-lib")
 (target / "_internal" / "stale.dll").write_text("only-in-old")
 (target / "user-notes.txt").write_text("keep-me")
 # capturador con su propia carpeta (exe separado)
 (target / "capture" / "_internal").mkdir(parents=True)
-(target / "capture" / "F1TelemCapture.exe").write_text("old-cap")
+(target / "capture" / "BoxBox-F1-Capture.exe").write_text("old-cap")
 (target / "capture" / "_internal" / "cap.dll").write_text("old-cap-lib")
 (payload / "capture" / "_internal").mkdir(parents=True)
-(payload / "capture" / "F1TelemCapture.exe").write_text("new-cap")
+(payload / "capture" / "BoxBox-F1-Capture.exe").write_text("new-cap")
 (payload / "capture" / "_internal" / "cap.dll").write_text("new-cap-lib")
 
 script = staging / "apply_update.ps1"
@@ -121,7 +121,7 @@ result = subprocess.run(
 )
 log_text = log.read_text() if log.exists() else "(sin log)"
 check(result.returncode == 0, f"helper: exit 0 (log: {log_text.strip()[-400:]})")
-check((target / "F1LiveTelemetry.exe").read_text() == "new-exe",
+check((target / "BoxBox-F1.exe").read_text() == "new-exe",
       "helper: exe reemplazado")
 check((target / "_internal" / "lib.dll").read_text() == "new-lib",
       "helper: _internal reemplazado")
@@ -129,11 +129,11 @@ check(not (target / "_internal" / "stale.dll").exists(),
       "helper: _internal viejo no deja archivos huérfanos")
 check((target / "user-notes.txt").read_text() == "keep-me",
       "helper: conserva archivos ajenos en la carpeta")
-check(not (target / "F1LiveTelemetry.exe.old").exists(), "helper: limpia el backup")
+check(not (target / "BoxBox-F1.exe.old").exists(), "helper: limpia el backup")
 check(not (target / "_internal.old").exists(), "helper: limpia _internal.old")
 check(not payload.exists(), "helper: limpia el payload extraído")
 check("Main app updated" in log_text, "helper: log de éxito de la app")
-check((target / "capture" / "F1TelemCapture.exe").read_text() == "new-cap",
+check((target / "capture" / "BoxBox-F1-Capture.exe").read_text() == "new-cap",
       "helper: capturador reemplazado (sin capturador corriendo)")
 check("Capturer updated" in log_text, "helper: log de éxito del capturador")
 
@@ -142,8 +142,8 @@ check("Capturer updated" in log_text, "helper: log de éxito del capturador")
 # solo el capturador (DoMain=0): la app principal no se toca
 payload2 = staging / "payload2"
 (payload2 / "capture" / "_internal").mkdir(parents=True)
-(payload2 / "F1LiveTelemetry.exe").write_text("newer-exe")
-(payload2 / "capture" / "F1TelemCapture.exe").write_text("cap-v2")
+(payload2 / "BoxBox-F1.exe").write_text("newer-exe")
+(payload2 / "capture" / "BoxBox-F1-Capture.exe").write_text("cap-v2")
 (payload2 / "capture" / "_internal" / "cap.dll").write_text("cap-lib-v2")
 log2 = staging / "update2.log"
 result = subprocess.run(
@@ -158,18 +158,18 @@ result = subprocess.run(
 )
 log2_text = log2.read_text() if log2.exists() else "(sin log)"
 check(result.returncode == 0, f"helper: solo-capturador exit 0 ({log2_text.strip()[-200:]})")
-check((target / "F1LiveTelemetry.exe").read_text() == "new-exe",
+check((target / "BoxBox-F1.exe").read_text() == "new-exe",
       "helper: DoMain=0 no toca la app principal")
-check((target / "capture" / "F1TelemCapture.exe").read_text() == "cap-v2",
+check((target / "capture" / "BoxBox-F1-Capture.exe").read_text() == "cap-v2",
       "helper: DoCapture=1 reemplaza el capturador")
 
 # solo la app (DoCapture=0): el capturador no se toca
 payload3 = staging / "payload3"
 (payload3 / "_internal").mkdir(parents=True)
-(payload3 / "F1LiveTelemetry.exe").write_text("exe-v3")
+(payload3 / "BoxBox-F1.exe").write_text("exe-v3")
 (payload3 / "_internal" / "lib.dll").write_text("lib-v3")
 (payload3 / "capture").mkdir()
-(payload3 / "capture" / "F1TelemCapture.exe").write_text("cap-v3")
+(payload3 / "capture" / "BoxBox-F1-Capture.exe").write_text("cap-v3")
 log3 = staging / "update3.log"
 result = subprocess.run(
     [updater._powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -181,9 +181,9 @@ result = subprocess.run(
      "-DoMain", "1", "-DoCapture", "0"],
     capture_output=True, text=True, timeout=180,
 )
-check((target / "F1LiveTelemetry.exe").read_text() == "exe-v3",
+check((target / "BoxBox-F1.exe").read_text() == "exe-v3",
       "helper: DoMain=1 reemplaza la app")
-check((target / "capture" / "F1TelemCapture.exe").read_text() == "cap-v2",
+check((target / "capture" / "BoxBox-F1-Capture.exe").read_text() == "cap-v2",
       "helper: DoCapture=0 no toca el capturador")
 
 # ------------------------------------------------------- limpieza

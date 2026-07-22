@@ -85,8 +85,10 @@ class SessionStrip(QWidget):
         self.clock_label.setText(
             f"⏱ {fmt_clock(remaining)}" if remaining is not None else "")
 
-        if hub.race_control:
-            msg = hub.race_control[-1]
+        # último mensaje HASTA el instante del timeline (sin spoilers)
+        msg = next((m for m in reversed(hub.race_control)
+                    if float(m.get("t", 0.0)) <= hub.latest_t), None)
+        if msg is not None:
             lap = msg.get("lap")
             prefix = f"L{lap} · " if lap else ""
             color = theme.FLAG_COLORS.get(

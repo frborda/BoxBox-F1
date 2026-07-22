@@ -14,12 +14,17 @@ import math
 import numpy as np
 from PySide6.QtCore import Qt, QPointF, QRectF
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QComboBox, QHBoxLayout, QLabel, QToolButton, QVBoxLayout, QWidget,
+)
+
+from .. import config
 
 from ..hub import DataHub
 from ..timing import TimingAnalyzer
 from . import theme
 from .charts import EdgeSmoother
+from .driver_filter import DriverFilterButton
 from .pit_strategy import current_gaps, pit_lane_bounds, project_rejoin
 
 RING_COLOR = "#3a3f4a"      # mismo gris que el trazado del track map
@@ -59,9 +64,12 @@ class LapWheelView(QWidget):
         self._ghost: tuple[str, float] | None = None        # (drv, ángulo)
         # anillo interno: [(detrás, adelante, segundos, áng_detrás, barrido)]
         self._intervals: list[tuple[str, str, float, float, float]] = []
-        # tramo de boxes (áng_entrada, barrido); cache por visitas cerradas
+        # tramo de boxes (áng_entrada, barrido); recalculado con throttle de
+        # tiempo: las visitas pueden llegar ANTES que la telemetría que
+        # permite ubicarlas (replay publica la historia junta) y la mediana
+        # se afina con cada parada nueva
         self._pit_arc: tuple[float, float] | None = None
-        self._pit_arc_n = -1
+        self._pit_arc_t = 0.0
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 2, 4, 4)
@@ -74,7 +82,26 @@ class LapWheelView(QWidget):
         self.result_label = QLabel("")
         self.result_label.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         row.addWidget(self.result_label, stretch=1)
+        # modo elástico: el anillo pasa de posición física a TIEMPO — autos
+        # espaciados por gap (líder en el norte, 1 vuelta = 360°): las
+        # batallas se ven como racimos y los trenes de DRS saltan a la vista
+        self.elastic_btn = QToolButton()
+        self.elastic_btn.setText("⏱ Gap")
+        self.elastic_btn.setCheckable(True)
+        self.elastic_btn.setAutoRaise(True)
+        self.elastic_btn.setToolTip(
+            "Elastic mode: cars spaced by TIME gap (leader at north, one "
+            "lap of pace = full circle) instead of physical lap position")
+        self.elastic_btn.setChecked(bool(self.cfg.get("ui", {})
+                                         .get("wheel_elastic", False)))
+        self.elastic_btn.clicked.connect(self._elastic_toggled)
+        row.addWidget(self.elastic_btn)
+        # filtro local de autos visibles (independiente del panel Drivers)
+        self.filter_btn = DriverFilterButton(hub, cfg, "wheel_hidden_cars")
+        self.filter_btn.changed.connect(self.refresh)
+        row.addWidget(self.filter_btn)
         lay.addLayout(row)
+        self._lap_ref = 90.0  # s por vuelta usados como escala del modo gap
         self.canvas = _WheelCanvas(self)
         lay.addWidget(self.canvas, stretch=1)
 
@@ -103,12 +130,49 @@ class LapWheelView(QWidget):
         self._ghost = None
         self._intervals = []
         self._pit_arc = None
-        self._pit_arc_n = -1
+        self._pit_arc_t = 0.0
         self.result_label.setText("")
         self.canvas.update()
 
     def pit_window_value(self) -> float:
         return float(self.cfg.get("strategy", {}).get("pit_window", 20.0))
+
+    def _elastic_toggled(self, on: bool) -> None:
+        if self.cfg:
+            self.cfg.setdefault("ui", {})["wheel_elastic"] = bool(on)
+            config.save_config(self.cfg)
+        self.refresh()
+
+    def elastic(self) -> bool:
+        return self.elastic_btn.isChecked()
+
+    def _elastic_dots(self, pts: dict, ordered: list) -> dict:
+        """Ángulo por auto en modo gap: líder en el norte y cada auto a
+        (gap al líder / vuelta de referencia)·360° — una vuelta de ritmo
+        es el círculo completo, así los doblados también cierran bien."""
+        hub = self.hub
+        leader = ordered[0]
+        last = self.analyzer.last_completed_lap(leader)
+        lap_ref = self.analyzer.lap_time(leader, last) if last else float("nan")
+        if not (lap_ref == lap_ref and lap_ref > 10.0):
+            lap_ref = self._lap_ref  # sin vuelta cerrada: última escala
+        self._lap_ref = float(lap_ref)
+        pos_l, t_l = pts[leader]
+        dots: dict[str, tuple[float, str, str]] = {}
+        for drv in ordered:
+            pos, t = pts[drv]
+            pd = float(pos[-1])
+            if float(pos_l[0]) <= pd <= float(pos_l[-1]):
+                gap = float(t[-1]) - float(np.interp(pd, pos_l, t_l))
+            elif drv == leader:
+                gap = 0.0
+            else:
+                continue  # sin historia del líder en ese punto todavía
+            info = hub.drivers.get(drv)
+            dots[drv] = ((gap / lap_ref * 360.0) % 360.0,
+                         info.code if info else drv,
+                         info.color if info else "#9aa0a6")
+        return dots
 
     # ------------------------------------------------------------ refresco
 
@@ -121,6 +185,8 @@ class LapWheelView(QWidget):
         dots: dict[str, tuple[float, str, str]] = {}
         pts: dict[str, tuple] = {}
         for drv, buf in hub.buffers.items():
+            if drv in self.filter_btn.hidden or not hub.is_active(drv):
+                continue  # ocultado acá, o abandonó / quedó clavado
             pt = self.analyzer.position_time(drv)
             if pt is None or len(pt[0]) < 2:
                 continue
@@ -133,18 +199,26 @@ class LapWheelView(QWidget):
             dots[drv] = ((pos % L) / L * 360.0,
                          info.code if info else drv,
                          info.color if info else "#9aa0a6")
+        ordered = sorted(pts, key=lambda d: float(pts[d][0][-1]), reverse=True)
+        if self.elastic() and ordered:
+            # modo gap: ángulos por tiempo detrás del líder, no por
+            # posición física en la vuelta
+            dots = self._elastic_dots(pts, ordered)
         self._dots = dots
 
         # anillo interno: intervalos entre autos consecutivos (en orden de
         # carrera); el arco une al de atrás con el de adelante y gira con
         # los ángulos suavizados, el valor se recalcula con cada refresco
-        ordered = sorted(pts, key=lambda d: float(pts[d][0][-1]), reverse=True)
         intervals: list[tuple[str, str, float, float, float]] = []
         for i in range(len(ordered) - 1):
             ahead, behind = ordered[i], ordered[i + 1]
             pos_a, t_a = pts[ahead]
             pos_b, t_b = pts[behind]
             p_b = float(pos_b[-1])
+            if float(pos_a[-1]) - p_b > 0.6 * L:
+                # a más de media vuelta (doblados) el arco angular ya no
+                # representa la distancia real entre ambos
+                continue
             if not (float(pos_a[0]) <= p_b <= float(pos_a[-1])):
                 continue  # el de adelante aún no tiene historia en ese punto
             secs = float(t_b[-1]) - float(np.interp(p_b, pos_a, t_a))
@@ -155,11 +229,11 @@ class LapWheelView(QWidget):
             intervals.append((behind, ahead, secs, b_ang, span))
         self._intervals = intervals
 
-        # tramo de la calle de boxes (recalcular solo con visitas nuevas)
-        n_closed = sum(1 for visits in hub.pit_lane.values()
-                       for v in visits if v[2] is not None)
-        if n_closed != self._pit_arc_n:
-            self._pit_arc_n = n_closed
+        # tramo de la calle de boxes: reintentar cada 2 s — el primer
+        # cálculo suele fallar porque la telemetría que ubica las visitas
+        # llega después que las visitas mismas
+        if now - self._pit_arc_t > 2.0:
+            self._pit_arc_t = now
             bounds = pit_lane_bounds(hub)
             if bounds is None:
                 self._pit_arc = None
@@ -178,7 +252,11 @@ class LapWheelView(QWidget):
             window = self.pit_window_value()
             pos, t = pts[sim]
             t_ghost = float(t[-1]) - window
-            if t_ghost > float(t[0]):
+            if self.elastic() and sim in dots:
+                # en modo gap el fantasma cae `window` segundos más atrás
+                self._ghost = (sim, (dots[sim][0]
+                                     + window / self._lap_ref * 360.0) % 360.0)
+            elif t_ghost > float(t[0]):
                 raw = float(np.interp(t_ghost, t, pos))
                 # el fantasma avanza con el mismo motor de reproducción que
                 # los autos: fluido aunque el feed llegue en ráfagas
@@ -200,7 +278,7 @@ class LapWheelView(QWidget):
                               f"{binfo.code if binfo else behind_drv}")
                 self.result_label.setText(
                     f"{code} pits now ({window:.1f}s): → P{new_pos}{behind_txt}")
-        elif not sim:
+        else:
             self.result_label.setText("")
         self.canvas.update()
 
@@ -238,37 +316,47 @@ class LapWheelView(QWidget):
         f_sector.setBold(True)
         f_code = QFont(self.font()); f_code.setPointSizeF(9.0); f_code.setBold(True)
 
+        elastic = self.elastic()
         # anillo gris único (mismo tono que el trazado del track map)
         rect = QRectF(cx - radius, cy - radius, 2 * radius, 2 * radius)
         p.setPen(QPen(QColor(RING_COLOR), 5))
         p.setBrush(Qt.NoBrush)
         p.drawEllipse(rect)
 
-        # amarillas por sector vigentes: arco amarillo sobre el anillo
-        pen_y = QPen(QColor(YELLOW_COLOR), 6)
-        p.setPen(pen_y)
-        for a0, a1 in self._active_yellows_deg():
-            span = (a1 - a0) % 360.0
-            if span <= 0.0:
-                span = 360.0
-            p.drawArc(rect, int((90.0 - a0 - span) * 16), int(span * 16))
+        if elastic:
+            # el anillo es TIEMPO: sin amarillas/sectores/curvas físicas
+            p.setFont(f_small)
+            p.setPen(QColor(theme.TEXT_MUTED))
+            p.drawText(QRectF(cx - 80, cy + radius - 4, 160, 14),
+                       Qt.AlignCenter,
+                       f"GAP MODE · lap = {self._lap_ref:.0f}s")
 
-        # delimitación de sectores: rayas radiales bien marcadas + etiquetas
-        b1, b2 = self._sector_bounds_deg()
-        p.setPen(QPen(QColor(theme.TEXT), 2.5))
-        for angle in (b1, b2):
-            p.drawLine(self._xy(cx, cy, radius - 12, angle),
-                       self._xy(cx, cy, radius + 12, angle))
-        p.setFont(f_sector)
-        p.setPen(QColor(theme.TEXT_MUTED))
-        for (a0, a1), label in zip(((0.0, b1), (b1, b2), (b2, 360.0)),
-                                   ("S1", "S2", "S3")):
-            mid = self._xy(cx, cy, radius - 22, (a0 + a1) / 2.0)
-            p.drawText(QRectF(mid.x() - 14, mid.y() - 8, 28, 16),
-                       Qt.AlignCenter, label)
+        # amarillas por sector vigentes: arco amarillo sobre el anillo
+        if not elastic:
+            pen_y = QPen(QColor(YELLOW_COLOR), 6)
+            p.setPen(pen_y)
+            for a0, a1 in self._active_yellows_deg():
+                span = (a1 - a0) % 360.0
+                if span <= 0.0:
+                    span = 360.0
+                p.drawArc(rect, int((90.0 - a0 - span) * 16), int(span * 16))
+
+            # delimitación de sectores: rayas radiales + etiquetas
+            b1, b2 = self._sector_bounds_deg()
+            p.setPen(QPen(QColor(theme.TEXT), 2.5))
+            for angle in (b1, b2):
+                p.drawLine(self._xy(cx, cy, radius - 12, angle),
+                           self._xy(cx, cy, radius + 12, angle))
+            p.setFont(f_sector)
+            p.setPen(QColor(theme.TEXT_MUTED))
+            for (a0, a1), label in zip(((0.0, b1), (b1, b2), (b2, 360.0)),
+                                       ("S1", "S2", "S3")):
+                mid = self._xy(cx, cy, radius - 22, (a0 + a1) / 2.0)
+                p.drawText(QRectF(mid.x() - 14, mid.y() - 8, 28, 16),
+                           Qt.AlignCenter, label)
 
         # tramo de la calle de boxes: arco punteado apenas por dentro
-        if self._pit_arc is not None:
+        if self._pit_arc is not None and not elastic:
             a_in, span = self._pit_arc
             r_pit = radius - 10
             rect_pit = QRectF(cx - r_pit, cy - r_pit, 2 * r_pit, 2 * r_pit)
@@ -282,25 +370,26 @@ class LapWheelView(QWidget):
             p.drawText(QRectF(mid_pit.x() - 15, mid_pit.y() - 7, 30, 14),
                        Qt.AlignCenter, "PIT")
 
-        # meta (norte): tick fuerte + S/F
+        # norte: meta (modo físico) o el líder (modo gap)
         p.setPen(QPen(QColor(theme.TEXT), 3))
         p.drawLine(self._xy(cx, cy, radius - 10, 0.0),
                    self._xy(cx, cy, radius + 10, 0.0))
         p.setPen(QColor(theme.TEXT))
         p.setFont(f_small)
         p.drawText(QRectF(cx - 16, cy - radius - 26, 32, 14),
-                   Qt.AlignCenter, "S/F")
+                   Qt.AlignCenter, "LDR" if elastic else "S/F")
 
         # curvas del circuito: tick corto + etiqueta por fuera
-        p.setFont(f_corner)
-        for label, dist, _x, _y in self.hub.corners:
-            angle = (float(dist) % L) / L * 360.0
-            p.setPen(QPen(QColor(theme.TEXT_MUTED), 1))
-            p.drawLine(self._xy(cx, cy, radius - 5, angle),
-                       self._xy(cx, cy, radius + 5, angle))
-            tip = self._xy(cx, cy, radius + 15, angle)
-            p.drawText(QRectF(tip.x() - 15, tip.y() - 7, 30, 14),
-                       Qt.AlignCenter, label)
+        if not elastic:
+            p.setFont(f_corner)
+            for label, dist, _x, _y in self.hub.corners:
+                angle = (float(dist) % L) / L * 360.0
+                p.setPen(QPen(QColor(theme.TEXT_MUTED), 1))
+                p.drawLine(self._xy(cx, cy, radius - 5, angle),
+                           self._xy(cx, cy, radius + 5, angle))
+                tip = self._xy(cx, cy, radius + 15, angle)
+                p.drawText(QRectF(tip.x() - 15, tip.y() - 7, 30, 14),
+                           Qt.AlignCenter, label)
 
         # anillo interno: arcos entre autos consecutivos con su diferencia
         # en segundos (el arco cubre la pista que los separa y gira con

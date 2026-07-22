@@ -6,6 +6,7 @@ refresco, así no hacen falta locks.
 """
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
 
@@ -146,6 +147,22 @@ class DataHub(QObject):
         self.live_frames = False
         self._bounds_next_try = 0.0
         self._bounds_done = False
+        # frenaje observado por curva: {vértice_m: m de frenaje antes del
+        # vértice} derivado del canal de freno (la zona real depende de qué
+        # tan rápido se llega y cuánto hay que frenar). None hasta derivar;
+        # congelado después (las marcas de µsector deben quedar estables).
+        self.brake_dists: dict[float, float] | None = None
+        self._brakes_next_try = 0.0
+        # cortes de µsector personalizados (panel Microsectors), en metros de
+        # vuelta SIN contar los límites de sector (esos siempre están). None
+        # = colocación automática. Persisten por circuito+año en config.
+        self.custom_micro: list[float] | None = None
+        # autos fuera de carrera: retirados oficiales (Retired del feed) y
+        # último instante con el auto EN MOVIMIENTO (para detectar abandonos
+        # y autos clavados aunque la fuente no publique el retiro)
+        self.retired: set[str] = set()
+        self.last_move_t: dict[str, float] = {}
+        self._stew_cache: tuple | None = None
         # estado de los microsectores oficiales: {driver: {(sector, µ): estado}}
         self.segments: dict[str, dict[tuple[int, int], int]] = {}
         self.segment_counts: dict[int, int] = {}
@@ -177,10 +194,21 @@ class DataHub(QObject):
         self._lap_len_obs.clear()
         self._start_offsets.clear()
         self._dist_fix.clear()
+        self.last_move_t.clear()
         self.segments.clear()
 
     def on_corners(self, corners) -> None:
         self.corners = list(corners)
+
+    def circuit_key(self) -> str | None:
+        """Clave por circuito+año para persistir la config de microsectores:
+        la misma todo el fin de semana, sin importar la tanda cargada."""
+        meeting = str(self.session_meta.get("meeting") or "").strip().lower()
+        if not meeting:
+            return None
+        slug = re.sub(r"[^a-z0-9]+", "-", meeting).strip("-")
+        year = str(self.session_meta.get("year") or "").strip()
+        return f"{year}-{slug}" if year else slug
 
     def on_tyres(self, data) -> None:
         self.tyres = dict(data)
@@ -201,9 +229,114 @@ class DataHub(QObject):
         self.pit_lane = {drv: [list(v) for v in visits]
                          for drv, visits in data.items()}
 
+    # margen para el feed de timing apenas adelantado a la telemetría (vivo)
+    PIT_AHEAD_S = 3.0
+
+    _CAR_RE = re.compile(r"CARS? (\d+)|\b(\d+) \([A-Z]{3}\)")
+
+    def stewards_flags(self) -> dict[str, str]:
+        """Chip de comisarios por auto según dirección de carrera HASTA el
+        timeline: '⚠' investigación abierta; '+5s'/'+10s'/'DT'/'SG' sanción
+        pendiente (se limpia con PENALTY SERVED; la investigación con NO
+        FURTHER... o al decidirse la sanción)."""
+        sig = (len(self.race_control), round(self.latest_t, 1))
+        if self._stew_cache is not None and self._stew_cache[0] == sig:
+            return self._stew_cache[1]
+        inv: dict[str, bool] = {}
+        pen: dict[str, str] = {}
+        for msg in self.race_control:
+            if float(msg.get("t", 0.0)) > self.latest_t:
+                continue  # sin spoilers
+            text = str(msg.get("message", "")).upper()
+            cars = {a or b for a, b in self._CAR_RE.findall(text)}
+            if not cars:
+                continue
+            for num in cars:
+                if "NO FURTHER" in text:
+                    inv[num] = False
+                elif "UNDER INVESTIGATION" in text or "NOTED" in text:
+                    inv[num] = True
+                if "TIME PENALTY" in text:
+                    m = re.search(r"(\d+) SECOND", text)
+                    pen[num] = f"+{m.group(1)}s" if m else "PEN"
+                    inv[num] = False
+                elif "DRIVE THROUGH" in text:
+                    pen[num] = "DT"
+                    inv[num] = False
+                elif "STOP AND GO" in text or "STOP/GO" in text \
+                        or "STOP & GO" in text:
+                    pen[num] = "SG"
+                    inv[num] = False
+                if "SERVED" in text:
+                    pen.pop(num, None)
+        out: dict[str, str] = {}
+        for num in set(inv) | set(pen):
+            chip = pen.get(num) or ("⚠" if inv.get(num) else "")
+            if chip:
+                out[num] = chip
+        self._stew_cache = (sig, out)
+        return out
+
+    def tyres_until_now(self, drv: str) -> dict[int, tuple[str, int]]:
+        """Neumáticos por vuelta SOLO hasta la vuelta en curso del auto: el
+        replay/demo publican el plan completo por adelantado y ningún panel
+        debe adelantarse al timeline. Sin muestras del auto se usa la vuelta
+        del líder (fila visible sin espiar el futuro)."""
+        tyre_map = self.tyres.get(drv)
+        if not tyre_map:
+            return {}
+        buf = self.buffers.get(drv)
+        cur = buf.current_lap() if buf is not None and buf.n else 0
+        if cur <= 0:
+            cur = max((b.current_lap() for b in self.buffers.values() if b.n),
+                      default=0)
+        if cur <= 0:
+            return {}
+        return {lap: v for lap, v in tyre_map.items() if lap <= cur}
+
+    def on_retirements(self, nums) -> None:
+        self.retired = {str(n) for n in nums}
+
+    def is_active(self, drv: str, stale_s: float = 45.0) -> bool:
+        """Auto en competencia: no retirado oficialmente y con telemetría en
+        movimiento. Un auto clavado o sin datos frescos por stale_s queda
+        inactivo (abandono, auto en el garage); en boxes no caduca (paradas
+        largas, banderas rojas), y antes del primer cruce de meta tampoco
+        (la grilla está detenida)."""
+        if drv in self.retired:
+            return False
+        buf = self.buffers.get(drv)
+        if buf is None or not buf.n:
+            return False
+        if buf.current_lap() <= 1:
+            return True
+        visit = self.last_pit_visit(drv)
+        if visit is not None and self.pit_visit_open(visit):
+            return True
+        return self.latest_t - self.last_move_t.get(drv, 0.0) <= stale_s
+
     def last_pit_visit(self, drv: str) -> list | None:
+        """Última visita a boxes ya iniciada a latest_t. El replay publica
+        la historia completa de la sesión por adelantado: las visitas
+        futuras todavía no cuentan."""
         visits = self.pit_lane.get(drv)
-        return visits[-1] if visits else None
+        if not visits:
+            return None
+        limit = self.latest_t + self.PIT_AHEAD_S
+        for visit in reversed(visits):
+            if visit[1] <= limit:
+                return visit
+        return None
+
+    def pit_visit_open(self, visit: list) -> bool:
+        """True si la visita sigue en curso a latest_t: sin salida
+        registrada, o con la salida aún en el futuro (replay)."""
+        return visit[2] is None or self.latest_t < visit[2]
+
+    def pit_stops_done(self, drv: str) -> list[tuple[int, float]]:
+        """Paradas ya ocurridas a latest_t (el replay publica todas)."""
+        limit = self.latest_t + self.PIT_AHEAD_S
+        return [s for s in self.pits.get(drv, []) if s[1] <= limit]
 
     def pit_stationary_time(self, drv: str, t0: float, t1: float) -> float:
         """Segundos detenido (velocidad ~0) entre t0 y t1, de la telemetría."""
@@ -375,6 +508,54 @@ class DataHub(QObject):
                 or abs(b2 - self.sector_bounds[1]) > 2.0):
             self.sector_bounds = (b1, b2)
 
+    # detección del frenaje por curva (canal brake de la telemetría)
+    BRAKE_WINDOW = 450.0   # m antes del vértice donde buscar el frenaje
+    BRAKE_ON = 20.0        # % de pedal que cuenta como frenando
+    BRAKES_MIN_OBS = 4     # observaciones mínimas por curva
+
+    def maybe_derive_brake_zones(self) -> None:
+        """Mide dónde ARRANCA el frenaje de cada curva: primera muestra con
+        pedal > BRAKE_ON % acercándose al vértice, mediana entre vueltas y
+        pilotos. Una sola derivación por sesión (con 2+ autos con 2+ vueltas
+        cerradas): las marcas de µsector deben quedar estables. Curvas sin
+        frenadas observadas (viraje a fondo) quedan sin zona de frenaje."""
+        if self.brake_dists is not None or not self.corners:
+            return
+        now = time.monotonic()
+        if now < self._brakes_next_try:
+            return
+        self._brakes_next_try = now + 5.0
+        apexes = [float(d) for _l, d, _x, _y in self.corners]
+        obs: dict[int, list[float]] = {}
+        cars_ready = 0
+        for buf in self.buffers.values():
+            laps = buf.completed_laps()[-6:] if buf.n else []
+            if len(laps) < 2:
+                continue
+            cars_ready += 1
+            for lap in laps:
+                sl = buf.lap_slice(lap)
+                d_arr = sl["dist_lap"]
+                b_arr = sl["brake"]
+                if len(d_arr) < 8:
+                    continue
+                for j, c in enumerate(apexes):
+                    a = int(np.searchsorted(d_arr, c - self.BRAKE_WINDOW))
+                    b = int(np.searchsorted(d_arr, c))
+                    if b - a < 3:
+                        continue
+                    braking = np.flatnonzero(b_arr[a:b] >= self.BRAKE_ON)
+                    if len(braking):
+                        obs.setdefault(j, []).append(
+                            c - float(d_arr[a + int(braking[0])]))
+        if cars_ready < 2:
+            return
+        self.brake_dists = {
+            round(apexes[j], 1): float(np.median(dists))
+            for j, dists in obs.items()
+            if len(dists) >= self.BRAKES_MIN_OBS
+        }
+
     def weather_at(self, t: float):
         """Última lectura de clima anterior o igual a t (None si no hay)."""
         current = None
@@ -405,6 +586,12 @@ class DataHub(QObject):
         self.live_frames = False
         self._bounds_next_try = 0.0
         self._bounds_done = False
+        self.brake_dists = None
+        self._brakes_next_try = 0.0
+        self.custom_micro = None
+        self.retired = set()
+        self.last_move_t.clear()
+        self._stew_cache = None
         self.segments.clear()
         self.segment_counts.clear()
         self.latest_t = 0.0
@@ -457,6 +644,10 @@ class DataHub(QObject):
             n0 = buf.n
             buf.append(group)
             self._apply_pending_dist_fix(drv, buf, n0)
+            moved = [s.t for s in group if s.speed > 3.0]
+            if moved:
+                self.last_move_t[drv] = max(
+                    self.last_move_t.get(drv, 0.0), moved[-1])
         if samples:
             self.latest_t = max(self.latest_t, samples[-1].t)
         self.total_samples += len(samples)

@@ -1,14 +1,15 @@
-# F1 Live Telemetry
+# BoxBox-F1
 
 A Windows desktop app for following **Formula 1 sessions live**: telemetry
 charts (speed, throttle, brake, RPM, gear) for one or several cars at once
-with **distance on the X axis**, plus a broadcast-style timing tower, track
-map, lap wheel, race trace, tyre/pit strategy, weather and race-control
-panels and a notification center — every view in **its own window**, driven
-from a compact control hub. Built with
+with **distance on the X axis**, plus a broadcast-style timing tower (with
+JRT-style delta graphs and stewards chips), track map, lap wheel, track
+dominance map, race trace, tyre/pit strategy, a microsector editor,
+weather and race-control panels and a notification center — every view in
+**its own window**, driven from a compact control hub. Built with
 [Fast-F1](https://github.com/theOehrly/Fast-F1), PySide6 and pyqtgraph.
 
-![F1 Live Telemetry — multi-window layout during a Safety Car: timing tower, Race 2 chart, lap wheel with live intervals, drivers, race trace, track map with a yellow sector and the timeline](docs/data.png)
+![BoxBox-F1 — multi-window layout during a Safety Car: timing tower, Race 2 chart, lap wheel with live intervals, drivers, race trace, track map with a yellow sector and the timeline](docs/data.png)
 
 **Control hub** — the whole app is driven from one narrow window: data
 source, the window catalog (Drivers and Timeline featured), window
@@ -26,10 +27,10 @@ degradation per stint and the timing tower with pit stops and averages:
 
 ![Times / Gap mode with degradation analysis](docs/screenshot-gap.png)
 
-**Quali comparison** — live laps against a target lap, with the cumulative
+**Qualy Lap Compare** — live laps against a target lap, with the cumulative
 delta trace and per-sector/microsector delta cards updating in real time:
 
-![Quali comparison mode against a target lap](docs/screenshot-quali.png)
+![Qualy Lap Compare mode against a target lap](docs/screenshot-quali.png)
 
 ## All-windows model
 
@@ -46,8 +47,8 @@ notification preferences). Everything else — every chart, the tower, the
 map, the driver selection, the timeline, each context panel — lives in
 **its own window**: freely placed on any monitor, pinnable (frameless,
 always on top) over a broadcast, and each chart carries **its own
-controls** (channel, X window), so two Race chart windows can show
-different channels at the same time. The first start opens nothing but the
+controls** (channel, X window, 👥 cars), so two Race chart windows can
+show different channels at the same time. The first start opens nothing but the
 hub; from then on closing a window just hides it — its position, size and
 pin are remembered and the whole arrangement is restored on the next
 start.
@@ -58,23 +59,26 @@ start.
 |------|-----------|
 | **Race chart** | Sliding window configurable in laps (½ to 20 or the whole session; default 1), plus free space on the right so the latest values and each series' label stay visible. The X axis is the **track position** ((lap − 1) × lap length + lap meter), so the same corner falls on the same vertical for every car: braking points line up even when a car runs behind. |
 | **Race 2** | Fixed X axis from 0 to the last meter of the lap. Each series overwrites ("eats") its own previous-lap line as it advances, with a visible gap ahead of each car's cursor. |
-| **Quali comparison** | Comparison of the current lap against a **target lap** (any completed lap of any driver). Three levels: the channel traces (dashed target + live current laps), the **cumulative delta trace** (X = distance, Y = seconds gained/lost vs the target at every meter, X axes linked), and **per-driver cards** (up to 4, in a 2-column grid) with the total lap delta in large type and one row per sector: the sector chip on the left and its 8 microsectors aligned next to it — no horizontal scrolling; green = doing better, red = worse, and the most recently crossed microsector is highlighted. |
-| **Times / Gap** | Gap chart against a reference driver (marked "(ref)" in the legend; X = **track position**, with "total distance / L\<lap\> +\<meters\>" ticks and a vertical line at every lap boundary; window configurable from ½ to 20 laps or the whole session; Y = seconds, **+ = slower than the reference at the same position, − = faster**) plus comparison tables ordered by track position: summary (P1..Pn, current lap, last, best, S1-S3, gap), lap times per driver, microsector deltas (24 splits, green/red cells) and per-corner minimum speeds. Sectors and microsectors are **rolling** (current lap in real time; until crossed, the value from one lap ago, dimmed) and each driver's most recently completed microsector is highlighted. |
+| **Qualy Lap Compare** | Comparison of the current lap against a **target lap** (any completed lap of any driver). Three levels: the channel traces (dashed target + live current laps), the **cumulative delta trace** (X = distance, Y = seconds gained/lost vs the target at every meter, X axes linked), and **per-driver cards** (up to 4, in a 2-column grid) with the total lap delta in large type and one row per sector: the sector chip on the left and its microsectors aligned next to it (8 per sector by default — follows the Microsectors panel) — no horizontal scrolling; green = doing better, red = worse, and the most recently crossed microsector is highlighted. |
+| **Times / Gap** | Gap chart against a reference driver (marked "(ref)" in the legend; X = **track position**, with "total distance / L\<lap\> +\<meters\>" ticks and a vertical line at every lap boundary; window configurable from ½ to 20 laps or the whole session; Y = seconds, **+ = slower than the reference at the same position, − = faster**) plus comparison tables ordered by track position: summary (P1..Pn, current lap, last, best, S1-S3, gap), lap times per driver, microsector deltas (green/red cells, following the Microsectors panel cuts) and per-corner minimum speeds. Sectors and microsectors are **rolling** (current lap in real time; until crossed, the value from one lap ago, dimmed) and each driver's most recently completed microsector is highlighted. |
 | **Race trace** | Classic race-trace: each driver's cumulative gap against a **selectable reference** (the leader by default, or any driver), with **one point per official microsector** so the effect of every corner shows up, not just the per-lap cut. X = laps (configurable: last N laps or all), Y = seconds (configurable ±s or auto; losing time = the line drops). SC/VSC/flag periods are shaded in the background. |
 
 The rest of the catalog (each one described in detail under *Features*):
 
 | Window | What it shows |
 |------|-----------|
-| **Timing tower** | Broadcast-style tower: positions, gaps, tyres, sectors, pit data. |
-| **Track map** | Live car positions and trails on the circuit outline. |
-| **Lap wheel** | Circular lap view: cars by lap position, sectors, corners, live intervals, pit-drop ghost. |
+| **Timing tower** | Broadcast-style tower: positions, gaps, tyres, sectors, pit data, PIT/OUT tags (own 👥 car filter; a **▦ button** picks which data columns are visible, persisted — hide what you don't need and the mini-sectors get the freed space). **Click a row to make that driver the reference**: the gap line, LAST/BEST pills, sector times and AVG5/AVG10 all turn into deltas against them, signed AND colored from the REFERENCE's point of view — **positive/red = the reference loses to that car, negative/green = it beats it** (the gap uses the JRT convention: + = that car runs ahead). Click again to clear. A **delta graph column** (wide windows), with the JRT logic: per rival, the change of the relative gap vs the reference **since the start of the current lap** (delta = REL now − REL at lap start — every lap restarts at neutral). The draw cursor advances with whichever car of the pair runs *behind*; the thin white line marks the rival's own position. **Red above the axis = the reference is losing time to that rival this lap, green below = gaining**; bar deflection saturates at ±1 s while the colour keeps deepening (grey → red/green → magenta/cyan at ±2 s). On lap change the previous lap stays dimmed until overwritten, and a genuine overtake (REL sign flip with a >1 s jump) resets the graph. **Stewards chips** on each row: ⚠ under investigation, +5s/+10s/DT/SG pending penalty (cleared when served). Retired or stalled cars sink to the bottom with a RET tag — and drop off the track map, lap wheel and its interval ring (official `Retired` flag when the feed carries it, plus a no-movement heuristic that works on every source). |
+| **Track map** | Live car positions and trails on the circuit outline (own 👥 car filter). |
+| **Lap wheel** | Circular lap view: cars by lap position, sectors, corners, live intervals, pit-drop ghost (own 👥 car filter). A **⏱ Gap toggle** switches to elastic mode: cars spaced by TIME behind the leader (leader at north, one lap of pace = full circle) — battles cluster and DRS trains jump out. |
+| **Track dominance** | Each µsector of the outline painted in the colour of the fastest driver through it (teammates split by dash style), with a µ-count legend and the **driver's initials floating beside each dominance zone** (offset outside the outline so they never cover the track; single-µ zones rely on colour alone). Pick the drivers to compare (👥, all by default) and the lap range (open ends with "start"/"now"). Follows the Microsectors panel cuts and the official-rescaled µ times; only laps already completed — no future. |
 | **Session status** | Flag, lap counter, session clock and latest race-control message. |
-| **Drivers** | Driver selection: which cars appear in every chart and the map. |
-| **Timeline** | Race progress: scrubber, lap ruler, pause and LIVE (replay/capture). |
+| **Drivers** | Driver selection: seeds the comparison charts — each chart can then add/remove cars with its own 👥, and any change here re-seeds them all. Map, wheel and tower filter their cars independently. |
+| **Timeline** | Race progress: scrubber, lap ruler, pause and LIVE (replay/capture). Detected **on-track overtakes** are marked as green clickable triangles ("moments"): hover shows "L23: PIA overtakes RUS for P4", click jumps a few seconds before it. Only what you already watched — never the future. A **▦ button** picks which reference marks are shown — lap marks, pit stops, flag/SC bands, rain, overtakes — persisted; hiding a layer also disables its hover and click. |
 | **Tyre strategy** | Stint bars per driver, colored by compound. |
-| **Pit lane** | Who is in the pits right now, entry compound and live clocks. |
-| **Pit strategy** | Pit window loss (*Ventana de Box*) and rejoin projections. |
+| **Tyre stints** | One chip per stint and driver: compound, laps and a green N for fresh sets. |
+| **Microsectors** | Editor of the µ cuts: drag them on the map or edit the meters in the table, add/remove cuts, any count per sector (sector boundaries stay official). A 🔒 lock freezes the cuts exactly as they are, so the automatic adjustments that arrive as cars run (measured braking zones, late circuit data) can't move them. Saved per circuit+year and reloaded for every session of the same weekend. |
+| **Pit lane** | Who is in the pits right now, entry compound and live clocks (own 👥 car filter). Cars that just left stay **dimmed with their frozen times and an OUT tag** until they cross the end of S2 or for 2 minutes, whichever comes first — you never lose who just exited. |
+| **Pit strategy** | Pit window loss (*Ventana de Box*), rejoin projections, and a **Net** column: the virtual order of the pit cycle (every car with pending stops pays one Pit window) — who is *really* ahead while the stops play out. |
 | **Race control** | Chronological log of official messages. |
 | **Weather** | Current air/track temperature, wind and rain. |
 | **Weather evolution** | Temperatures and wind over the session (X = leader lap). |
@@ -116,13 +120,13 @@ direct Live client to the source list.)
 A companion app that ONLY captures the live stream to a file, so the
 visualizer (this app, even multiple instances) can follow it live or rewind
 without touching the network connection. It is a **separate executable**
-(`F1TelemCapture.exe`, its own `capture\` folder with an independent
+(`BoxBox-F1-Capture.exe`, its own `capture\` folder with an independent
 `_internal`) so the main app can be updated **without stopping a running
 capture** — the auto-updater replaces the visualizer and leaves the capturer
 untouched while it keeps recording (it updates the next time it is closed).
 
 ```powershell
-F1TelemCapture.exe        # or: .\capture.ps1  ·  python -m f1telem --capture
+BoxBox-F1-Capture.exe        # or: .\capture.ps1  ·  python -m f1telem --capture
 ```
 
 The capturer starts **idle** — nothing is recorded until you press **Start
@@ -169,11 +173,11 @@ follows the most recent capture file.
 
 **Install the extension (once)**
 
-1. Locate the `extension` folder: next to `F1LiveTelemetry.exe` in the
+1. Locate the `extension` folder: next to `BoxBox-F1.exe` in the
    release, or at the repo root.
 2. Open `chrome://extensions` in Chrome, enable **Developer mode**
    (top-right toggle) and click **Load unpacked**.
-3. Pick the `extension` folder — "F1 Live Telemetry Companion" appears in
+3. Pick the `extension` folder — "BoxBox-F1 Companion" appears in
    the list. Keep the folder where it is (Chrome loads it from there).
 4. If you have the old *FastF1 Companion*, **disable it** in
    `chrome://extensions` — both react to the same sign-in URL and would
@@ -202,7 +206,7 @@ follows the most recent capture file.
 **If the automatic delivery fails**
 
 - The extension's Connect page offers **Open in the app**: the browser
-  shows its native *"Open F1 Live Telemetry?"* dialog and hands the token
+  shows its native *"Open BoxBox-F1?"* dialog and hands the token
   straight to the executable through the `f1telemetry://` link (the
   capturer registers it per-user on start, no admin needed) — the running
   capturer picks it up within seconds.
@@ -224,7 +228,23 @@ follows the most recent capture file.
   refreshing. The arrangement is **persistent** — geometry, pin and open
   state are reapplied exactly on the next start. The Times/Gap tables and
   the Quali cards can additionally be popped out of their parent window
-  with their own ⧉ button.
+  with their own ⧉ button, hidden with ✕, and brought back to factory
+  state with the ↺ button in the window's title bar.
+- **Per-window car filter**: the track map, lap wheel and timing tower each
+  carry a 👥 button choosing which cars that window shows (all visible by
+  default, persisted per window) — independent of the **Drivers**
+  comparison selection. The tower keeps the real positions, gaps and
+  intervals: hiding cars only removes their rows. The comparison charts
+  (Race, Race 2, Qualy Lap Compare, Times/Gap, Race trace) instead follow
+  the **Drivers** selection and offer their own 👥 to add/remove cars per
+  window: a local tweak never leaks to other windows, and any change in
+  **Drivers** re-seeds every chart.
+- **No spoilers, ever**: every panel respects the current timeline instant
+  — tyre stints/strategy clip at the current lap; race control, the
+  session strip and the weather chart only show what already happened; pit
+  data ignores future visits; and overtake "moments" only mark what you
+  actually watched. The timeline ruler itself (the navigation control) is
+  the single deliberate exception.
 - **Window profiles**: the hub saves the complete current arrangement
   (which windows are open, where, sizes, pins) under a name and reapplies
   it with one click; factory presets **Race / Quali / Strategy** are
@@ -377,7 +397,7 @@ python -m venv .venv
    (teammates share the team color and are distinguished by line style).
 3. Open the windows you need from the hub's catalog (or apply a profile);
    each chart window carries its own channel / X-window selectors. In
-   **Quali comparison**, pick the target driver and lap in the window's own
+   **Qualy Lap Compare**, pick the target driver and lap in the window's own
    toolbar and press **Set**.
 
 ## Windows executable
@@ -386,14 +406,14 @@ python -m venv .venv
 .\build.ps1
 ```
 
-Produces `dist\F1LiveTelemetry\` with **two executables** —
-`F1LiveTelemetry.exe` (visualizer) and `capture\F1TelemCapture.exe`
-(capturer, its own `_internal`) — plus `dist\F1LiveTelemetry-win64.zip`,
+Produces `dist\BoxBox-F1\` with **two executables** —
+`BoxBox-F1.exe` (visualizer) and `capture\BoxBox-F1-Capture.exe`
+(capturer, its own `_internal`) — plus `dist\BoxBox-F1-win64.zip`,
 ready to upload as the GitHub release asset. No Python required.
 
 If **Inno Setup 6** is installed (`winget install JRSoftware.InnoSetup`),
-the build also produces `dist\F1LiveTelemetry-setup.exe`: a proper installer
-that installs into `%LOCALAPPDATA%\Programs\F1LiveTelemetry` (no admin
+the build also produces `dist\BoxBox-F1-setup.exe`: a proper installer
+that installs into `%LOCALAPPDATA%\Programs\BoxBox-F1` (no admin
 required, so the auto-updater keeps working), creates Start-menu and
 optional desktop shortcuts, registers the `f1telemetry://` protocol for the
 F1TV sign-in extension and provides an uninstaller.
@@ -419,7 +439,7 @@ Running from source only opens the releases page.
 
 Publishing a release: bump `__version__` in `src/f1telem/__init__.py`, run
 `.\build.ps1`, create a GitHub release tagged `vX.Y.Z` and upload
-`dist\F1LiveTelemetry-win64.zip` (keep that asset name).
+`dist\BoxBox-F1-win64.zip` (keep that asset name).
 
 ## Tests
 
@@ -446,7 +466,19 @@ $env:QT_QPA_PLATFORM = "offscreen"
   the app locates the **real S1/S2 boundaries** on track — interpolating
   where each car was at the instant it set each sector time, median across
   laps and drivers — and anchors the marks to them; each microsector is 1/8
-  of its sector. Each lap's marks are also scaled to the length it really
+  of its sector, and once the circuit corners are known the interior µ cuts
+  are nudged out of each corner's braking/exit zone (no µ boundary falls
+  mid-braking or on an apex — linear interpolation errs most where speed
+  changes fast; sector boundaries are never moved). The braking zone of
+  each corner is measured from the brake channel (median across laps and
+  drivers) once enough data is in — a hairpin after a long straight gets a
+  longer zone than a flat-out kink. The **Microsectors** window lets you
+  hand-place the cuts instead (any count per sector), saved per
+  circuit+year. Microsectors are
+  computed data while sectors are official, so as soon as an official
+  sector time arrives that sector's 8 microsectors are **rescaled
+  proportionally to sum exactly to the official time** — the µ splits and
+  the sector they belong to always agree. Each lap's marks are also scaled to the length it really
   integrated between finish-line crossings. On top of that, **as soon as
   each official sector/lap time is published, the tables show that exact
   value** — interpolation only covers what is not timed yet (the rolling

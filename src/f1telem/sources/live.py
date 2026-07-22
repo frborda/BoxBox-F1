@@ -155,6 +155,7 @@ class LiveDecoderMixin:
         self._lap_count = [0, 0]
         self._pit_counts: dict[str, int] = {}
         self._pit_log: dict[str, list] = {}
+        self._retired: set[str] = set()
         # visitas a la calle de boxes: transiciones de InPit
         self._inpit: dict[str, bool] = {}
         self._pit_visits: dict[str, list] = {}  # {num: [[vuelta, t_in, t_out|None]]}
@@ -359,8 +360,12 @@ class LiveDecoderMixin:
         if meeting or name:
             self.statusChanged.emit(f"Live: {meeting} — {name}")
         stype = str(data.get("Type") or "")
+        meta_year = str(data.get("StartDate", ""))[:4]
         if meeting or name or stype:
-            self.sessionMeta.emit({"type": stype, "meeting": meeting, "name": name})
+            self.sessionMeta.emit({
+                "type": stype, "meeting": meeting, "name": name,
+                "year": meta_year if meta_year.isdigit() else "",
+            })
         # trazado completo inmediato: la API de circuitos de MultiViewer usa
         # las mismas coordenadas que Position.z. Sin esto, el mapa se
         # autoconstruía recién cuando un auto cerraba ~2 vueltas (minutos), y
@@ -380,7 +385,7 @@ class LiveDecoderMixin:
 
             resp = requests.get(
                 f"https://api.multiviewer.app/api/v1/circuits/{key}/{year}",
-                timeout=20, headers={"User-Agent": "F1LiveTelemetry"},
+                timeout=20, headers={"User-Agent": "BoxBox-F1"},
             )
             resp.raise_for_status()
             outline, corners = _circuit_rows(resp.json())
@@ -433,9 +438,19 @@ class LiveDecoderMixin:
         seg_updates: list[tuple] = []
         pits_changed = False
         lane_changed = False
+        retired_changed = False
         for num, line in (data.get("Lines") or {}).items():
             if not isinstance(line, dict):
                 continue
+            # abandono oficial (Stopped es transitorio — un trompo — y lo
+            # cubre la heurística de movimiento del hub; acá solo Retired)
+            ret = line.get("Retired")
+            if ret is True and num not in self._retired:
+                self._retired.add(num)
+                retired_changed = True
+            elif ret is False and num in self._retired:
+                self._retired.discard(num)
+                retired_changed = True
             if isinstance(line.get("NumberOfLaps"), int):
                 self._laps_done[num] = line["NumberOfLaps"]
             done = self._laps_done.get(num, 0)
@@ -499,6 +514,8 @@ class LiveDecoderMixin:
         if lane_changed:
             self.pitLane.emit({k: [list(v) for v in vs]
                                for k, vs in self._pit_visits.items()})
+        if retired_changed:
+            self.retirements.emit(sorted(self._retired))
 
     def _on_position(self, data) -> None:
         if not isinstance(data, dict):

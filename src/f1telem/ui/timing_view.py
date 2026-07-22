@@ -753,6 +753,14 @@ class TimingView(QWidget):
         vuelta atrás (atenuada). El último µsector completado de cada piloto
         se resalta en color acento, negrita y subrayado."""
         an = self.analyzer
+        n_micro = an.n_micro()
+        if self.micro_table.columnCount() != n_micro:
+            # la cantidad de µ es configurable (panel Microsectors)
+            self.micro_table.setColumnCount(n_micro)
+            self.micro_table.setHorizontalHeaderLabels(
+                [f"µ{i + 1}" for i in range(n_micro)])
+            for c in range(n_micro):
+                self.micro_table.setColumnWidth(c, 60)
         ref_data = an.latest_micro_times(ref)
         ref_micro = ref_data[0] if ref_data is not None else None
         ordered = self._by_track_position()
@@ -769,8 +777,8 @@ class TimingView(QWidget):
                 if len(from_cur):
                     last_idx = int(from_cur.max())
                 elif bool(np.isfinite(data[0]).any()):
-                    last_idx = N_MICRO - 1  # recién cruzó la meta: µ24 de la vuelta previa
-            for c in range(N_MICRO):
+                    last_idx = n_micro - 1  # recién cruzó la meta: último µ previo
+            for c in range(n_micro):
                 if data is None or not math.isfinite(data[0][c]):
                     self.micro_table.setItem(r, c, _cell("—"))
                     continue

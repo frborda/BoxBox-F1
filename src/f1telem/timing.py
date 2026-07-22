@@ -6,8 +6,16 @@ distancia fijas dentro de la vuelta (24 divisiones; los sectores son
 grupos de 8). Si el hub ya derivó los límites oficiales de sector
 (`hub.sector_bounds`), las marcas se anclan a ellos: S1/S2/S3 pasan a ser
 los sectores reales y cada µsector es 1/8 de su sector; si no, la vuelta
-se divide en tercios iguales. Con telemetría a ~4-5 Hz la precisión es de
-~±0,1 s: sirve para comparar, no es el cronometraje oficial.
+se divide en tercios iguales. Cuando el trazado con curvas ya se conoce,
+los cortes internos se corren fuera de las zonas de frenaje/curva (la
+interpolación asume velocidad constante entre muestras y es donde más
+erra); los límites de sector nunca se tocan. Con telemetría a ~4-5 Hz la
+precisión es de ~±0,1 s: sirve para comparar, no es el cronometraje
+oficial. Como el µsector es un dato calculado y el sector es oficial, al
+llegar cada tiempo oficial de sector los 8 µ de ese sector se re-escalan
+proporcionalmente para que su suma cierre EXACTA contra el oficial (sin
+oficial, la suma ya cierra contra el sector interpolado por construcción:
+son diferencias del mismo arreglo de marcas).
 
 El "gap" entre dos autos es la diferencia de tiempo al pasar por la misma
 posición de pista (vuelta × largo + metro de vuelta): positivo = detrás
@@ -22,39 +30,138 @@ from .hub import DataHub
 N_MICRO = 24          # microsectores por vuelta (divisible por 3)
 SECTOR_STEP = N_MICRO // 3
 
+# zona conflictiva alrededor del vértice de cada curva: el frenaje arranca
+# antes y la tracción se recupera después; un corte de µsector ahí cae en
+# plena variación de velocidad (donde la interpolación lineal más erra) y
+# es confuso de leer. Los cortes internos se corren al borde de la zona.
+BRAKE_BEFORE = 100.0   # m antes del vértice (solo hasta derivar el frenaje
+                       # real por curva del canal de freno: hub.brake_dists)
+EXIT_AFTER = 60.0      # m después del vértice
+APEX_GUARD = 30.0      # zona mínima antes del vértice (curvas sin frenaje)
+ZONE_BRIDGE = 80.0     # m mínimos de pista limpia entre dos curvas para
+                       # aceptar un corte entre ellas: con menos (chicanas,
+                       # eses) las zonas se fusionan y el corte no cae en
+                       # el cambio de sentido
+MAX_SHIFT_FRAC = 0.35  # tope de corrimiento (fracción del ancho del µ):
+                       # garantiza orden y un ancho mínimo de 0,3 µ
+
 
 class TimingAnalyzer:
     def __init__(self, hub: DataHub):
         self.hub = hub
         self._marks_cache: dict[tuple[str, int], np.ndarray] = {}
         self._pos_cache: dict[str, tuple[int, float, tuple]] = {}
-        self._geo_used: tuple = (0.0, None)
+        self._geo_used: tuple = (0.0, None, (), None, None)
+        self._dists_cache: np.ndarray | None = None
+        self._scale_cache: dict[tuple[str, int], np.ndarray] = {}
+        # índices de los límites de sector dentro de las marcas (la cantidad
+        # de µ por sector puede variar con la config del panel Microsectors)
+        self._sector_idx: tuple[int, int] = (SECTOR_STEP, 2 * SECTOR_STEP)
 
     def clear(self) -> None:
         self._marks_cache.clear()
         self._pos_cache.clear()
+        self._scale_cache.clear()
+        self._dists_cache = None
 
     def _mark_dists(self) -> np.ndarray:
-        """Distancias de las 25 marcas: ancladas a los límites oficiales de
-        sector cuando el hub ya los derivó, si no tercios iguales."""
+        """Distancias de las marcas. Límites de sector: los oficiales cuando
+        el hub ya los derivó (si no, tercios) — siempre presentes. Cortes
+        internos: los del panel Microsectors si hay config para el circuito
+        (cantidad libre por sector), si no 8 µ iguales por sector corridos
+        fuera de las zonas de frenaje/curva."""
+        self._check_track_len()
+        if self._dists_cache is not None:
+            return self._dists_cache
         L = self.hub.track_length
+        edges = (0.0, L / 3.0, 2.0 * L / 3.0, L)
         bounds = self.hub.sector_bounds
-        if bounds is not None:
-            b1, b2 = bounds
-            if 0.0 < b1 < b2 < L:
-                return np.concatenate((
-                    np.linspace(0.0, b1, SECTOR_STEP + 1)[:-1],
-                    np.linspace(b1, b2, SECTOR_STEP + 1)[:-1],
-                    np.linspace(b2, L, SECTOR_STEP + 1),
-                ))
-        return np.linspace(0.0, L, N_MICRO + 1)
+        if bounds is not None and 0.0 < bounds[0] < bounds[1] < L:
+            edges = (0.0, bounds[0], bounds[1], L)
+        custom = self.hub.custom_micro
+        if custom:
+            interior = [float(d) for d in custom
+                        if 1.0 < d < L - 1.0
+                        and min(abs(d - e) for e in edges) > 1.0]
+            marks = np.unique(np.array([*edges, *interior]))
+        else:
+            marks = np.concatenate([
+                np.linspace(edges[k], edges[k + 1], SECTOR_STEP + 1)[:-1]
+                for k in range(3)
+            ] + [[L]])
+            marks = self._snap_marks(marks, L)
+        self._sector_idx = (int(np.searchsorted(marks, edges[1])),
+                            int(np.searchsorted(marks, edges[2])))
+        self._dists_cache = marks
+        return marks
+
+    def n_micro(self) -> int:
+        return len(self._mark_dists()) - 1
+
+    def sector_slices(self) -> tuple[tuple[int, int], ...]:
+        """Rango (inicio, fin) de los µ de cada sector, sobre los µ de la
+        vuelta (fin exclusivo). Con la config por defecto: (0,8)(8,16)(16,24)."""
+        n = self.n_micro()  # asegura _sector_idx actualizado
+        i1, i2 = self._sector_idx
+        return ((0, i1), (i1, i2), (i2, n))
+
+    def _snap_marks(self, marks: np.ndarray, L: float) -> np.ndarray:
+        """Corre cada corte interno que cae en la zona de una curva
+        ([−BRAKE_BEFORE, +EXIT_AFTER] del vértice) al borde más cercano de
+        la zona: queda antes del comienzo del frenaje o pasada la salida.
+        Los límites de sector (marcas 0/8/16/24) son oficiales y no se
+        tocan; una marca nunca se mueve más de MAX_SHIFT_FRAC de su µ (si
+        la zona es más ancha que eso, se queda: corte de compromiso). Sin
+        curvas conocidas no hace nada."""
+        corners = sorted(d for _lbl, d, _x, _y in self.hub.corners
+                         if 0.0 < d < L)
+        if not corners:
+            return marks
+        # inicio de zona por curva: el frenaje real medido si ya se derivó
+        # (depende de la velocidad de llegada), si no el fallback fijo
+        brake_dists = self.hub.brake_dists
+        zones: list[list[float]] = []
+        for c in corners:
+            if brake_dists is not None:
+                before = max(brake_dists.get(round(c, 1), 0.0), APEX_GUARD)
+            else:
+                before = BRAKE_BEFORE
+            z0, z1 = max(c - before, 0.0), min(c + EXIT_AFTER, L)
+            # fusionar también con hueco chico entre medio: en curva y
+            # contracurva el corte no debe caer en el cambio de sentido
+            if zones and z0 - zones[-1][1] < ZONE_BRIDGE:
+                zones[-1][1] = max(zones[-1][1], z1)
+            else:
+                zones.append([z0, z1])
+        out = marks.copy()
+        for i in range(1, N_MICRO):
+            if i % SECTOR_STEP == 0:
+                continue  # límite de sector: intocable
+            m = float(marks[i])
+            max_shift = MAX_SHIFT_FRAC * float(marks[i + 1] - marks[i - 1]) / 2.0
+            for z0, z1 in zones:
+                if z0 < m < z1:
+                    back, fwd = m - z0, z1 - m
+                    if back <= fwd and back <= max_shift:
+                        out[i] = z0
+                    elif fwd <= max_shift:
+                        out[i] = z1
+                    break
+        return out
 
     def _check_track_len(self) -> None:
-        geo = (self.hub.track_length, self.hub.sector_bounds)
+        bd = self.hub.brake_dists
+        cm = self.hub.custom_micro
+        geo = (self.hub.track_length, self.hub.sector_bounds,
+               tuple(round(float(d), 1) for _l, d, _x, _y in self.hub.corners),
+               None if bd is None else tuple(sorted(bd.items())),
+               None if cm is None else tuple(round(float(d), 1) for d in cm))
         if (abs(geo[0] - self._geo_used[0]) > 1.0
-                or geo[1] != self._geo_used[1]):
+                or geo[1:] != self._geo_used[1:]):
             self._marks_cache.clear()
             self._pos_cache.clear()
+            self._scale_cache.clear()
+            self._dists_cache = None
             self._geo_used = geo
 
     # ------------------------------------------------------- marcas por vuelta
@@ -95,7 +202,7 @@ class TimingAnalyzer:
         frame = self._frame_marks(drv, lap)
         if frame is None:
             return None
-        t_b1 = float(frame[SECTOR_STEP])
+        t_b1 = float(frame[self._sector_idx[0]])
         if t_b1 != t_b1:
             return None
         return t_b1 - float(off[0])
@@ -210,9 +317,10 @@ class TimingAnalyzer:
         if marks is None:
             times = [float("nan")] * 3
         else:
+            i1, i2 = self._sector_idx
+            pts = (0, i1, i2, len(marks) - 1)
             times = [
-                float(marks[(k + 1) * SECTOR_STEP] - marks[k * SECTOR_STEP])
-                for k in range(3)
+                float(marks[pts[k + 1]] - marks[pts[k]]) for k in range(3)
             ]
         off = self.hub.official_times.get((drv, lap))
         if off is not None:
@@ -221,17 +329,53 @@ class TimingAnalyzer:
                     times[k] = float(off[k])
         return times
 
+    def _sector_scales(self, drv: str, lap: int) -> np.ndarray:
+        """Factor por sector que lleva los 8 µ interpolados a sumar EXACTO
+        el tiempo oficial del sector cuando ya llegó (1.0 sin oficial): el
+        µsector es un dato calculado y el sector es oficial, así que el
+        error de interpolación se reparte proporcionalmente entre los µ."""
+        cached = self._scale_cache.get((drv, lap))
+        if cached is not None:
+            return cached
+        scales = np.ones(3)
+        off = self.hub.official_times.get((drv, lap))
+        if off is not None:
+            marks = self.lap_marks(drv, lap)
+            if marks is not None:
+                i1, i2 = self._sector_idx
+                pts = (0, i1, i2, len(marks) - 1)
+                for k in range(3):
+                    if off[k] != off[k]:
+                        continue
+                    interp = float(marks[pts[k + 1]] - marks[pts[k]])
+                    if np.isfinite(interp) and interp > 0.0:
+                        scales[k] = float(off[k]) / interp
+            buf = self.hub.buffers.get(drv)
+            if (buf is not None and lap < buf.current_lap()
+                    and all(o == o for o in off[:3])):
+                # vuelta cerrada con los 3 oficiales: inmutable, cachear
+                self._scale_cache[(drv, lap)] = scales
+        return scales
+
+    def _scale_per_micro(self, scales: np.ndarray) -> np.ndarray:
+        """Expande los 3 factores de sector a un factor por µ."""
+        counts = [b - a for a, b in self.sector_slices()]
+        return np.repeat(scales, counts)
+
     def micro_times(self, drv: str, lap: int) -> np.ndarray | None:
+        """µsectores de la vuelta, re-escalados sector a sector para que
+        los µ de cada sector sumen exacto el sector oficial si ya llegó."""
         marks = self.lap_marks(drv, lap)
-        return None if marks is None else np.diff(marks)
+        if marks is None:
+            return None
+        return np.diff(marks) * self._scale_per_micro(
+            self._sector_scales(drv, lap))
 
-    def _latest_segments(self, drv: str, step: int) -> tuple[np.ndarray, np.ndarray] | None:
-        """Últimos segmentos rodantes de tamaño `step` marcas: cada segmento
-        sale de la vuelta en curso si ya fue cruzado (cálculo en tiempo
-        real) y, si no, de exactamente una vuelta atrás.
-
-        Devuelve (tiempos, vuelta_de_origen) de largo N_MICRO // step.
-        """
+    def _latest_segments(self, drv: str, idx: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        """Últimos segmentos rodantes entre las marcas `idx` (índices de
+        marca de los cortes): cada segmento sale de la vuelta en curso si ya
+        fue cruzado (cálculo en tiempo real) y, si no, de exactamente una
+        vuelta atrás. Devuelve (tiempos, vuelta_de_origen)."""
         buf = self.hub.buffers.get(drv)
         if buf is None or not buf.n:
             return None
@@ -243,10 +387,10 @@ class TimingAnalyzer:
             marks = self.lap_marks(drv, lap)
             if marks is None:
                 return None
-            pts = marks[::step]
+            pts = marks[idx]
             return pts[1:] - pts[:-1]
 
-        n = N_MICRO // step
+        n = len(idx) - 1
         seg_cur = segments(cur)
         seg_prev = segments(cur - 1) if cur >= 2 else None
         if seg_cur is None and seg_prev is None:
@@ -261,13 +405,27 @@ class TimingAnalyzer:
         return times, laps
 
     def latest_micro_times(self, drv: str) -> tuple[np.ndarray, np.ndarray] | None:
-        return self._latest_segments(drv, 1)
+        """µ rodantes, re-escalados al sector oficial de su vuelta de origen
+        (cada µ puede venir de la vuelta en curso o de la anterior)."""
+        data = self._latest_segments(drv, np.arange(self.n_micro() + 1))
+        if data is None:
+            return None
+        times, laps = data
+        times = times.copy()
+        for lap in np.unique(laps):
+            scales = self._sector_scales(drv, int(lap))
+            if (scales != 1.0).any():
+                sel = laps == lap
+                times[sel] *= self._scale_per_micro(scales)[sel]
+        return times, laps
 
     def latest_sector_times(self, drv: str) -> tuple[np.ndarray, np.ndarray] | None:
         """Sectores rodantes; cada valor se reemplaza por el oficial de su
         vuelta de origen apenas el feed lo publica (segundos después del
         cruce), quedando el interpolado solo para lo aún no cronometrado."""
-        data = self._latest_segments(drv, SECTOR_STEP)
+        n = self.n_micro()
+        i1, i2 = self._sector_idx
+        data = self._latest_segments(drv, np.array([0, i1, i2, n]))
         if data is None:
             return None
         times, laps = data

@@ -14,8 +14,8 @@ from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap, QPolygonF, QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QSlider, QSpinBox,
-    QToolTip, QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QSlider, QSpinBox,
+    QToolButton, QToolTip, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from .. import __version__, config
@@ -25,7 +25,10 @@ from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplayS
 from . import theme
 from .charts import RollingChart, WrapChart
 from .docks import Detachable
+from .dominance_map import DominanceMapView
+from .driver_filter import DriverSelectButton
 from .lap_wheel import LapWheelView
+from .micro_config import MicroConfigView
 from .notifications import (
     NotificationCenter, NotificationSettingsDialog, NotificationsPanel,
 )
@@ -39,6 +42,7 @@ from .timing_view import TimingView
 from .tower import TimingTower
 from .trace_chart import TraceChart
 from .track_map import TrackMapView
+from .tyre_stints import TyreStintsView
 from .update_dialog import run_check
 from .weather import WeatherChart, WeatherNowPanel
 
@@ -93,6 +97,9 @@ class LapRuler(QWidget):
         self._pits: list[tuple[float, str]] = []      # (t, color)
         self._status: list[tuple[float, float, str]] = []
         self._rain: list[tuple[float, float]] = []
+        self._moments: list[tuple[float, str]] = []   # (t, texto) sobrepasos
+        # capas visibles (▦ de la línea de tiempo): ausente = visible
+        self._layers: dict[str, bool] = {}
         self._t0 = 0.0
         self._t1 = 1.0
         self._seek = seek_callback
@@ -116,6 +123,21 @@ class LapRuler(QWidget):
         self._rain = list(periods)
         self.update()
 
+    def set_moments(self, moments) -> None:
+        """Momentos de la carrera (sobrepasos detectados): triángulo
+        clickeable; solo lo ya visto, nunca el futuro."""
+        self._moments = list(moments)
+        self.update()
+
+    def set_layer(self, key: str, on: bool) -> None:
+        """Muestra/oculta un tipo de referencia (laps, pits, flags, rain,
+        overtakes); también apaga su hover y su click."""
+        self._layers[key] = bool(on)
+        self.update()
+
+    def _on(self, key: str) -> bool:
+        return self._layers.get(key, True)
+
     def set_range(self, t0: float, t1: float) -> None:
         if (t0, t1) != (self._t0, self._t1):
             self._t0, self._t1 = t0, t1
@@ -133,12 +155,12 @@ class LapRuler(QWidget):
         font.setPointSizeF(7.0)
         painter.setFont(font)
         # franja fina de lluvia (azul), arriba de las bandas de bandera
-        for t0, t1 in self._rain:
+        for t0, t1 in (self._rain if self._on("rain") else ()):
             x0 = self._x_of(t0)
             x1 = self._x_of(min(t1, self._t1))
             painter.fillRect(QRectF(x0, 8, max(x1 - x0, 2.0), 2.5), QColor(0, 130, 220, 170))
         # bandas de bandera/SC de fondo
-        for t0, t1, code in self._status:
+        for t0, t1, code in (self._status if self._on("flags") else ()):
             style = theme.TRACK_STATUS.get(code)
             if style is None:
                 continue
@@ -152,7 +174,7 @@ class LapRuler(QWidget):
         step = 1
         while avg_px * step < 26.0:
             step += 1
-        for lap, t in self._marks:
+        for lap, t in (self._marks if self._on("laps") else ()):
             x = self._x_of(t)
             if x < 0 or x > self.width():
                 continue
@@ -163,7 +185,7 @@ class LapRuler(QWidget):
                 painter.drawText(QRectF(x - 16, 0, 32, 10), Qt.AlignCenter, f"L{lap}")
         # rombos de paradas en boxes (color del piloto)
         painter.setPen(Qt.NoPen)
-        for t, color in self._pits:
+        for t, color in (self._pits if self._on("pits") else ()):
             x = self._x_of(t)
             if x < 0 or x > self.width():
                 continue
@@ -171,12 +193,23 @@ class LapRuler(QWidget):
             painter.drawPolygon(QPolygonF([
                 QPointF(x, 10.5), QPointF(x + 3, 14), QPointF(x, 17.5), QPointF(x - 3, 14),
             ]))
+        # triángulos de sobrepasos ("momentos" de la carrera)
+        painter.setBrush(QColor("#2fbf71"))
+        for t, _label in (self._moments if self._on("overtakes") else ()):
+            x = self._x_of(t)
+            if x < 0 or x > self.width():
+                continue
+            painter.drawPolygon(QPolygonF([
+                QPointF(x - 3.2, 8.0), QPointF(x + 3.2, 8.0), QPointF(x, 2.0),
+            ]))
         painter.end()
 
     def _t_at(self, x: float) -> float:
         return self._t0 + x / max(self.width(), 1) * (self._t1 - self._t0)
 
     def _status_at(self, t: float):
+        if not self._on("flags"):
+            return None
         for t0, t1, code in self._status:
             if t0 <= t <= t1 and code in theme.TRACK_STATUS:
                 return t0, theme.TRACK_STATUS[code][0]
@@ -190,14 +223,32 @@ class LapRuler(QWidget):
             lap_txt = f"L{laps[-1][0]} · "
         rel = max(0.0, t - self._t0)
         hint = f"{lap_txt}{int(rel // 60)}:{int(rel % 60):02d}"
+        moment = self._moment_near(t)
+        if moment is not None:
+            hint += f" · {moment[1]}"
         status = self._status_at(t)
         if status is not None:
             hint += f" · {status[1]}"
         return hint
 
+    def _moment_near(self, t: float) -> tuple[float, str] | None:
+        if not self._on("overtakes"):
+            return None
+        span = max(self._t1 - self._t0, 1e-9)
+        close = [(abs(mt - t), mt, txt) for mt, txt in self._moments
+                 if abs(mt - t) <= span * 0.012]
+        if not close:
+            return None
+        _d, mt, txt = min(close)
+        return mt, txt
+
     def _target_for_click(self, t_click: float) -> float | None:
-        """Dentro de una banda de bandera/SC se salta al INICIO del
-        incidente; si no, al inicio de la vuelta más cercana."""
+        """Un momento (sobrepaso) cercano manda: salta unos segundos antes;
+        dentro de una banda de bandera/SC se salta al INICIO del incidente;
+        si no, al inicio de la vuelta más cercana."""
+        moment = self._moment_near(t_click)
+        if moment is not None:
+            return max(self._t0, moment[0] - 5.0)
         status = self._status_at(t_click)
         if status is not None:
             return max(status[0], self._t0)
@@ -224,7 +275,8 @@ class _ViewHost(QWidget):
     gráfico lleva canal / ventana X propios (dos ventanas Race pueden mostrar
     canales distintos)."""
 
-    def __init__(self, view: QWidget, controls: list, parent=None):
+    def __init__(self, view: QWidget, controls: list, right: QWidget | None = None,
+                 parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -236,6 +288,8 @@ class _ViewHost(QWidget):
             row.addWidget(widget)
             row.addSpacing(10)
         row.addStretch(1)
+        if right is not None:  # p.ej. el selector 👥 de autos del gráfico
+            row.addWidget(right)
         lay.addLayout(row)
         lay.addWidget(view, stretch=1)
 
@@ -243,7 +297,7 @@ class _ViewHost(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("F1 Live Telemetry — Control hub")
+        self.setWindowTitle("BoxBox-F1 — Control hub")
         self.resize(400, 900)
 
         self.cfg = config.load_config()
@@ -272,19 +326,34 @@ class MainWindow(QMainWindow):
         self.chart_trace = TraceChart(self.hub, self.cfg)
         self.charts = [self.chart_rolling, self.chart_wrap, self.chart_qualy,
                        self.chart_timing, self.chart_trace]
-        self.track_map = TrackMapView(self.hub)
+        # selector local 👥 por gráfico: nace del panel Drivers (cada cambio
+        # ahí lo vuelve a pisar) y se retoca por ventana sin afectar al resto
+        self._panel_sel: list[str] = []
+        self._chart_sel_btns: list[DriverSelectButton] = []
+        for chart in self.charts:
+            btn = DriverSelectButton(self.hub)
+            btn.changed.connect(
+                lambda c=chart, b=btn: c.set_selected(b.selection()))
+            self._chart_sel_btns.append(btn)
+        self.chart_trace.add_control(self._chart_sel_btns[4])
+        self.track_map = TrackMapView(self.hub, self.cfg)
+        self.dominance_view = DominanceMapView(self.hub, self.cfg)
         self.lap_wheel = LapWheelView(self.hub, self.cfg)
         self.tower = TimingTower(self.hub, self.cfg)
         self.session_strip = SessionStrip(self.hub)
         self.race_control_view = RaceControlPanel(self.hub)
         self.strategy_view = StrategyView(self.hub)
-        self.pitlane_view = PitlaneView(self.hub)
+        self.tyre_stints_view = TyreStintsView(self.hub)
+        self.micro_config_view = MicroConfigView(self.hub, self.cfg)
+        self._micro_cfg_key: str | None = None
+        self.pitlane_view = PitlaneView(self.hub, self.cfg)
         self.pit_strategy_view = PitStrategyView(self.hub, self.cfg)
         self.notifier = NotificationCenter(self.hub, self.cfg, self)
         self.notifications_view = NotificationsPanel(self.notifier, self.cfg)
         self.weather_now = WeatherNowPanel(self.hub)
         self.weather_chart = WeatherChart(self.hub)
         self._tick_n = 0
+        self._moments_n = 0
         # espera de la fuente Capture: sondear hasta que el capturador
         # empiece a escribir datos y conectar solo (definido antes de la UI:
         # _source_kind_changed consulta _cap_waiting durante el cableado)
@@ -332,27 +401,38 @@ class MainWindow(QMainWindow):
          "Rolling telemetry vs track position (same corner = same vertical)"),
         ("race2_chart", "Race 2",
          "Fixed 0→L lap axis; each car overwrites its previous lap"),
-        ("quali_view", "Quali comparison",
+        ("quali_view", "Qualy Lap Compare",
          "Current laps vs a target lap: traces, cumulative delta and cards"),
         ("times_gap", "Times / Gap",
          "Gap chart vs a reference driver plus timing tables"),
         ("race_trace", "Race trace",
          "Gap evolution per microsector vs a selectable reference"),
         ("tower", "Timing tower",
-         "Broadcast-style tower: positions, gaps, tyres, sectors"),
+         "Broadcast-style tower: positions, gaps, tyres, sectors "
+         "(👥 picks the cars shown)"),
         ("map", "Track map",
-         "Live car positions and trails on the circuit outline"),
+         "Live car positions and trails on the circuit outline "
+         "(👥 picks the cars shown)"),
         ("lap_wheel", "Lap wheel",
          "Circular lap view: cars by lap position (north = start line), "
-         "sectors, corners and the pit-drop ghost"),
+         "sectors, corners and the pit-drop ghost (👥 picks the cars shown)"),
+        ("dominance", "Track dominance",
+         "Each µsector painted in the fastest driver's colour — pick the "
+         "drivers to compare (👥) and the lap range"),
         ("session", "Session status",
          "Flag, lap counter, session clock and latest race control message"),
         ("drivers", "Drivers",
-         "Driver selection: which cars appear in every chart and the map"),
+         "Driver selection: which cars are compared in the charts (the map, "
+         "lap wheel and tower pick their own cars with 👥)"),
         ("timeline", "Timeline",
          "Race progress: scrubber, lap ruler, pause and LIVE (replay/capture)"),
         ("strategy", "Tyre strategy",
          "Stint bars per driver, colored by compound"),
+        ("tyre_stints", "Tyre stints",
+         "One chip per stint: compound, laps and a green N for a fresh set"),
+        ("micro_config", "Microsectors",
+         "Move/add/remove the µ cuts on the map and table; saved per "
+         "circuit and year (sector boundaries stay official)"),
         ("pitlane", "Pit lane",
          "Who is in the pits right now, entry compound and live clocks"),
         ("pit_strategy", "Pit strategy",
@@ -445,6 +525,36 @@ class MainWindow(QMainWindow):
         seek_lay.addLayout(mid, stretch=1)
         self.time_label = QLabel("0:00 / 0:00")
         seek_lay.addWidget(self.time_label)
+        # capas de referencias de la línea de tiempo (persistidas)
+        self.timeline_layers_btn = QToolButton()
+        self.timeline_layers_btn.setText("▦")
+        self.timeline_layers_btn.setAutoRaise(True)
+        self.timeline_layers_btn.setToolTip(
+            "Choose which reference marks the timeline shows")
+        self.timeline_layers_btn.setPopupMode(QToolButton.InstantPopup)
+        self.timeline_layers_btn.setStyleSheet(
+            "QToolButton::menu-indicator { image: none; }")
+        tl_menu = QMenu(self)
+        tl_box = QWidget()
+        tl_lay = QVBoxLayout(tl_box)
+        tl_lay.setContentsMargins(6, 4, 6, 4)
+        tl_lay.setSpacing(2)
+        tl_stored = self.cfg.get("ui", {}).get("timeline_layers", {})
+        for key, label in (("laps", "Lap marks"), ("pits", "Pit stops"),
+                           ("flags", "Flags / SC bands"), ("rain", "Rain"),
+                           ("overtakes", "Overtakes")):
+            chk = QCheckBox(label)
+            on = tl_stored.get(key, True) is not False
+            chk.setChecked(on)
+            self.lap_ruler.set_layer(key, on)
+            chk.toggled.connect(
+                lambda v, k=key: self._timeline_layer_toggled(k, v))
+            tl_lay.addWidget(chk)
+        tl_action = QWidgetAction(tl_menu)
+        tl_action.setDefaultWidget(tl_box)
+        tl_menu.addAction(tl_action)
+        self.timeline_layers_btn.setMenu(tl_menu)
+        seek_lay.addWidget(self.timeline_layers_btn)
         # la línea de tiempo es un panel más del catálogo (ventana propia);
         # acá solo se deshabilita hasta que la fuente sea replay/captura
         self.seek_row.setEnabled(False)
@@ -574,21 +684,24 @@ class MainWindow(QMainWindow):
         hosts = {
             "race_chart": _ViewHost(self.chart_rolling, [
                 ("Channel", self.race_channel_combo),
-                ("X window", self.race_window_combo)]),
+                ("X window", self.race_window_combo)], self._chart_sel_btns[0]),
             "race2_chart": _ViewHost(self.chart_wrap, [
-                ("Channel", self.race2_channel_combo)]),
+                ("Channel", self.race2_channel_combo)], self._chart_sel_btns[1]),
             "quali_view": _ViewHost(self.chart_qualy, [
-                ("Channel", self.quali_channel_combo)]),
+                ("Channel", self.quali_channel_combo)], self._chart_sel_btns[2]),
             "times_gap": _ViewHost(self.chart_timing, [
-                ("X window", self.gap_window_combo)]),
+                ("X window", self.gap_window_combo)], self._chart_sel_btns[3]),
             "race_trace": self.chart_trace,  # ya lleva sus controles
             "tower": self.tower,
             "map": self.track_map,
+            "dominance": self.dominance_view,
             "lap_wheel": self.lap_wheel,
             "session": self.session_strip,
             "drivers": self._drivers_box,
             "timeline": self.seek_row,
             "strategy": self.strategy_view,
+            "tyre_stints": self.tyre_stints_view,
+            "micro_config": self.micro_config_view,
             "pitlane": self.pitlane_view,
             "pit_strategy": self.pit_strategy_view,
             "race_control": self.race_control_view,
@@ -790,7 +903,7 @@ class MainWindow(QMainWindow):
     def _launch_capturer(self) -> bool:
         try:
             if getattr(sys, "frozen", False):
-                exe = Path(sys.executable).parent / "capture" / "F1TelemCapture.exe"
+                exe = Path(sys.executable).parent / "capture" / "BoxBox-F1-Capture.exe"
                 if not exe.exists():
                     return False
                 subprocess.Popen([str(exe)], cwd=str(exe.parent))
@@ -889,10 +1002,17 @@ class MainWindow(QMainWindow):
         source.sessionClock.connect(self.hub.on_session_clock)
         source.lapCount.connect(self.hub.on_lap_count)
         source.sessionMeta.connect(self.hub.on_session_meta)
+        source.retirements.connect(self.hub.on_retirements)
+        # config de microsectores por circuito+año: cargarla apenas la meta
+        # identifica al fin de semana (después de que el hub la guardó)
+        self._micro_cfg_key = None
+        source.sessionMeta.connect(self._load_micro_cfg)
         # Live/Capture: el marco de vuelta llega con la latencia del feed y
         # se re-ancla con los S1 oficiales
         self.hub.live_frames = isinstance(source, (LiveSource, CaptureSource))
         self.lap_ruler.set_rain([])
+        self.lap_ruler.set_moments([])
+        self._moments_n = 0
         self._progress = None
         self.lap_ruler.set_marks([])
         self.lap_ruler.set_pits([])
@@ -902,6 +1022,9 @@ class MainWindow(QMainWindow):
         self.session_strip.clear_data()
         self.race_control_view.clear_data()
         self.strategy_view.clear_data()
+        self.tyre_stints_view.clear_data()
+        self.micro_config_view.clear_data()
+        self.dominance_view.clear_data()
         self.pitlane_view.clear_data()
         self.pit_strategy_view.clear_data()
         self.notifier.reset()
@@ -1050,6 +1173,7 @@ class MainWindow(QMainWindow):
         self.chart_trace.clear_data()
         self.track_map.clear_data()
         self.tower.clear_data()
+        self.dominance_view.clear_data()
         self.chart_qualy.clear_stream_data()
 
     def _on_batch(self, samples: list) -> None:
@@ -1061,7 +1185,7 @@ class MainWindow(QMainWindow):
 
     def _on_source_failed(self, text: str) -> None:
         self._on_source_status(text)
-        QMessageBox.warning(self, "F1 Live Telemetry", text)
+        QMessageBox.warning(self, "BoxBox-F1", text)
 
     # ------------------------------------------------- calendario del año
 
@@ -1142,15 +1266,44 @@ class MainWindow(QMainWindow):
 
     def _selection_changed(self, *_args) -> None:
         selected = self._selected_drivers()
-        for chart in self.charts:
-            chart.set_selected(selected)
-        self.track_map.set_selected(selected)
+        # el panel Drivers pisa la selección local (👥) de cada gráfico —
+        # solo ante un cambio real de selección, así los retoques locales
+        # sobreviven a driversChanged sin cambios (altas, colores)
+        if selected != self._panel_sel:
+            self._panel_sel = list(selected)
+            for chart, btn in zip(self.charts, self._chart_sel_btns):
+                btn.set_selection(selected)
+                chart.set_selected(selected)
         # reflejar el estado sin disparar el toggle
         self.all_check.blockSignals(True)
         self.all_check.setChecked(
             self.driver_list.count() > 0 and len(selected) == self.driver_list.count()
         )
         self.all_check.blockSignals(False)
+
+    def _timeline_layer_toggled(self, key: str, on: bool) -> None:
+        """Capas de la línea de tiempo (vueltas, pits, banderas, lluvia,
+        sobrepasos): mostrar/ocultar persistente."""
+        self.lap_ruler.set_layer(key, on)
+        layers = self.cfg.setdefault("ui", {}).setdefault(
+            "timeline_layers", {})
+        if on:
+            layers.pop(key, None)
+        else:
+            layers[key] = False
+        config.save_config(self.cfg)
+
+    def _load_micro_cfg(self, *_meta) -> None:
+        """Config de microsectores del circuito+año: se carga UNA vez por
+        fin de semana, sin importar qué tanda se cargue."""
+        key = self.hub.circuit_key()
+        if key is None or key == self._micro_cfg_key:
+            return
+        self._micro_cfg_key = key
+        stored = self.cfg.get("microsectors", {}).get(key)
+        self.hub.custom_micro = (
+            [float(d) for d in stored]
+            if isinstance(stored, list) and stored else None)
 
     def _trails_toggled(self, on: bool) -> None:
         self.track_map.set_trails_enabled(on)
@@ -1376,34 +1529,68 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------------- tick
 
+    def _safe_refresh(self, refresh) -> None:
+        """Aísla el refresh de una vista: si explota, las demás siguen y el
+        error queda en %LOCALAPPDATA%\\f1telem\\ui-errors.log (el exe no
+        tiene consola). La vista se recupera sola en el próximo tick."""
+        try:
+            refresh()
+        except Exception:
+            import time as _t
+            import traceback
+            traceback.print_exc()
+            try:
+                path = config.data_dir() / "ui-errors.log"
+                if path.exists() and path.stat().st_size > 512 * 1024:
+                    path.unlink()
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(_t.strftime("[%Y-%m-%d %H:%M:%S] ")
+                             + traceback.format_exc() + "\n")
+            except OSError:
+                pass
+
     def _tick(self) -> None:
         self._tick_n += 1
         if self._tick_n % 30 == 0:  # 1 Hz: límites oficiales de sector
-            self.hub.maybe_derive_sector_bounds()
-        # cada gráfico refresca solo si su ventana está abierta
+            self._safe_refresh(self.hub.maybe_derive_sector_bounds)
+            self._safe_refresh(self.hub.maybe_derive_brake_zones)
+        # cada gráfico refresca solo si su ventana está abierta; un refresh
+        # que explote jamás debe matar el tick (todo lo que refresca después
+        # quedaría "vacío" para siempre, p.ej. tras un salto de timeline):
+        # cada vista se aísla y el error queda en ui-errors.log
         for pid, chart in zip(self._CHART_IDS, self.charts):
             if self._panels[pid].is_panel_visible():
-                chart.refresh()
+                self._safe_refresh(chart.refresh)
         if self.track_map.isVisible():
-            self.track_map.refresh()
+            self._safe_refresh(self.track_map.refresh)
         if self.lap_wheel.isVisible():
-            self.lap_wheel.refresh()
+            self._safe_refresh(self.lap_wheel.refresh)
         if self.tower.isVisible() and self._tick_n % 15 == 0:
-            self.tower.refresh()
+            self._safe_refresh(self.tower.refresh)
         if self._tick_n % 30 == 0:
-            self._update_capturer_status()
+            self._safe_refresh(self._update_capturer_status)
         if self._tick_n % 15 == 0:
             # el gestor de notificaciones corre siempre (los popups no
-            # dependen de que su panel esté visible)
-            self.notifier.check()
+            # dependen de que su panel esté visible) y jamás frena el tick
+            try:
+                self.notifier.check()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            if len(self.notifier.moments) != self._moments_n:
+                self._moments_n = len(self.notifier.moments)
+                self.lap_ruler.set_moments(
+                    [(m["t"], m["text"]) for m in self.notifier.moments])
             if self.session_strip.isVisible():
-                self.session_strip.refresh()
+                self._safe_refresh(self.session_strip.refresh)
             for view in (self.race_control_view, self.strategy_view,
+                         self.tyre_stints_view, self.micro_config_view,
+                         self.dominance_view,
                          self.pitlane_view, self.pit_strategy_view,
                          self.weather_now, self.weather_chart,
                          self.notifications_view):
                 if view.isVisible():
-                    view.refresh()
+                    self._safe_refresh(view.refresh)
             # sub-paneles flotados aparte con su ventana madre cerrada
             tables = self.chart_timing.tables_panel
             if (not self._panels["times_gap"].is_panel_visible()

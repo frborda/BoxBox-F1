@@ -41,6 +41,7 @@ KINDS = [
     ("vsc", "Virtual safety car", "#ffd12e"),
     ("red", "Red flag", "#ff4d4d"),
     ("penalty", "Penalties", "#ff6b6b"),
+    ("overtake", "Overtakes", "#2fbf71"),
 ]
 _COLOR = {key: color for key, _label, color in KINDS}
 _STATUS_EVENTS = {
@@ -127,6 +128,11 @@ class NotificationCenter(QObject):
         self._moving: set[str] = set()
         self._stop_since: dict[str, float] = {}
         self._stop_fired: set[str] = set()
+        # sobrepasos: "momentos" para la línea de tiempo
+        self.moments: list[dict] = []  # {"t", "lap", "text"}
+        self._order_prev: list[str] = []
+        self._swaps_pending: dict[tuple[str, str], float] = {}
+        self._ov_t = 0.0  # último instante chequeado (detecta saltos)
 
     def reset(self) -> None:
         self.analyzer.clear()
@@ -141,6 +147,10 @@ class NotificationCenter(QObject):
         self._moving.clear()
         self._stop_since.clear()
         self._stop_fired.clear()
+        self.moments = []
+        self._order_prev = []
+        self._swaps_pending.clear()
+        self._ov_t = 0.0
 
     # ------------------------------------------------------------- emisión
 
@@ -177,9 +187,11 @@ class NotificationCenter(QObject):
         self._check_stopped(prime)
         self._check_status(prime)
         self._check_penalties(prime)
+        self._check_overtakes(prime)
         self._primed = True
 
     def _check_pit(self, prime: bool) -> None:
+        now = self.hub.latest_t
         for drv, visits in self.hub.pit_lane.items():
             n = len(visits)
             open_now = bool(visits) and visits[-1][2] is None
@@ -191,6 +203,11 @@ class NotificationCenter(QObject):
             if n > prev_n:
                 for visit in visits[prev_n:]:
                     lap, t_in, t_out = visit
+                    # la historia que llega de golpe tras el prime (replay
+                    # con toda la sesión, conexión a mitad de tanda) no se
+                    # anuncia: solo lo cercano al presente
+                    if not (-30.0 <= now - float(t_in) <= 120.0):
+                        continue
                     self._emit("pit_in", f"{code} — pit in (L{lap})",
                                key=("pi", drv, round(float(t_in), 1)))
                     if t_out is not None:
@@ -241,8 +258,8 @@ class NotificationCenter(QObject):
             if speed > 0.5:
                 continue
             since = self._stop_since.setdefault(drv, t)
-            visits = self.hub.pit_lane.get(drv)
-            in_pit = bool(visits) and visits[-1][2] is None
+            visit = self.hub.last_pit_visit(drv)
+            in_pit = visit is not None and self.hub.pit_visit_open(visit)
             if (not prime and drv in self._moving and not in_pit
                     and drv not in self._stop_fired and t - since >= 3.0):
                 self._stop_fired.add(drv)
@@ -263,6 +280,78 @@ class NotificationCenter(QObject):
         if event is not None:
             kind, text = event
             self._emit(kind, text, key=("ts", code_now, round(t_start, 1)))
+
+    def _pit_involved(self, drv: str, now: float) -> bool:
+        """True si el auto está en boxes o acaba de entrar/salir: los
+        cambios de orden del ciclo de paradas no son sobrepasos."""
+        for _lap, t_in, t_out in self.hub.pit_lane.get(drv, []):
+            end = float(t_out) + 25.0 if t_out is not None else float("inf")
+            if float(t_in) - 5.0 <= now <= end:
+                return True
+        return False
+
+    def _check_overtakes(self, prime: bool) -> None:
+        """Cambios de orden EN PISTA (fuera de boxes) sostenidos dos chequeos
+        seguidos: notificación + "momento" clickeable en la línea de tiempo."""
+        hub = self.hub
+        if hub.lap_count[1] <= 0 and "race" not in str(
+                hub.session_meta.get("type", "")).lower():
+            return  # la posición de pista solo ordena en carrera
+        pts = {}
+        for drv in hub.buffers:
+            if not hub.is_active(drv):
+                continue
+            pt = self.analyzer.position_time(drv)
+            if (pt is not None and len(pt[0]) >= 2
+                    and self.analyzer.real_positions_ready(drv)):
+                pts[drv] = float(pt[0][-1])
+        order = sorted(pts, key=lambda d: pts[d], reverse=True)
+        prev, self._order_prev = self._order_prev, order
+        now_t = hub.latest_t
+        jumped = abs(now_t - self._ov_t) > 30.0  # salto de timeline
+        self._ov_t = now_t
+        if prime or not prev or jumped:
+            # tras un seek el orden "anterior" es de otro instante: los
+            # cruces aparentes serían sobrepasos fantasma
+            self._swaps_pending.clear()
+            return
+        prev_idx = {d: k for k, d in enumerate(prev)}
+        now_idx = {d: k for k, d in enumerate(order)}
+        now = hub.latest_t
+        swapped: set[tuple[str, str]] = set()
+        for winner, wi in now_idx.items():
+            pw = prev_idx.get(winner)
+            if pw is None:
+                continue
+            for loser, li in now_idx.items():
+                pl = prev_idx.get(loser)
+                if pl is None or not (li > wi and pl < pw):
+                    continue  # no se cruzaron entre chequeos
+                if (self._pit_involved(winner, now)
+                        or self._pit_involved(loser, now)):
+                    continue
+                swapped.add((winner, loser))
+        # confirmación diferida: un cruce cuenta si el orden nuevo SIGUE en
+        # pie un chequeo después (el ruido de posición entre autos casi
+        # empatados se revierte solo y no debe disparar sobrepasos fantasma)
+        for (winner, loser), t0 in list(self._swaps_pending.items()):
+            del self._swaps_pending[(winner, loser)]
+            wi, li = now_idx.get(winner), now_idx.get(loser)
+            if wi is None or li is None or wi >= li:
+                continue  # se revirtió: era ruido
+            buf = hub.buffers.get(winner)
+            lap = buf.current_lap() if buf is not None and buf.n else 0
+            text = (f"{self._code(winner)} overtakes "
+                    f"{self._code(loser)} for P{wi + 1} (L{lap})")
+            key = ("ov", winner, loser, lap)
+            if key not in self._seen:
+                self.moments.append(
+                    {"t": float(t0), "lap": lap, "text": f"L{lap}: {text}"})
+                if len(self.moments) > 500:
+                    del self.moments[:100]
+            self._emit("overtake", text, key=key)
+        for pair in swapped:
+            self._swaps_pending.setdefault(pair, now)
 
     def _check_penalties(self, prime: bool) -> None:
         rows = self.hub.race_control

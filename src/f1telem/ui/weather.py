@@ -101,7 +101,8 @@ class WeatherChart(QWidget):
         self._rain_items = []
 
     def refresh(self) -> None:
-        rows = self.hub.weather
+        # sin spoilers: la evolución llega solo hasta el timeline actual
+        rows = [r for r in self.hub.weather if r[0] <= self.hub.latest_t]
         if not rows:
             return
         is_race = (str(self.hub.session_meta.get("type", "")).lower() == "race"

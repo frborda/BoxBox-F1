@@ -28,6 +28,7 @@ class BaseSource(QThread):
     sessionClock = Signal(object)     # (t_rel, restante_s, extrapolando) reloj de sesión
     lapCount = Signal(object)         # (vuelta_actual, total) en carreras
     sessionMeta = Signal(object)      # {"type", "meeting", "name"} de SessionInfo
+    retirements = Signal(object)      # [driver, ...] retirados oficiales (Retired)
     failed = Signal(str)
 
     def set_speed(self, speed: float) -> None:

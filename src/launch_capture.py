@@ -1,4 +1,4 @@
-"""Punto de entrada del capturador (exe propio: F1TelemCapture).
+"""Punto de entrada del capturador (exe propio: BoxBox-F1-Capture).
 
 Separado del visualizador para que una actualización de la app principal
 no obligue a frenar una captura en vivo en curso.

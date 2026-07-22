@@ -37,7 +37,7 @@ exe = EXE(
     pyz,
     a.scripts,
     exclude_binaries=True,
-    name="F1LiveTelemetry",
+    name="BoxBox-F1",
     debug=False,
     console=False,
 )
@@ -45,7 +45,7 @@ exe_cap = EXE(
     pyz_cap,
     cap.scripts,
     exclude_binaries=True,
-    name="F1TelemCapture",
+    name="BoxBox-F1-Capture",
     debug=False,
     console=False,
 )
@@ -56,10 +56,10 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
-    name="F1LiveTelemetry",
+    name="BoxBox-F1",
 )
 # COLLECT usa solo el basename como carpeta bajo dist: queda como hermano
-# 'capture' y build.ps1 lo mueve dentro de F1LiveTelemetry\capture.
+# 'capture' y build.ps1 lo mueve dentro de BoxBox-F1\capture.
 coll_cap = COLLECT(
     exe_cap,
     cap.binaries,

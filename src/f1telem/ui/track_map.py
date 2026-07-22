@@ -1,6 +1,7 @@
 """Mapa del circuito: trazado de la pista con la posición actual de los
-pilotos seleccionados (punto + estela + código), sincronizado con el mismo
-reloj que los gráficos.
+autos (punto + estela + código), sincronizado con el mismo reloj que los
+gráficos. Qué autos se ven lo decide el filtro 👥 propio de la ventana
+(todos por defecto), independiente del panel Drivers de comparación.
 
 El trazado lo provee la fuente (demo: sintético; replay: posiciones de la
 vuelta más rápida). En vivo, el hub lo arma siguiendo a un auto en
@@ -19,12 +20,13 @@ from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPen
 from ..hub import DataHub
 from . import theme
 from .charts import EdgeSmoother, series_pens
+from .driver_filter import DriverFilterButton
 
 TRAIL_SEC = 5.0  # largo de la estela detrás de cada auto (en tiempo de sesión)
 
 
 class TrackMapView(pg.PlotWidget):
-    def __init__(self, hub: DataHub, parent=None):
+    def __init__(self, hub: DataHub, cfg: dict | None = None, parent=None):
         super().__init__(parent)
         self.hub = hub
         self.selected: list[str] = []
@@ -75,7 +77,30 @@ class TrackMapView(pg.PlotWidget):
         self.scene().sigMouseMoved.connect(self._on_scene_move)
         self.viewport().installEventFilter(self)
 
-        hub.driversChanged.connect(self._restyle)
+        # filtro local de autos visibles (independiente del panel Drivers),
+        # como botón superpuesto en la esquina superior derecha del mapa
+        self.filter_btn = DriverFilterButton(hub, cfg, "map_hidden_cars", self)
+        self.filter_btn.changed.connect(self._apply_filter)
+        hub.driversChanged.connect(self._apply_filter)
+
+    def _apply_filter(self) -> None:
+        """Dibuja todos los autos de la sesión menos los ocultados acá."""
+        drivers = sorted(self.hub.drivers.values(), key=lambda d: d.label.upper())
+        self.set_selected(self.filter_btn.filter([d.number for d in drivers]))
+        self._place_filter_btn()
+
+    def _place_filter_btn(self) -> None:
+        # pyqtgraph emite resizeEvent durante super().__init__, antes de que
+        # el botón exista
+        btn = getattr(self, "filter_btn", None)
+        if btn is None:
+            return
+        btn.move(self.width() - btn.width() - 8, 6)
+        btn.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_filter_btn()
 
     def eventFilter(self, obj, event) -> bool:
         if event.type() == QEvent.Leave:
@@ -221,7 +246,8 @@ class TrackMapView(pg.PlotWidget):
             pb = self.hub.positions.get(drv)
             trail = self.trails[drv]
             label = self.labels[drv]
-            if pb is None or not len(pb):
+            if pb is None or not len(pb) or not self.hub.is_active(drv):
+                # sin datos, o abandonó / quedó clavado: fuera del mapa
                 trail.setData([], [])
                 label.setVisible(False)
                 continue

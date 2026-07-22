@@ -6,7 +6,7 @@ import sys
 
 def _selftest() -> int:
     """Verifica que todas las dependencias diferidas estén disponibles
-    (útil para validar el build congelado): F1Telem.exe --selftest"""
+    (útil para validar el build congelado): BoxBox-F1.exe --selftest"""
     try:
         import fastf1  # noqa: F401
         import pyqtgraph  # noqa: F401
@@ -39,12 +39,12 @@ def _handle_protocol(url: str) -> int:
     if token:
         save_token(token)
         QMessageBox.information(
-            None, "F1 Live Telemetry",
+            None, "BoxBox-F1",
             "F1TV token saved — the capturer will pick it up automatically.",
         )
         return 0
     QMessageBox.warning(
-        None, "F1 Live Telemetry", "No F1TV token found in the link."
+        None, "BoxBox-F1", "No F1TV token found in the link."
     )
     return 1
 
@@ -66,7 +66,7 @@ def main() -> int:
     from .ui.theme import apply_theme
 
     app = QApplication(sys.argv)
-    app.setApplicationName("F1 Live Telemetry")
+    app.setApplicationName("BoxBox-F1")
     app.setOrganizationName("f1telem")
     apply_theme(app)
     window = MainWindow()

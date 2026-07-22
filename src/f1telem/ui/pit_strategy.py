@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
@@ -280,13 +281,17 @@ class PitStrategyView(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
 
-        self.table = QTableWidget(0, 6)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["P", "Driver", "Gap", "→ P", "Behind", "Margin"])
+            ["P", "Driver", "Gap", "Net", "→ P", "Behind", "Margin"])
+        self.table.horizontalHeaderItem(3).setToolTip(
+            "Net position in the pit cycle: virtual order once every car "
+            "with pending stops pays one Pit window (green = gains, red = "
+            "loses vs today's track position)")
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setStyleSheet("QTableWidget { font-size: 8pt; }")
-        for col, width in ((0, 28), (2, 56), (3, 36), (5, 64)):
+        for col, width in ((0, 28), (2, 56), (3, 40), (4, 36), (6, 64)):
             self.table.setColumnWidth(col, width)
         lay.addWidget(self.table, stretch=1)
 
@@ -335,23 +340,42 @@ class PitStrategyView(QWidget):
         self._last_table = now
         ordered, gaps = self.current_gaps()
         window = float(self.window_spin.value())
+        # posición NETA en el ciclo de paradas: el orden en pista miente
+        # mientras unos pararon y otros no — a cada auto le faltan
+        # (máx_paradas − propias) paradas, cada una vale una Ventana de Box
+        stops = {d: len(self.hub.pit_stops_done(d)) for d in ordered}
+        max_stops = max(stops.values(), default=0)
+        virtual: dict[str, float] = {}
+        for d in ordered:
+            g = gaps.get(d)
+            if g is not None:
+                virtual[d] = g + (max_stops - stops[d]) * window
+        net_order = sorted(virtual, key=lambda d: virtual[d])
+        net_pos = {d: k + 1 for k, d in enumerate(net_order)}
         self.table.setRowCount(len(ordered))
         for i, drv in enumerate(ordered):
             info = self.hub.drivers.get(drv)
             code = info.code if info else drv
             gap = gaps.get(drv)
             proj = project_rejoin(gaps, drv, window)
+            net = net_pos.get(drv)
             cells = [str(i + 1), code,
                      "—" if gap is None else f"+{gap:.1f}",
+                     f"P{net}" if net else "—",
                      "—", "—", "—"]
             if proj is not None:
                 new_pos, (behind_drv, margin), _ahead = proj
                 binfo = self.hub.drivers.get(behind_drv or "")
-                cells[3] = f"P{new_pos}"
-                cells[4] = (binfo.code if binfo else (behind_drv or "—"))
-                cells[5] = "—" if margin != margin else f"+{margin:.1f}s"
+                cells[4] = f"P{new_pos}"
+                cells[5] = (binfo.code if binfo else (behind_drv or "—"))
+                cells[6] = "—" if margin != margin else f"+{margin:.1f}s"
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if c == 1 and info is not None:
                     item.setForeground(Qt.white)
+                if c == 3 and net is not None:
+                    if net < i + 1:
+                        item.setForeground(QColor("#2fbf71"))
+                    elif net > i + 1:
+                        item.setForeground(QColor("#ff6b5e"))
                 self.table.setItem(i, c, item)

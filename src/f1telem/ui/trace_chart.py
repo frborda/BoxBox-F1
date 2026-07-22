@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from .. import config
 from ..hub import DataHub
-from ..timing import N_MICRO, TimingAnalyzer
+from ..timing import TimingAnalyzer
 from . import theme
 from .charts import HoverProbe
 
@@ -70,6 +70,7 @@ class TraceChart(QWidget):
         self.y_spin.setValue(float(self.cfg.get("ui", {}).get("trace_y_secs", 0.0)))
         controls.addWidget(self.y_spin)
         controls.addStretch(1)
+        self._controls = controls
         lay.addLayout(controls)
 
         self.plot = pg.PlotWidget()
@@ -138,6 +139,10 @@ class TraceChart(QWidget):
 
     # ---------------------------------------------- interfaz común de vistas
 
+    def add_control(self, widget: QWidget) -> None:
+        """Suma un control a la barrita propia (p.ej. el selector 👥)."""
+        self._controls.addWidget(widget)
+
     def set_selected(self, drivers: list[str]) -> None:
         self._selected = list(drivers)
         for drv, curve in self._curves.items():
@@ -168,7 +173,8 @@ class TraceChart(QWidget):
 
     def _checkpoint_step(self) -> float:
         counts = self.hub.segment_counts
-        n = sum(counts.values()) if len(counts) == 3 else N_MICRO
+        n = (sum(counts.values()) if len(counts) == 3
+             else self.analyzer.n_micro())
         return self.hub.track_length / max(n, 3)
 
     def refresh(self) -> None:

@@ -98,7 +98,8 @@ class StrategyView(QWidget):
                          reverse=True)
         rows = []
         for drv in ordered:
-            stints = collect_stints(hub.tyres.get(drv, {}))
+            # sin spoilers: el plan futuro del replay no se muestra
+            stints = collect_stints(hub.tyres_until_now(drv))
             if not stints:
                 continue
             info = hub.drivers.get(drv)

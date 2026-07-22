@@ -88,6 +88,16 @@ src._on_timing({"Lines": {"16": {"Sectors": [{"Value": ""}, {"Value": "bad"}]}}}
 check(not any(r[0] == "16" for r in sector_reports),
       "decoder: Value vacío o inválido no emite tiempo")
 
+# retiro oficial: Retired del feed (Stopped es transitorio y no cuenta)
+ret_events: list = []
+src.retirements.connect(lambda r: ret_events.append(list(r)))
+src._on_timing({"Lines": {"44": {"Retired": True, "Stopped": True}}})
+check(ret_events and ret_events[-1] == ["44"], "decoder: Retired emitido")
+src._on_timing({"Lines": {"44": {"Retired": True}}})
+check(len(ret_events) == 1, "decoder: Retired repetido no re-emite")
+src._on_timing({"Lines": {"16": {"Stopped": True}}})
+check(len(ret_events) == 1, "decoder: Stopped solo no retira")
+
 # ---------------------------------------- trazado del circuito (MultiViewer)
 
 from f1telem.sources.live import _circuit_rows  # noqa: E402
@@ -191,6 +201,28 @@ micro = an.micro_times("44", 3)
 check(micro is not None and abs(float(np.nansum(micro)) - lap_time) < 0.05,
       "analyzer: los 24 µsectores suman la vuelta")
 
+# invariante: los 8 µ de cada sector suman EXACTO el sector mostrado (el
+# oficial si ya llegó — re-escalado proporcional — o el interpolado si no)
+hub.on_sector_times([("44", 5, 2, 36.4),   # S3 oficial distinto del interp
+                     ("44", 7, 0, 36.9)])  # S1 oficial solo (caso mixto)
+for lap in (3, 5, 7):
+    micro_l = an.micro_times("44", lap)
+    secs_l = an.sector_times("44", lap)
+    for k in range(3):
+        seg_sum = float(micro_l[k * SECTOR_STEP:(k + 1) * SECTOR_STEP].sum())
+        check(abs(seg_sum - secs_l[k]) < 1e-6,
+              f"invariante: µ de S{k + 1} suman el sector (vuelta {lap}: "
+              f"{seg_sum:.3f} vs {secs_l[k]:.3f})")
+
+# lo mismo para los valores rodantes (µ y sector de la vuelta en curso)
+hub.on_sector_times([("44", 8, 0, 36.6)])
+lm, _lm_laps = an.latest_micro_times("44")
+ls, _ls_laps = an.latest_sector_times("44")
+check(abs(float(lm[:SECTOR_STEP].sum()) - float(ls[0])) < 1e-6
+      and abs(float(ls[0]) - 36.6) < 1e-9,
+      f"invariante rodante: µ1-8 suman el S1 oficial "
+      f"({float(lm[:SECTOR_STEP].sum()):.3f} vs {float(ls[0]):.3f})")
+
 # al llegar los tiempos oficiales, las tablas los muestran tal cual
 hub.on_sector_times([("44", 4, 3, 119.512), ("44", 4, 2, 35.5)])
 check(an.lap_time("44", 4) == 119.512,
@@ -213,6 +245,151 @@ hub2.sector_bounds = (B1, B2)
 an2._check_track_len()
 check(abs(an2._mark_dists()[SECTOR_STEP] - B1) < 0.01,
       "analyzer: al aparecer bounds cambian las marcas")
+
+# ------------------------------------------------- cortes fuera de curvas
+
+hub5 = DataHub()
+hub5.on_track_length(L)  # tercios: µ de 250 m, marcas cada 250 m
+hub5.corners = [("T1", 950.0, 0.0, 0.0), ("T5", 2550.0, 0.0, 0.0)]
+an5 = TimingAnalyzer(hub5)
+d5 = an5._mark_dists()
+check(len(d5) == N_MICRO + 1 and float(d5[0]) == 0.0
+      and abs(float(d5[-1]) - L) < 1e-9,
+      "snap: 25 marcas con extremos intactos")
+check(bool((np.diff(d5) > 0.3 * L / N_MICRO).all()),
+      "snap: orden y ancho mínimo garantizados")
+zones = [(850.0, 1010.0), (2450.0, 2610.0)]  # vértice −100 m / +60 m
+inner = [float(d5[i]) for i in range(1, N_MICRO) if i % SECTOR_STEP]
+check(not any(z0 < m < z1 for m in inner for z0, z1 in zones),
+      "snap: ningún corte interno dentro de una zona de curva")
+check(abs(float(d5[4]) - 1010.0) < 1e-6 and abs(float(d5[10]) - 2450.0) < 1e-6,
+      f"snap: cortes movidos al borde de la zona ({float(d5[4]):.0f}, "
+      f"{float(d5[10]):.0f})")
+check(abs(float(d5[SECTOR_STEP]) - L / 3) < 1e-9,
+      "snap: el límite de sector nunca se mueve")
+# al conocerse las curvas más tarde, el cache de marcas se invalida
+hub5b = DataHub()
+hub5b.on_track_length(L)
+an5b = TimingAnalyzer(hub5b)
+check(abs(float(an5b._mark_dists()[4]) - 1000.0) < 1e-9,
+      "snap: sin curvas, marcas equiespaciadas")
+hub5b.corners = [("T1", 950.0, 0.0, 0.0)]
+check(abs(float(an5b._mark_dists()[4]) - 1010.0) < 1e-6,
+      "snap: al llegar las curvas las marcas se recolocan")
+
+# curva y contracurva: el hueco entre ambas zonas es demasiado chico para
+# un corte (cambio de sentido) — las zonas se fusionan
+hub5c = DataHub()
+hub5c.on_track_length(L)
+# zonas [850, 1010] y [1050, 1210]: hueco de 40 m; antes el corte de 1000 m
+# era atraído a 1010 (plena transición de la chicana)
+hub5c.corners = [("T1", 950.0, 0.0, 0.0), ("T2", 1150.0, 0.0, 0.0)]
+an5c = TimingAnalyzer(hub5c)
+d5c = an5c._mark_dists()
+check(abs(float(d5c[4]) - 1000.0) < 1e-9,
+      f"snap: chicana fusionada — el corte no se atrae a la transición "
+      f"({float(d5c[4]):.0f} m)")
+# corrida la chicana: los cortes vecinos salen ANTES del primer frenaje y
+# DESPUÉS de la salida de la segunda curva, nunca al medio
+hub5c.corners = [("T1", 1050.0, 0.0, 0.0), ("T2", 1250.0, 0.0, 0.0)]
+d5c = an5c._mark_dists()
+check(abs(float(d5c[4]) - 950.0) < 1e-6 and abs(float(d5c[5]) - 1310.0) < 1e-6,
+      f"snap: cortes al frenaje de la 1ª y salida de la 2ª "
+      f"({float(d5c[4]):.0f}, {float(d5c[5]):.0f})")
+inner_c = [float(d5c[i]) for i in range(1, N_MICRO) if i % SECTOR_STEP]
+check(not any(1110.0 <= m <= 1150.0 for m in inner_c),
+      "snap: ningún corte en el cambio de sentido")
+
+# ---------------------------------------- frenaje real medido por curva
+
+# la zona de frenaje no es fija: depende de qué tan rápido se llega y
+# cuánto hay que frenar — se mide del canal de freno (mediana)
+hub7 = DataHub()
+hub7.on_track_length(L)
+hub7.corners = [("T1", 1500.0, 0.0, 0.0),   # frenada larga: 200 m
+                ("T8", 3500.0, 0.0, 0.0)]   # viraje a fondo: sin freno
+brk_samples = []
+for drv in ("44", "16"):
+    t = 0.0
+    while t < 4 * 120.0:
+        total = t * V
+        d_lap = total % L
+        braking = 100.0 if 1300.0 <= d_lap < 1500.0 else 0.0
+        brk_samples.append(Sample(
+            driver=drv, t=t, lap=int(total // L) + 1, dist_lap=d_lap,
+            dist_total=total, speed=V * 3.6, throttle=80.0, brake=braking,
+            rpm=11000.0, gear=6, drs=0,
+        ))
+        t += 0.25
+hub7.on_batch(brk_samples)
+hub7.maybe_derive_brake_zones()
+check(hub7.brake_dists is not None, "frenaje: derivado con 2 autos y vueltas")
+bd = hub7.brake_dists or {}
+check(abs(bd.get(1500.0, 0.0) - 200.0) < 15.0,
+      f"frenaje: T1 frena ~200 m antes ({bd.get(1500.0, 0.0):.0f} m)")
+check(3500.0 not in bd, "frenaje: viraje a fondo sin zona de frenaje")
+an7 = TimingAnalyzer(hub7)
+d7 = an7._mark_dists()
+# marca nominal de 1500 m: zona [1300, 1560] -> sale a la salida (1560)
+check(abs(float(d7[6]) - 1560.0) < 1e-6,
+      f"frenaje: corte fuera de la frenada medida ({float(d7[6]):.0f} m)")
+# marca nominal de 3500 m: sin frenaje solo protege el vértice (±30/60)
+check(abs(float(d7[14]) - 3470.0) < 1e-6,
+      f"frenaje: viraje a fondo solo guarda el vértice ({float(d7[14]):.0f} m)")
+
+# ------------------------------------------- marcas personalizadas (panel)
+
+hub8 = DataHub()
+hub8.on_track_length(L)
+hub8.sector_bounds = (B1, B2)
+hub8.custom_micro = [600.0, 1200.0, 3000.0, 4800.0, 5400.0]  # 3+2+3 µ
+an8 = TimingAnalyzer(hub8)
+m8 = an8._mark_dists()
+check(len(m8) == 9 and an8.n_micro() == 8,
+      f"custom: 5 cortes + límites = 8 µ ({an8.n_micro()})")
+check(an8.sector_slices() == ((0, 3), (3, 5), (5, 8)),
+      f"custom: cantidad libre por sector ({an8.sector_slices()})")
+check(abs(float(m8[3]) - B1) < 1e-9 and abs(float(m8[5]) - B2) < 1e-9,
+      "custom: los límites oficiales siempre son marcas")
+hub8.on_batch([s for s in samples if s.driver == "44"])
+sec8 = an8.sector_times("44", 3)
+check(abs(sec8[0] - S1) < 0.2 and abs(sec8[1] - S2) < 0.2,
+      f"custom: S1/S2 correctos con µ variables ({sec8[0]:.2f}, {sec8[1]:.2f})")
+micro8 = an8.micro_times("44", 3)
+for k, (a8, b8) in enumerate(an8.sector_slices()):
+    check(abs(float(micro8[a8:b8].sum()) - sec8[k]) < 1e-6,
+          f"custom: µ de S{k + 1} suman el sector ({b8 - a8} µ)")
+# los rodantes respetan la config: un valor por µ configurado
+roll8 = an8.latest_micro_times("44")
+check(roll8 is not None and len(roll8[0]) == 8,
+      "custom: µ rodantes con la cantidad configurada")
+
+# ------------------------------------------------- autos fuera de carrera
+
+hub9 = DataHub()
+hub9.on_track_length(L)
+act_samples = []
+for drv, t_end in (("44", 300.0), ("16", 200.0)):  # 16 se clava en t=200
+    t = 0.0
+    while t < t_end:
+        total = t * V
+        act_samples.append(Sample(
+            driver=drv, t=t, lap=int(total // L) + 1, dist_lap=total % L,
+            dist_total=total, speed=V * 3.6, throttle=0.0, brake=0.0,
+            rpm=0.0, gear=0, drs=0))
+        t += 0.5
+act_samples.sort(key=lambda s: s.t)  # cronológico, como una fuente real
+hub9.on_batch(act_samples)
+check(hub9.is_active("44"), "activo: auto en movimiento")
+check(not hub9.is_active("16"),
+      "activo: clavado / sin datos frescos queda fuera de carrera")
+hub9.on_batch([Sample("5", 299.0, 1, 10.0, 10.0, 0.0,
+                      0.0, 0.0, 0.0, 0, 0)])
+check(hub9.is_active("5"), "activo: en vuelta 1 la grilla parada no caduca")
+hub9.on_retirements(["44"])
+check(not hub9.is_active("44"), "activo: Retired oficial lo saca")
+hub9.on_retirements([])
+check(hub9.is_active("44"), "activo: des-retirado vuelve")
 
 # ------------------------------------------- re-anclaje en vivo (S1 oficial)
 

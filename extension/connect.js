@@ -69,7 +69,7 @@ async function connect() {
       return;
     }
     // plan B: entregar por el protocolo f1telemetry:// (diálogo nativo
-    // "Abrir F1 Live Telemetry") o copiar para "Paste token…"
+    // "Abrir BoxBox-F1") o copiar para "Paste token…"
     const token = extractToken(cookie);
     if (token) {
       $("tokenbox").style.display = "block";
@@ -77,7 +77,7 @@ async function connect() {
       $("openapp").onclick = () => {
         location.href = "f1telemetry://auth?token=" + encodeURIComponent(token);
         status.textContent =
-          'If the browser asked to open "F1 Live Telemetry", accept — the ' +
+          'If the browser asked to open "BoxBox-F1", accept — the ' +
           "capturer picks the token up automatically.";
         status.className = "warn";
       };

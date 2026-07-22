@@ -33,7 +33,7 @@ class _FloatWindow(QWidget):
         self.holder = holder
         self.pinned = False
         self.setObjectName("floatwin")
-        self.setWindowTitle(f"F1 Live Telemetry — {holder.title}")
+        self.setWindowTitle(f"BoxBox-F1 — {holder.title}")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 2, 4, 4)
         lay.setSpacing(2)
@@ -42,6 +42,15 @@ class _FloatWindow(QWidget):
         title.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-weight: bold;")
         bar.addWidget(title)
         bar.addStretch(1)
+        # restaurar los subpaneles internos ocultados/flotados (solo visible
+        # en ventanas que los tienen, p.ej. tablas de Times/Gap o tarjetas
+        # de Quali): sin esto un subpanel cerrado con ✕ era irrecuperable
+        self.reset_btn = _mini_btn(
+            "↺", "Reset inner panels: reopen and dock back this window's "
+                 "sub-panels")
+        self.reset_btn.clicked.connect(self._reset_inner)
+        self.reset_btn.setVisible(False)
+        bar.addWidget(self.reset_btn)
         # opacidad para overlays fijados sobre una transmisión
         self.opacity_slider = QSlider(Qt.Horizontal)
         self.opacity_slider.setRange(55, 100)
@@ -66,6 +75,12 @@ class _FloatWindow(QWidget):
 
     def add_content(self, widget: QWidget) -> None:
         self._lay.addWidget(widget, stretch=1)
+        self.reset_btn.setVisible(bool(widget.findChildren(Detachable)))
+
+    def _reset_inner(self) -> None:
+        for sub in self.holder.content.findChildren(Detachable):
+            sub.attach()
+            sub.set_panel_visible(True)
 
     def _set_pinned(self, on: bool) -> None:
         # sin marco no se puede mover ni redimensionar; el botón de des-fijar
@@ -132,7 +147,8 @@ class Detachable(QWidget):
         self.float_btn.clicked.connect(lambda _=False: self.detach())
         bar.addWidget(self.float_btn)
         if closable and not keep_placeholder:
-            close_btn = _mini_btn("✕", "Hide this panel (reopen from Panels)")
+            close_btn = _mini_btn(
+                "✕", "Hide this sub-panel (↺ in the window bar brings it back)")
             close_btn.clicked.connect(self._hide_docked)
             bar.addWidget(close_btn)
         lay.addLayout(bar)

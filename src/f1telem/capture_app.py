@@ -1,7 +1,7 @@
 """Capturador: aplicación mínima que graba el stream de F1 Live Timing a un
 archivo de captura, para que el visualizador lo siga en vivo (o lo rebobine).
 
-Se abre con `F1LiveTelemetry.exe --capture` (o `python -m f1telem --capture`).
+Se abre con `BoxBox-F1.exe --capture` (o `python -m f1telem --capture`).
 Incluye el login F1TV (mismo token que FastF1): el streaming en vivo requiere
 una suscripción F1TV activa; sin token se intenta sin autenticación.
 """
@@ -95,7 +95,7 @@ def save_token(token: str) -> None:
 
 def token_from_url(url: str) -> str | None:
     """Token del enlace f1telemetry://auth?token=... que abre la extensión
-    (vía el diálogo nativo del navegador 'Abrir F1 Live Telemetry')."""
+    (vía el diálogo nativo del navegador 'Abrir BoxBox-F1')."""
     parsed = urllib.parse.urlparse(url)
     raw = (urllib.parse.parse_qs(parsed.query).get("token") or [""])[0]
     if not raw:
@@ -115,7 +115,7 @@ def register_protocol() -> None:
         root = winreg.CreateKey(
             winreg.HKEY_CURRENT_USER, r"Software\Classes\f1telemetry"
         )
-        winreg.SetValueEx(root, None, 0, winreg.REG_SZ, "URL:F1 Live Telemetry")
+        winreg.SetValueEx(root, None, 0, winreg.REG_SZ, "URL:BoxBox-F1")
         winreg.SetValueEx(root, "URL Protocol", 0, winreg.REG_SZ, "")
         cmd = winreg.CreateKey(root, r"shell\open\command")
         winreg.SetValueEx(cmd, None, 0, winreg.REG_SZ,
@@ -187,7 +187,7 @@ class _AuthWorker(QObject):
 class CaptureWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("F1 Live Telemetry — Capture")
+        self.setWindowTitle("BoxBox-F1 — Capture")
         self.setMinimumWidth(460)
         self.cfg = config.load_config()
         self.source: LiveSource | None = None
@@ -281,7 +281,7 @@ class CaptureWindow(QWidget):
         self._tray: QSystemTrayIcon | None = None
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._tray = QSystemTrayIcon(_tray_icon(), self)
-            self._tray.setToolTip("F1 Telemetry Capture")
+            self._tray.setToolTip("BoxBox-F1 Capture")
             tray_menu = QMenu()
             show_action = tray_menu.addAction("Show capturer")
             show_action.triggered.connect(self._show_from_tray)
@@ -319,7 +319,7 @@ class CaptureWindow(QWidget):
         token = extract_subscription_token(text)
         if token is None:
             QMessageBox.warning(
-                self, "F1 Live Telemetry",
+                self, "BoxBox-F1",
                 "Could not find a token in what you pasted. Expected the\n"
                 "'login-session' cookie value or a JWT (starts with 'ey').",
             )
@@ -393,7 +393,7 @@ class CaptureWindow(QWidget):
         out = str(rec_dir / IMPORT_PLAYBACK_NAME)
         if os.path.normcase(os.path.abspath(path)) == os.path.normcase(out):
             QMessageBox.warning(
-                self, "F1 Live Telemetry",
+                self, "BoxBox-F1",
                 "That file is the playback working file itself — pick a"
                 " recorded capture.",
             )
@@ -410,7 +410,7 @@ class CaptureWindow(QWidget):
         start_at = parse_hms(text)
         if start_at is None:
             QMessageBox.warning(
-                self, "F1 Live Telemetry",
+                self, "BoxBox-F1",
                 f"Could not parse '{text}'. Use hh:mm:ss, e.g. 00:01:30.",
             )
             return
@@ -535,7 +535,7 @@ class CaptureWindow(QWidget):
             event.ignore()
             self.hide()
             self._tray.showMessage(
-                "F1 Telemetry Capture",
+                "BoxBox-F1 Capture",
                 "Still running in the tray. Right-click the icon and choose "
                 "Exit to quit.")
             return
@@ -559,7 +559,7 @@ def main() -> int:
     from .ui.theme import apply_theme
 
     app = QApplication(sys.argv)
-    app.setApplicationName("F1 Live Telemetry Capture")
+    app.setApplicationName("BoxBox-F1 Capture")
     apply_theme(app)
     window = CaptureWindow()
     window.show()

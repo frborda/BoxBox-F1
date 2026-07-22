@@ -165,6 +165,16 @@ check(3.0 <= stopped <= 4.0,
 hub2.on_pit_lane({"1": [[4, 10.0, 32.0]]})
 check(hub2.last_pit_visit("1") == [4, 10.0, 32.0], "hub: última visita a boxes")
 
+# historia completa por adelantado (replay): la visita futura no cuenta aún
+hub2.on_pit_lane({"1": [[4, 10.0, 32.0], [30, 5000.0, None]]})
+check(hub2.last_pit_visit("1") == [4, 10.0, 32.0],
+      "hub: visita futura del replay ignorada")
+hub2.latest_t = 20.0
+check(hub2.pit_visit_open([4, 10.0, 32.0]),
+      "hub: visita en curso con salida en el futuro (replay)")
+hub2.latest_t = 40.0
+check(not hub2.pit_visit_open([4, 10.0, 32.0]), "hub: visita ya cerrada")
+
 hub.reset()
 check(hub.lap_count == (0, 0) and not hub.session_meta
       and not hub.race_control and not hub.pit_lane,
