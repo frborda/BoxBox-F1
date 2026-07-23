@@ -4,7 +4,7 @@ de carrera. Pensada como banner sobre la zona central (desacoplable)."""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QHBoxLayout, QLabel, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
 
 from ..hub import DataHub
 from . import theme
@@ -44,6 +44,11 @@ class SessionStrip(QWidget):
         self.rcm_label.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         self.rcm_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         lay.addWidget(self.rcm_label, stretch=1)
+        # los textos largos (sesión y race control) no deben imponer un
+        # ancho mínimo: con la ventana angosta se recortan y listo
+        for label in (self.session_label, self.rcm_label):
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.setMinimumWidth(90)
 
     def clear_data(self) -> None:
         for label in (self.session_label, self.lap_label,

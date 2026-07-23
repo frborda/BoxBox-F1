@@ -234,6 +234,13 @@ class LiveDecoderMixin:
     def _on_weather(self, data) -> None:
         if not isinstance(data, dict):
             return
+
+        def _opt(key: str) -> float:
+            try:
+                return float(data.get(key))
+            except (ValueError, TypeError):
+                return float("nan")
+
         try:
             entry = (
                 self._last_rel_t,
@@ -241,6 +248,9 @@ class LiveDecoderMixin:
                 float(data.get("TrackTemp", 0) or 0),
                 float(data.get("WindSpeed", 0) or 0),
                 str(data.get("Rainfall", "0")) == "1",
+                _opt("Humidity"),
+                _opt("Pressure"),
+                _opt("WindDirection"),
             )
         except (ValueError, TypeError):
             return

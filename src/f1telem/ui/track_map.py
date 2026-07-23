@@ -10,12 +10,16 @@ dibujan la pista.
 """
 from __future__ import annotations
 
+import math
 import time
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QPointF
-from PySide6.QtGui import QBrush, QColor, QLinearGradient, QPen
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QLinearGradient, QPainter, QPen, QPolygonF,
+)
+from PySide6.QtWidgets import QWidget
 
 from ..hub import DataHub
 from . import theme
@@ -23,6 +27,78 @@ from .charts import EdgeSmoother, series_pens
 from .driver_filter import DriverFilterButton
 
 TRAIL_SEC = 5.0  # largo de la estela detrás de cada auto (en tiempo de sesión)
+
+
+class WindBadge(QWidget):
+    """Brújula de viento superpuesta al mapa: N arriba y una flecha que
+    apunta hacia DONDE sopla el viento (la dirección meteorológica del feed
+    es desde dónde viene). Las coordenadas de Position.z son norte-arriba,
+    igual que el trazado dibujado, así que la flecha se corresponde con la
+    pista: viento en contra o a favor en cada recta se lee directo."""
+
+    SIZE = 58
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE + 14)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        self._dir: float = float("nan")   # ° desde el norte (desde dónde viene)
+        self._speed: float = float("nan")  # m/s
+        self.setVisible(False)
+
+    def set_wind(self, direction_deg: float, speed_ms: float) -> None:
+        if (direction_deg != direction_deg) or not math.isfinite(speed_ms):
+            if self.isVisible():
+                self.setVisible(False)
+            return
+        if (direction_deg, speed_ms) != (self._dir, self._speed):
+            self._dir = float(direction_deg)
+            self._speed = float(speed_ms)
+            self.setToolTip(
+                f"Wind {speed_ms:.1f} m/s from {direction_deg:.0f}° "
+                "(arrow shows where it blows to)")
+            self.update()
+        if not self.isVisible():
+            self.setVisible(True)
+
+    def paintEvent(self, event) -> None:
+        if self._dir != self._dir:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        d = self.SIZE
+        cx, cy, r = d / 2.0, d / 2.0, d / 2.0 - 2.0
+        p.setPen(QPen(QColor(theme.BORDER), 1))
+        p.setBrush(QColor(theme.SURFACE + "c0"))
+        p.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+        f = QFont(self.font())
+        f.setPointSizeF(6.0)
+        p.setFont(f)
+        p.setPen(QColor(theme.TEXT_MUTED))
+        p.drawText(QRectF(cx - 6, cy - r, 12, 9), Qt.AlignCenter, "N")
+        # flecha hacia donde sopla: dirección meteorológica + 180°; en
+        # pantalla el eje y crece hacia abajo (norte = -y)
+        to = math.radians((self._dir + 180.0) % 360.0)
+        dx, dy = math.sin(to), -math.cos(to)
+        tip = QPointF(cx + dx * (r - 4), cy + dy * (r - 4))
+        tail = QPointF(cx - dx * (r - 8), cy - dy * (r - 8))
+        p.setPen(QPen(QColor(theme.ACCENT), 2))
+        p.drawLine(tail, tip)
+        # punta de flecha
+        left = math.radians((self._dir + 180.0) % 360.0 + 150.0)
+        right = math.radians((self._dir + 180.0) % 360.0 - 150.0)
+        head = QPolygonF([
+            tip,
+            QPointF(tip.x() + math.sin(left) * 7, tip.y() - math.cos(left) * 7),
+            QPointF(tip.x() + math.sin(right) * 7, tip.y() - math.cos(right) * 7),
+        ])
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(theme.ACCENT))
+        p.drawPolygon(head)
+        p.setPen(QColor(theme.TEXT))
+        p.drawText(QRectF(0, d, self.width(), 12), Qt.AlignCenter,
+                   f"{self._speed:.1f} m/s")
+        p.end()
 
 
 class TrackMapView(pg.PlotWidget):
@@ -82,6 +158,9 @@ class TrackMapView(pg.PlotWidget):
         self.filter_btn = DriverFilterButton(hub, cfg, "map_hidden_cars", self)
         self.filter_btn.changed.connect(self._apply_filter)
         hub.driversChanged.connect(self._apply_filter)
+        # brújula de viento (abajo a la izquierda; solo si el feed trae
+        # dirección del viento)
+        self.wind_badge = WindBadge(self)
 
     def _apply_filter(self) -> None:
         """Dibuja todos los autos de la sesión menos los ocultados acá."""
@@ -97,6 +176,10 @@ class TrackMapView(pg.PlotWidget):
             return
         btn.move(self.width() - btn.width() - 8, 6)
         btn.raise_()
+        badge = getattr(self, "wind_badge", None)
+        if badge is not None:
+            badge.move(8, self.height() - badge.height() - 8)
+            badge.raise_()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -188,6 +271,7 @@ class TrackMapView(pg.PlotWidget):
         self._dist_map = None
         self._dist_map_len = -1
         self.probe_marker.setVisible(False)
+        self.wind_badge.set_wind(float("nan"), float("nan"))
         self.yellow_curve.setData([], [])
         self._yellow_sig = None
         self.outline_curve.setData([], [])
@@ -222,6 +306,11 @@ class TrackMapView(pg.PlotWidget):
 
     def refresh(self) -> None:
         self._update_yellow_sectors()
+        wx = self.hub.weather_at(self.hub.latest_t)
+        if wx is not None and len(wx) > 7:
+            self.wind_badge.set_wind(float(wx[7]), float(wx[3]))
+        else:
+            self.wind_badge.set_wind(float("nan"), float("nan"))
         outline = self.hub.outline
         if outline is not None and len(outline[0]) != self._outline_len:
             self._outline_len = len(outline[0])

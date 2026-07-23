@@ -128,7 +128,15 @@ class DataHub(QObject):
         self.tyres: dict[str, dict[int, tuple[str, int]]] = {}
         self.pits: dict[str, list[tuple[int, float]]] = {}
         self.track_status: list[tuple[float, float, str]] = []
-        self.weather: list[tuple[float, float, float, float, bool]] = []
+        # filas de clima normalizadas a 8 campos:
+        # (t, aire, pista, viento m/s, lluvia, humedad %, presión mbar,
+        #  dirección del viento en ° desde el norte; NaN si la fuente no lo trae)
+        self.weather: list[tuple] = []
+        # enriquecimiento OpenF1 (histórico, ver openf1.py):
+        # grilla oficial de largada, paradas oficiales y fotos de pilotos
+        self.grid: dict[str, int] = {}
+        self.official_pits: dict[str, dict[int, tuple[float, float]]] = {}
+        self.headshots: dict[str, str] = {}
         self.sector_yellows: list[tuple[float, float, float, float]] = []
         # visitas a la calle de boxes: {driver: [[vuelta, t_in, t_out|None]]}
         self.pit_lane: dict[str, list[list]] = {}
@@ -163,6 +171,7 @@ class DataHub(QObject):
         self.retired: set[str] = set()
         self.last_move_t: dict[str, float] = {}
         self._stew_cache: tuple | None = None
+        self._quali_cache: tuple | None = None
         # estado de los microsectores oficiales: {driver: {(sector, µ): estado}}
         self.segments: dict[str, dict[tuple[int, int], int]] = {}
         self.segment_counts: dict[int, int] = {}
@@ -219,8 +228,48 @@ class DataHub(QObject):
     def on_track_status(self, periods) -> None:
         self.track_status = list(periods)
 
+    WX_FIELDS = 8
+
     def on_weather(self, rows) -> None:
-        self.weather = sorted(rows)
+        # normalizar a 8 campos: fuentes/grabaciones viejas emiten 5
+        nan = float("nan")
+        self.weather = sorted(
+            tuple(row) + (nan,) * (self.WX_FIELDS - len(row))
+            for row in rows)
+
+    def on_grid(self, mapping) -> None:
+        """Grilla oficial de largada (OpenF1): {nº: posición}."""
+        if isinstance(mapping, dict) and mapping:
+            self.grid = {str(k): int(v) for k, v in mapping.items()}
+
+    def on_official_pits(self, data) -> None:
+        """Paradas oficiales (OpenF1): {nº: {vuelta: (lane_s, stop_s)}}."""
+        if isinstance(data, dict) and data:
+            self.official_pits = {
+                str(drv): dict(laps) for drv, laps in data.items()}
+
+    def on_headshots(self, paths) -> None:
+        """Fotos de pilotos (OpenF1/CDN): {nº: ruta local}. Dispara
+        driversChanged para que los tooltips se rearmen con la foto."""
+        if isinstance(paths, dict) and paths:
+            self.headshots.update({str(k): str(v) for k, v in paths.items()})
+            self.driversChanged.emit()
+
+    def official_stop(self, drv: str, lap: int) -> tuple[float, float] | None:
+        """(s en la calle, s detenido) oficiales de la parada de esa vuelta.
+        Sin spoilers por construcción: los llamadores consultan vueltas de
+        paradas que el timeline ya mostró."""
+        laps = self.official_pits.get(drv)
+        if not laps:
+            return None
+        # la vuelta oficial puede diferir en ±1 de la del feed (atribución
+        # entrada/salida): tomar la más cercana dentro de ese margen
+        best = None
+        for pit_lap, vals in laps.items():
+            d = abs(pit_lap - lap)
+            if d <= 1 and (best is None or d < best[0]):
+                best = (d, vals)
+        return best[1] if best else None
 
     def on_sector_yellows(self, periods) -> None:
         self.sector_yellows = list(periods)
@@ -233,6 +282,42 @@ class DataHub(QObject):
     PIT_AHEAD_S = 3.0
 
     _CAR_RE = re.compile(r"CARS? (\d+)|\b(\d+) \([A-Z]{3}\)")
+
+    def is_quali(self) -> bool:
+        """Clasificación (Qualifying / Sprint Qualifying / Shootout): la
+        torre agrupa por tandas Q1-Q3 con eliminaciones."""
+        name = str(self.session_meta.get("name", "")).lower()
+        typ = str(self.session_meta.get("type", "")).lower()
+        return "quali" in typ or "quali" in name or "shootout" in name
+
+    def quali_phase_bounds(self) -> list[float]:
+        """Inicios de Q2/Q3 ya cruzados por el timeline. La frontera entre
+        tandas es la PRIMERA luz verde posterior a cada bandera a cuadros:
+        las vueltas lanzadas antes de la cuadros cierran después de ella y
+        deben contar para la tanda que termina. Solo usa mensajes hasta
+        latest_t (sin spoilers: un seek atrás re-arma la tanda vieja)."""
+        sig = (len(self.race_control), round(self.latest_t, 1))
+        if self._quali_cache is not None and self._quali_cache[0] == sig:
+            return self._quali_cache[1]
+        cheqs: list[float] = []
+        greens: list[float] = []
+        for msg in self.race_control:
+            t = float(msg.get("t", 0.0))
+            if t > self.latest_t:
+                continue
+            text = str(msg.get("message", "")).upper()
+            if "CHEQUERED" in text:
+                cheqs.append(t)
+            elif "GREEN LIGHT" in text:
+                greens.append(t)
+        bounds: list[float] = []
+        for cheq in cheqs[:2]:  # solo separan Q1→Q2 y Q2→Q3
+            nxt = next((g for g in greens if g > cheq), None)
+            bound = nxt if nxt is not None else cheq + 240.0
+            if bound <= self.latest_t:
+                bounds.append(bound)
+        self._quali_cache = (sig, bounds)
+        return bounds
 
     def stewards_flags(self) -> dict[str, str]:
         """Chip de comisarios por auto según dirección de carrera HASTA el
@@ -575,6 +660,9 @@ class DataHub(QObject):
         self.pits = {}
         self.track_status = []
         self.weather = []
+        self.grid = {}
+        self.official_pits = {}
+        self.headshots = {}
         self.sector_yellows = []
         self.pit_lane = {}
         self.race_control = []
@@ -592,6 +680,7 @@ class DataHub(QObject):
         self.retired = set()
         self.last_move_t.clear()
         self._stew_cache = None
+        self._quali_cache = None
         self.segments.clear()
         self.segment_counts.clear()
         self.latest_t = 0.0

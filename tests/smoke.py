@@ -18,6 +18,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("F1TELEM_NO_UPDATE_CHECK", "1")  # sin red hacia GitHub
 os.environ.setdefault("F1TELEM_DEV_SOURCES", "1")      # fuente demo en el combo
 os.environ.setdefault("F1TELEM_NO_SCHEDULE", "1")      # sin calendario (red lenta)
+os.environ.setdefault("F1TELEM_NO_OPENF1", "1")        # sin red hacia OpenF1
 # sandbox: el smoke NUNCA debe leer ni escribir la config/los datos reales
 import tempfile  # noqa: E402
 
@@ -411,6 +412,582 @@ def test_delta_wave() -> None:
           "delta: gradiente y saturación de color JRT")
 
 
+def test_openf1() -> None:
+    """Cliente OpenF1: partes puras (sin red) — matching de sesión,
+    parsers y limitador de requests."""
+    from f1telem import openf1
+
+    # limitador: nunca más de 30 requests por minuto, con reloj simulado
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    def _sleep(s: float) -> None:
+        sleeps.append(s)
+        clock[0] += s
+
+    rl = openf1.RateLimiter(now=lambda: clock[0], sleep=_sleep)
+    stamps = []
+    for _ in range(60):  # cliente ansioso: pide sin pausa propia
+        rl.wait()
+        stamps.append(clock[0])
+        clock[0] += 0.05
+    worst = max(sum(1 for t in stamps if t0 <= t < t0 + 60.0) for t0 in stamps)
+    check(worst <= 30, f"openf1: máximo {worst} requests en 60 s (≤ 30)")
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    check(min(gaps) >= openf1.MIN_INTERVAL_S - 1e-9,
+          f"openf1: separación mínima entre requests ({min(gaps):.2f}s)")
+
+    meetings = [
+        {"meeting_key": 1, "meeting_name": "Bahrain Grand Prix",
+         "meeting_official_name": "Formula 1 Gulf Air Bahrain Grand Prix",
+         "circuit_short_name": "Sakhir", "location": "Sakhir",
+         "country_name": "Bahrain"},
+        {"meeting_key": 2, "meeting_name": "Miami Grand Prix",
+         "meeting_official_name": "Formula 1 Crypto.com Miami Grand Prix",
+         "circuit_short_name": "Miami", "location": "Miami",
+         "country_name": "United States"},
+    ]
+    hit = openf1.match_meeting(meetings, "Miami Grand Prix")
+    check(hit is not None and hit["meeting_key"] == 2,
+          "openf1: meeting por nombre exacto")
+    hit = openf1.match_meeting(meetings, "GP de Miami")
+    check(hit is not None and hit["meeting_key"] == 2,
+          "openf1: meeting por coincidencia de palabras")
+    check(openf1.match_meeting(meetings, "Demo Grand Prix") is None,
+          "openf1: sin coincidencia real no elige nada")
+
+    sessions = [
+        {"session_key": 10, "session_name": "Practice 1",
+         "session_type": "Practice"},
+        {"session_key": 11, "session_name": "Qualifying",
+         "session_type": "Qualifying"},
+        {"session_key": 12, "session_name": "Race", "session_type": "Race"},
+    ]
+    hit = openf1.pick_session(sessions, "Race", "Race")
+    check(hit is not None and hit["session_key"] == 12,
+          "openf1: tanda por nombre")
+    hit = openf1.pick_session(sessions, "", "Qualifying")
+    check(hit is not None and hit["session_key"] == 11,
+          "openf1: tanda por tipo si el nombre no aparece")
+    check(openf1.pick_session(sessions, "Sprint", "") is None,
+          "openf1: tanda inexistente devuelve None")
+
+    grid = openf1.parse_grid([
+        {"position": 1, "driver_number": 1},
+        {"position": 2, "driver_number": 44},
+        {"position": None, "driver_number": 16},  # sin dato: fuera
+    ])
+    check(grid == {"1": 1, "44": 2}, f"openf1: parse_grid ({grid})")
+
+    # finde con sprint: el endpoint trae DOS grillas por meeting, cada una
+    # con la key de la clasificación que la definió
+    sprint_sessions = [
+        {"session_key": 20, "session_name": "Sprint Qualifying"},
+        {"session_key": 21, "session_name": "Sprint"},
+        {"session_key": 22, "session_name": "Qualifying"},
+        {"session_key": 23, "session_name": "Race"},
+    ]
+    grid_rows = [
+        {"session_key": 20, "position": 1, "driver_number": 44},
+        {"session_key": 22, "position": 1, "driver_number": 1},
+    ]
+    race_rows = openf1.pick_grid_rows(grid_rows, sprint_sessions, "Race")
+    check(openf1.parse_grid(race_rows) == {"1": 1},
+          "openf1: grilla de carrera desde la Qualifying")
+    spr_rows = openf1.pick_grid_rows(grid_rows, sprint_sessions, "Sprint")
+    check(openf1.parse_grid(spr_rows) == {"44": 1},
+          "openf1: grilla de sprint desde la Sprint Qualifying")
+    solo = openf1.pick_grid_rows(
+        [{"session_key": 9, "position": 1, "driver_number": 4}], [], "Race")
+    check(openf1.parse_grid(solo) == {"4": 1},
+          "openf1: con un único grupo de grilla se usa ese")
+
+    pits = openf1.parse_pits([
+        {"driver_number": 1, "lap_number": 14, "lane_duration": 21.7,
+         "stop_duration": 2.3},
+        {"driver_number": 1, "lap_number": 33, "lane_duration": 22.0,
+         "stop_duration": None},          # pre-2024: sin dato oficial
+        {"driver_number": 44, "lap_number": 15, "pit_duration": 23.1},
+        {"driver_number": 16},            # fila rota: fuera
+    ])
+    check(pits["1"][14] == (21.7, 2.3), "openf1: parse_pits completo")
+    check(pits["1"][33][1] != pits["1"][33][1],
+          "openf1: stop_duration ausente queda NaN")
+    check(pits["44"][15][0] == 23.1,
+          "openf1: lane cae al pit_duration deprecado")
+    check("16" not in pits, "openf1: fila sin vuelta descartada")
+
+    shots = openf1.parse_headshots([
+        {"driver_number": 1, "headshot_url": "https://x/ver.png"},
+        {"driver_number": 44, "headshot_url": None},
+    ])
+    check(shots == {"1": "https://x/ver.png"},
+          f"openf1: parse_headshots ({shots})")
+
+    # normalización de clima en el hub: filas viejas de 5 campos -> 8
+    from f1telem.hub import DataHub as _DH
+    hub = _DH()
+    hub.on_weather([(0.0, 25.0, 40.0, 3.0, False)])
+    row = hub.weather[0]
+    check(len(row) == 8 and all(v != v for v in row[5:]),
+          "hub: clima de 5 campos rellenado con NaN")
+
+
+def test_analysis_engine() -> None:
+    """Motor de análisis con una pista 'estadio' sintética: 2 rectas de
+    800 m y 2 curvas semicirculares de radio 100 m, con física analítica
+    (G lateral = v²/R, clipping y lift & coast fabricados a propósito)."""
+    import numpy as np
+
+    from f1telem.analysis import AnalysisEngine
+    from f1telem.hub import DataHub as _DH
+    from f1telem.models import Sample as _S
+
+    R, S = 100.0, 800.0
+    arc = math.pi * R
+    L = 2 * S + 2 * arc  # ≈ 2228.32 m
+    # trazado: recta A (y=0) -> curva 1 -> recta B (y=200, invertida) -> curva 2
+    d_pts = np.arange(0.0, L, 5.0)
+    xs, ys = [], []
+    for d in d_pts:
+        if d < S:
+            xs.append(d); ys.append(0.0)
+        elif d < S + arc:
+            a = (d - S) / R
+            xs.append(S + R * math.sin(a)); ys.append(R - R * math.cos(a))
+        elif d < 2 * S + arc:
+            xs.append(S - (d - S - arc)); ys.append(2 * R)
+        else:
+            a = (d - 2 * S - arc) / R
+            xs.append(-R * math.sin(a)); ys.append(R + R * math.cos(a))
+    hub_an = _DH()
+    hub_an.on_track_length(L)
+    hub_an.on_outline((np.array(xs), np.array(ys)))
+    hub_an.on_corners([("T1", S + arc / 2, 0.0, 0.0),
+                       ("T2", 2 * S + 1.5 * arc, 0.0, 0.0)])
+
+    c1, c2 = S, 2 * S + arc  # inicio de cada curva
+    zones_d = [(0.0, S), (c1, c1 + arc), (c1 + arc, c2), (c2, L)]
+
+    def gen_lap(lap_no, t, v, cv, clip=False, lift=False):
+        out = []
+        pos = (lap_no - 1) * L
+        end = lap_no * L
+        while pos < end:
+            d = pos - (lap_no - 1) * L
+            in_c1 = zones_d[1][0] <= d < zones_d[1][1]
+            in_c2 = d >= zones_d[3][0]
+            throttle, brake, a = 100.0, 0.0, 6.0
+            if in_c1 or in_c2:
+                v = cv
+                throttle, a = 30.0, 0.0
+            else:
+                nxt = c1 if d < c1 else c2
+                gap = nxt - d
+                brake_d = max(0.0, (v * v - cv * cv) / (2.0 * 25.0))
+                if gap <= brake_d + 5.0:
+                    throttle, brake, a = 0.0, 100.0, -25.0
+                elif lift and d > zones_d[2][0] and gap <= brake_d + 155.0:
+                    throttle, a = 0.0, -1.5  # lift & coast
+                elif clip and d < S and v >= 70.0:
+                    a = 0.0  # derate: a fondo sin acelerar
+            out.append(_S("1", t, lap_no, d, pos, v * 3.6, throttle,
+                          brake, 10500.0, 5, 0))
+            v = max(cv, v + a * 0.1)
+            pos += v * 0.1
+            t += 0.1
+        return out, t, v
+
+    t, v = 0.0, 43.0
+    for lap_no, cv, clip, lift in ((1, 43.0, False, False),
+                                   (2, 41.5, True, True),
+                                   (3, 40.0, False, False),
+                                   (4, 40.0, False, False)):
+        batch, t, v = gen_lap(lap_no, t, v, cv, clip, lift)
+        hub_an.on_batch(batch)
+
+    eng = AnalysisEngine(hub_an)
+    zs = eng.zones()
+    n_corner = sum(1 for z in zs if z.kind == "corner")
+    n_str = sum(1 for z in zs if z.kind == "straight")
+    check(n_corner == 2 and n_str == 2,
+          f"analysis: 2 curvas y 2 rectas detectadas ({n_corner}/{n_str})")
+    check({z.label for z in zs if z.kind == "corner"} == {"T1", "T2"},
+          "analysis: curvas etiquetadas con los vértices oficiales")
+    check(any("main" in z.label for z in zs if z.kind == "straight"),
+          "analysis: la recta principal marcada")
+
+    chan = eng.channels("1")
+    check(chan is not None and float(chan["a_lon"].min()) < -1.8,
+          f"analysis: G de frenada ({chan['a_lon'].min():.2f})")
+    check(0.4 < float(chan["a_lon"].max()) < 0.9,
+          f"analysis: G de tracción ({chan['a_lon'].max():.2f})")
+
+    m2 = eng.lap_metrics("1", 2)   # con clipping y lift
+    m3 = eng.lap_metrics("1", 3)   # limpia
+    # precisión: el plateau fabricado va de ~275 m (llega a 70 m/s) hasta
+    # la frenada (~730 m); con guardas de transición, esperar 350-520 m
+    check(m2 is not None and 350.0 <= m2.derate_total <= 520.0,
+          f"analysis: clipping preciso ({m2.derate_total:.0f} m, real ~450)")
+    check(m3.derate_total < 40.0,
+          f"analysis: vuelta limpia sin derate ({m3.derate_total:.0f} m)")
+    # precisión: el lift fabricado es de 150 m antes del punto de frenada
+    check(120.0 <= m2.coast_total <= 200.0,
+          f"analysis: lift & coast preciso ({m2.coast_total:.0f} m, real ~150)")
+    check(m3.coast_total < 30.0,
+          f"analysis: sin lift no hay coast ({m3.coast_total:.0f} m)")
+    check(abs(m2.deploy_m + m2.derate_total - m2.wot_straight_m) < 60.0,
+          "analysis: deploy + derate ≈ metros a fondo en recta")
+    zi_da = next(iter(m2.derate_m))
+    span_d = m2.derate_end[zi_da] - m2.derate_start[zi_da]
+    check(abs(span_d - m2.derate_m[zi_da]) < 40.0,
+          f"analysis: extensión medida del derate en el mapa "
+          f"({span_d:.0f} vs {m2.derate_m[zi_da]:.0f} m)")
+    corner_zi = [i for i, z in enumerate(zs) if z.kind == "corner"]
+    vmin, alat = m3.corners[corner_zi[0]]
+    expect = 40.0 * 40.0 / R / 9.81  # 1.63 g
+    check(abs(vmin - 40.0) < 2.5,
+          f"analysis: V min de curva ({vmin:.1f} m/s)")
+    check(abs(alat - expect) < 0.4,
+          f"analysis: G lateral = v²/R ({alat:.2f} vs {expect:.2f})")
+    # degradación: la velocidad de curva cae 43 -> 40 entre vueltas
+    m1 = eng.lap_metrics("1", 1)
+    check(m1.corners[corner_zi[0]][1] > m3.corners[corner_zi[0]][1],
+          "analysis: la G lateral cae con la degradación fabricada")
+    # el coast quedó atribuido a la curva 2 (venía por la recta B)
+    check(corner_zi[1] in m2.coast_m and m2.coast_m[corner_zi[1]] > 80.0,
+          "analysis: coast atribuido a la curva siguiente")
+    check(m2.coast_n.get(corner_zi[1], 0) == 1,
+          "analysis: un solo evento de coast en esa curva")
+
+    # envolvente convexa del círculo de fricción
+    from f1telem.analysis import convex_hull
+    hx, hy = convex_hull(np.array([0.0, 2.0, 2.0, 0.0, 1.0]),
+                         np.array([0.0, 0.0, 2.0, 2.0, 1.0]))
+    check(len(hx) == 5 and (hx[0], hy[0]) == (hx[-1], hy[-1]),
+          f"analysis: envolvente = cuadrado cerrado ({len(hx)} vértices)")
+    check(1.0 not in hx[:-1] or (1.0, 1.0) not in list(zip(hx, hy)),
+          "analysis: el punto interior queda fuera de la envolvente")
+
+    # máscara multi-zona: solo las dos curvas
+    mask = eng.zone_mask(np.array([100.0, S + 50.0, S + arc + 100.0,
+                                   2 * S + arc + 50.0]),
+                         ("multi", frozenset(corner_zi)))
+    check(list(mask) == [False, True, False, True],
+          "analysis: máscara multi-zona (solo curvas elegidas)")
+
+    # unidades crudas del feed: Position.z viene en décimas de metro. El
+    # mismo circuito en dm debe dar las mismas zonas y la misma G lateral
+    # (bug real: solo aparecían las horquillas y la G quedaba /10). Además
+    # una curva oficial suave en plena recta debe ganar su propia zona.
+    hub_dm = _DH()
+    hub_dm.on_track_length(L)
+    hub_dm.on_outline((np.array(xs) * 10.0, np.array(ys) * 10.0))
+    hub_dm.on_corners([("T1", S + arc / 2, 0.0, 0.0),
+                       ("T2", 2 * S + 1.5 * arc, 0.0, 0.0),
+                       ("T9", 400.0, 0.0, 0.0)])  # kink suave en la recta A
+    t2, v2 = 0.0, 43.0
+    for lap_no, cv, clip, lift in ((1, 43.0, False, False),
+                                   (2, 41.5, True, True),
+                                   (3, 40.0, False, False),
+                                   (4, 40.0, False, False)):
+        batch, t2, v2 = gen_lap(lap_no, t2, v2, cv, clip, lift)
+        hub_dm.on_batch(batch)
+    eng_dm = AnalysisEngine(hub_dm)
+    zs_dm = eng_dm.zones()
+    n_c = sum(1 for z in zs_dm if z.kind == "corner")
+    n_s = sum(1 for z in zs_dm if z.kind == "straight")
+    check(n_c == 3 and n_s == 3,
+          f"analysis: trazado en dm -> mismas zonas + kink oficial "
+          f"({n_c}/{n_s})")
+    check({z.label for z in zs_dm if z.kind == "corner"}
+          == {"T1", "T2", "T9"},
+          "analysis: zona carvada para la curva oficial suave")
+    m3dm = eng_dm.lap_metrics("1", 3)
+    zi_t1 = next(i for i, z in enumerate(zs_dm) if z.label == "T1")
+    check(zi_t1 in m3dm.corners
+          and abs(m3dm.corners[zi_t1][1] - expect) < 0.4,
+          f"analysis: G lateral correcta con trazado en dm "
+          f"({m3dm.corners[zi_t1][1]:.2f} vs {expect:.2f})")
+
+    # líneas de tendencia (panel Acceleration)
+    from f1telem.analysis import fit_trend
+    xs_f = np.linspace(50.0, 300.0, 60)
+    fit = fit_trend(xs_f, 2.0 * xs_f + 1.0, "linear")
+    check(fit is not None and abs(fit[1][0] - (2.0 * fit[0][0] + 1.0)) < 1e-6
+          and abs(fit[1][-1] - (2.0 * fit[0][-1] + 1.0)) < 1e-6,
+          "analysis: tendencia lineal exacta")
+    fit = fit_trend(xs_f, -3.0 * np.exp(-0.01 * xs_f), "exponential")
+    check(fit is not None and fit[1][0] < 0
+          and abs(fit[1][-1] - (-3.0 * math.exp(-0.01 * fit[0][-1]))) < 0.05,
+          "analysis: tendencia exponencial con signo negativo")
+    check(fit_trend(xs_f[:4], xs_f[:4], "linear") is None,
+          "analysis: tendencia rechaza pocos puntos")
+
+
+def test_preprocessing() -> None:
+    """Preproceso de datos: despike, cruces por Hermite (exactos bajo
+    aceleración constante) y perfiles de curva entrenados por ensamble."""
+    import numpy as np
+
+    from f1telem.analysis import AnalysisEngine
+    from f1telem.hub import DataHub as _DH
+    from f1telem.models import Sample as _S
+    from f1telem.timing import TimingAnalyzer as _TA
+
+    # despike: un pico imposible se reemplaza por la mediana vecina
+    out = _TA._despike(np.array([200.0, 201.0, 400.0, 202.0, 203.0]))
+    check(out[2] == 202.0 and out[1] == 201.0,
+          f"preproc: pico imposible corregido ({out[2]:.0f})")
+
+    # Hermite: frenada constante muestreada CADA 3 s; el cruce del fin de
+    # S1 (d=1000) tiene solución analítica t=12.98s — lineal erraría ~35ms
+    hub_h = _DH()
+    hub_h.on_track_length(3000.0)
+    hub_h.sector_bounds = (1000.0, 2000.0)
+    hub_h._bounds_done = True
+    v0 = 90.0              # d(t) = 90t − t², v(t) = 90 − 2t hasta t=20
+    samples = []
+    for k in range(0, 8):  # t = 0..21, muestras cada 3 s
+        t = k * 3.0
+        if t <= 20.0:
+            d = v0 * t - t * t
+            v = v0 - 2.0 * t
+        else:
+            d = 1400.0 + 50.0 * (t - 20.0)
+            v = 50.0
+        samples.append(_S("1", t, 1, d, d, v * 3.6, 100.0, 0.0, 0.0, 7, 0))
+    for k in range(3):  # vuelta siguiente: ancla el cierre
+        t = 53.0 + k
+        samples.append(_S("1", t, 2, 50.0 * k, 3000.0 + 50.0 * k,
+                          180.0, 100.0, 0.0, 0.0, 7, 0))
+    # completar la vuelta 1 hasta la meta (v constante 50)
+    extra = []
+    for k in range(8, 18):
+        t = k * 3.0
+        d = 1400.0 + 50.0 * (t - 20.0)
+        if d < 2999.0:
+            extra.append(_S("1", t, 1, d, d, 180.0, 100.0, 0.0, 0.0, 7, 0))
+    samples = [s for s in samples if s.lap == 1] + extra \
+        + [s for s in samples if s.lap == 2]
+    samples.sort(key=lambda s: s.t)
+    hub_h.on_batch(samples)
+    an_h = _TA(hub_h)
+    marks = an_h.lap_marks("1", 1)
+    i1 = an_h._sector_idx[0]
+    t_analytic = (90.0 - math.sqrt(90.0 ** 2 - 4.0 * 1000.0)) / 2.0
+    err = abs(float(marks[i1]) - t_analytic)
+    check(err < 0.005,
+          f"preproc: cruce Hermite exacto en frenada ({err * 1000:.1f} ms)")
+
+    # perfiles de curva: 25 vueltas con fases de muestreo distintas; la
+    # Vmin real (40 m/s) se reconstruye aunque ningún tick pise el apex
+    R, S = 100.0, 800.0
+    arc = math.pi * R
+    L = 2 * S + 2 * arc
+    d_pts = np.arange(0.0, L, 5.0)
+    xs_p, ys_p = [], []
+    for d in d_pts:
+        if d < S:
+            xs_p.append(d); ys_p.append(0.0)
+        elif d < S + arc:
+            a = (d - S) / R
+            xs_p.append(S + R * math.sin(a)); ys_p.append(R - R * math.cos(a))
+        elif d < 2 * S + arc:
+            xs_p.append(S - (d - S - arc)); ys_p.append(2 * R)
+        else:
+            a = (d - 2 * S - arc) / R
+            xs_p.append(-R * math.sin(a)); ys_p.append(R + R * math.cos(a))
+    hub_p = _DH()
+    hub_p.on_track_length(L)
+    hub_p.on_outline((np.array(xs_p), np.array(ys_p)))
+    hub_p.on_corners([("T1", S + arc / 2, 0.0, 0.0),
+                      ("T2", 2 * S + 1.5 * arc, 0.0, 0.0)])
+    hub_p.on_session_meta({"meeting": "Profile GP", "year": 2098,
+                           "type": "Race", "name": "Race"})
+    apex1 = S + arc / 2.0
+
+    def v_true(d):
+        # valle triangular: 40 m/s en el apex, +0.5 m/s por metro
+        return min(65.0, 40.0 + 0.5 * abs(d - apex1)) \
+            if S <= d <= S + arc else 65.0
+
+    t_cur = 0.0
+    batches = []
+    for lap in range(1, 27):
+        d = (lap * 7.3) % 17.0   # fase de muestreo distinta por vuelta
+        while d < L:
+            v = v_true(d)
+            batches.append(_S("1", t_cur, lap, d, (lap - 1) * L + d,
+                              v * 3.6, 80.0, 0.0, 0.0, 6, 0))
+            t_cur += 17.0 / v
+            d += 17.0
+    hub_p.on_batch(batches)
+    eng_p = AnalysisEngine(hub_p)
+    eng_p.profiles.min_passes = 20
+    zs_p = eng_p.zones()
+    zi1 = next(i for i, z in enumerate(zs_p) if z.label == "T1")
+    laps_done = eng_p.completed_laps("1")
+    raw_vmin = {}
+    for lap in laps_done:
+        m = eng_p.lap_metrics("1", lap)   # entrena y guarda el crudo
+        if m is not None and zi1 in m.corners:
+            raw_vmin[lap] = m.corners[zi1][0]
+    check(eng_p.profiles.ready(zi1),
+          f"preproc: modelo entrenado ({eng_p.profiles.zones[zi1]['passes']}"
+          " pasadas)")
+    lap_bad, worst = max(raw_vmin.items(), key=lambda kv: kv[1])
+    check(worst > 41.5,
+          f"preproc: el submuestreo sobreestima la Vmin ({worst:.1f})")
+    eng_p.set_refine(True)
+    eng_p.zones()  # aplica la versión del modelo
+    m_ref = eng_p.lap_metrics("1", lap_bad)
+    v_ref = m_ref.corners[zi1][0]
+    check(v_ref < worst - 0.8 and 39.0 <= v_ref <= 41.5,
+          f"preproc: Vmin reconstruida ({worst:.1f} → {v_ref:.1f})")
+    # pasada atípica (distorsión asimétrica): el modelo NO la corrige
+    prof = eng_p.profiles.profile(zi1)
+    centers, mean = prof
+    weird = mean * np.where(centers < apex1, 1.3, 0.7)
+    check(eng_p.profiles.refine_vmin(zi1, centers, weird) is None,
+          "preproc: pasada atípica conserva el dato crudo")
+    # persistencia: guardar y adoptar en un motor nuevo
+    eng_p.save_profiles()
+    eng_p2 = AnalysisEngine(hub_p)
+    eng_p2.profiles.min_passes = 20
+    eng_p2.zones()
+    check(eng_p2.profiles.ready(zi1),
+          "preproc: entrenamiento persistido y adoptado")
+
+
+def test_quali_tower() -> None:
+    """Torre en clasificación: tandas Q1-Q3 detectadas por banderas, best
+    por tanda (con reset), bloques de eliminados inviolables, drop zone y
+    línea de corte. 8 autos, corta 2 por tanda."""
+    from f1telem.hub import DataHub as _DH
+    from f1telem.models import Sample as _S
+    from f1telem.ui.tower import TimingTower as _TT, quali_drops
+
+    # formato por tamaño de grilla: Q3 SIEMPRE con 10 autos
+    check(quali_drops(22) == (6, 6), "quali: formato 2026 (22 → 6+6)")
+    check(quali_drops(20) == (5, 5), "quali: formato clásico (20 → 5+5)")
+    check(quali_drops(21) == (5, 6), "quali: grilla impar reparte (5+6)")
+    check(quali_drops(8) == (2, 2), "quali: grilla chica proporcional")
+
+    hub_q = _DH()
+    hub_q.on_track_length(1000.0)
+    hub_q.on_session_meta({"type": "Qualifying", "name": "Qualifying",
+                           "meeting": "Testland GP", "year": 2099})
+    # historia completa por adelantado (replay): el hub filtra por timeline
+    hub_q.on_race_control([
+        {"t": 5.0, "message": "GREEN LIGHT - PIT EXIT OPEN"},
+        {"t": 290.0, "message": "CHEQUERED FLAG"},
+        {"t": 360.0, "message": "GREEN LIGHT - PIT EXIT OPEN"},
+        {"t": 690.0, "message": "CHEQUERED FLAG"},
+        {"t": 760.0, "message": "GREEN LIGHT - PIT EXIT OPEN"},
+    ])
+    state: dict = {}
+
+    def run_laps(drv, start_t, lap_times):
+        st = state.setdefault(drv, {"t": start_t, "lap": 1})
+        st["t"] = max(st["t"], start_t)
+        samples = []
+        for T in lap_times:
+            for k in range(20):
+                frac = k / 20.0
+                samples.append(_S(drv, st["t"] + T * frac, st["lap"],
+                                  1000.0 * frac,
+                                  (st["lap"] - 1) * 1000.0 + 1000.0 * frac,
+                                  1000.0 / T * 3.6, 50.0, 0.0, 0.0, 5, 0))
+            st["t"] += T
+            st["lap"] += 1
+        # vuelta lanzada y nunca cerrada: las previas cuentan como cerradas
+        for k in range(3):
+            samples.append(_S(drv, st["t"] + k * 0.7, st["lap"],
+                              4.0 * k, (st["lap"] - 1) * 1000.0 + 4.0 * k,
+                              20.0, 10.0, 0.0, 0.0, 2, 0))
+        st["t"] += 2.5
+        st["lap"] += 1
+        hub_q.on_batch(samples)
+
+    # Q1: bests 101..106 para "1".."6"; "7"=118 y "8"=119 quedan afuera
+    for i in range(1, 7):
+        run_laps(str(i), 10.0 + i, [110.0, 100.0 + i])
+    run_laps("7", 16.0, [120.0, 118.0])
+    run_laps("8", 17.0, [121.0, 119.0])
+    tw = _TT(hub_q)
+    tw.refresh()
+    order1 = [r.drv for r in tw.rows]
+    check(order1 == ["1", "2", "3", "4", "5", "6", "7", "8"],
+          f"quali: Q1 ordena por vuelta rápida de la tanda ({order1})")
+    check(tw.quali_cut_row == 6 and tw.rows[6].drop and tw.rows[7].drop,
+          "quali: drop zone con los 2 que hoy quedan afuera")
+    check(tw.rows[6].cut_txt.startswith("CUT +"),
+          f"quali: cuánto necesita para salvarse ({tw.rows[6].cut_txt})")
+    check("Q1" in tw.lap_label.text() and "top 6" in tw.lap_label.text(),
+          f"quali: header de tanda ({tw.lap_label.text()})")
+    check(abs(tw.rows[0].best - 101.0) < 0.5,
+          f"quali: best de Q1 ({tw.rows[0].best:.1f})")
+
+    # Q2: corren "1".."6"; "6" clava 130s — igual queda ARRIBA de los
+    # eliminados de Q1 aunque ellos tengan tiempos viejos más rápidos
+    for i in range(1, 6):
+        run_laps(str(i), 365.0 + i, [92.0 + i, 95.0 + i])
+    run_laps("6", 372.0, [130.0, 131.0])
+    tw.refresh()
+    order2 = [r.drv for r in tw.rows]
+    check(order2[:6] == ["1", "2", "3", "4", "5", "6"]
+          and order2[6:] == ["7", "8"],
+          f"quali: eliminado nunca supera a uno vivo ({order2})")
+    check(tw.rows[6].out_tag == "OUT Q1" and tw.rows[7].out_tag == "OUT Q1",
+          "quali: tags OUT Q1 en el bloque eliminado")
+    check(tw.quali_seps == [(6, "ELIMINATED Q1")],
+          f"quali: separador del bloque ({tw.quali_seps})")
+    check(abs(tw.rows[0].best - 93.0) < 0.5,
+          f"quali: el best se resetea en Q2 ({tw.rows[0].best:.1f})")
+    check(tw.quali_cut_row == 4 and tw.rows[4].drop and tw.rows[5].drop,
+          "quali: drop zone de Q2 (P5 y P6)")
+
+    # Q3: corren "1".."4"; clasificación final por bloques
+    for i in range(1, 5):
+        run_laps(str(i), 765.0 + i, [80.0 + i, 82.0 + i])
+    tw.refresh()
+    order3 = [r.drv for r in tw.rows]
+    check(order3 == ["1", "2", "3", "4", "5", "6", "7", "8"],
+          f"quali: clasificación final por bloques ({order3})")
+    check(tw.rows[4].out_tag == "OUT Q2" and tw.rows[6].out_tag == "OUT Q1",
+          "quali: tags OUT Q2 y OUT Q1")
+    check([s for s in tw.quali_seps]
+          == [(4, "ELIMINATED Q2"), (6, "ELIMINATED Q1")],
+          f"quali: dos separadores rotulados ({tw.quali_seps})")
+    check(tw.quali_cut_row is None, "quali: sin drop zone en Q3")
+    check(abs(tw.rows[0].best - 81.0) < 0.5
+          and abs(tw.rows[4].best - 97.0) < 0.5,
+          f"quali: bests por tanda (Q3 {tw.rows[0].best:.1f}, "
+          f"Q2 congelado {tw.rows[4].best:.1f})")
+    check(tw.rows[1].gap_txt.startswith("+1.0")
+          and tw.rows[4].gap_txt == "—",
+          f"quali: gaps por delta de tiempos ({tw.rows[1].gap_txt})")
+    check(tw.rows[0].pos == 1 and tw.rows[7].pos == 8,
+          "quali: numeración de clasificación")
+    # métrica elegida: ordena DENTRO de cada bloque (bloques inviolables)
+    tw.sort_combo.setCurrentIndex(tw.sort_combo.findData("s1"))
+    check(set(r.drv for r in tw.rows[:4]) == {"1", "2", "3", "4"}
+          and tw.rows[6].out_tag == "OUT Q1",
+          "quali: métrica respeta los bloques")
+    tw.sort_combo.setCurrentIndex(tw.sort_combo.findData("position"))
+    # seek atrás: el timeline al final de Q1 re-arma la tanda 1 (a t=260
+    # todas las vueltas de Q1 ya cerraron y la cuadros aún no cayó)
+    hub_q.latest_t = 260.0
+    tw.refresh()
+    check("Q1" in tw.lap_label.text()
+          and abs(tw.rows[0].best - 101.0) < 0.5,
+          f"quali: seek atrás vuelve a Q1 ({tw.lap_label.text()})")
+    # el pintado con separadores/drop no debe crashear
+    tw.canvas.resize(600, 400)
+    tw.canvas.grab()
+
+
 def test_app_demo(app: QApplication) -> None:
     win = MainWindow()
     # sin popups durante el smoke: el log del gestor alcanza para verificar
@@ -613,7 +1190,9 @@ def test_app_demo(app: QApplication) -> None:
     check(gx is not None and len(gx) > 50 and bool(np.isfinite(gy).all()),
           f"Gap: serie con datos finitos ({0 if gx is None else len(gx)})")
     check(abs(float(gy[-1])) < 120, f"Gap: magnitud razonable ({float(gy[-1]):+.2f} s)")
-    # las tablas se refrescan a 2 Hz: esperar a que el resumen se pueble
+    # las tablas se refrescan a 2 Hz sobre la pestaña ACTIVA (viven en el
+    # panel Data tables): activar Summary y esperar a que se pueble
+    win.data_table_view.tabs.setCurrentWidget(tv.summary_table)
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         if (tv.summary_table.rowCount() == len(sel)
@@ -911,19 +1490,49 @@ def test_app_demo(app: QApplication) -> None:
     t_item.setCheckState(Qt.Checked)
     check(len(win.tower.rows) == n_rows0, "torre: filtro 👥 restaurado")
 
+    # ordenamiento: selector de métrica + default según tipo de sesión
+    idx_best_t = win.tower.sort_combo.findData("best")
+    win.tower.sort_combo.setCurrentIndex(idx_best_t)
+    finite_b = [r.best for r in win.tower.rows
+                if r.best == r.best and math.isfinite(r.best)]
+    check(len(finite_b) >= 3 and finite_b == sorted(finite_b),
+          "torre: orden por Best lap ascendente")
+    idx_s1_t = win.tower.sort_combo.findData("s1")
+    win.tower.sort_combo.setCurrentIndex(idx_s1_t)
+    s1_vals = [win.tower._sort_value(r.drv, "s1") for r in win.tower.rows]
+    check(s1_vals == sorted(s1_vals), "torre: orden por mejor S1")
+    win.tower.sort_combo.setCurrentIndex(
+        win.tower.sort_combo.findData("position"))
+    check(win.tower.rows[0].gap_txt == "leader",
+          "torre: Position en carrera vuelve al orden de pista")
+    # en práctica/quali, Position = vuelta rápida por defecto
+    win.hub.session_meta["type"] = "Practice"
+    win.hub.session_meta["name"] = "Practice 1"
+    win.tower.refresh()
+    finite_p = [r.best for r in win.tower.rows
+                if r.best == r.best and math.isfinite(r.best)]
+    check(finite_p == sorted(finite_p),
+          "torre: práctica ordena por vuelta rápida por defecto")
+    win.hub.session_meta["type"] = "Race"
+    win.hub.session_meta["name"] = "Race"
+    win.tower.refresh()
+
     # ↺: los subpaneles internos ocultados con ✕ vuelven de fábrica
-    tg_win = win._panels["times_gap"]._win
-    tables = win._panels["times_tables"]
-    check(tg_win.reset_btn.isVisible(), "ventana con subpaneles muestra ↺")
-    tables._hide_docked()
-    check(not tables.is_panel_visible(), "subpanel oculto con ✕")
-    tg_win.reset_btn.click()
-    check(tables.is_panel_visible() and not tables.floating,
-          "↺ restaura el subpanel oculto")
-    tables.detach()
+    # (las tarjetas de Lap Compare - Live; las tablas ya son panel propio)
+    win._panels["quali_view"].set_panel_visible(True)
     pump(app, 0.2)
-    tg_win.reset_btn.click()
-    check(tables.is_panel_visible() and not tables.floating,
+    qv_win = win._panels["quali_view"]._win
+    cards = win._panels["quali_cards"]
+    check(qv_win.reset_btn.isVisible(), "ventana con subpaneles muestra ↺")
+    cards._hide_docked()
+    check(not cards.is_panel_visible(), "subpanel oculto con ✕")
+    qv_win.reset_btn.click()
+    check(cards.is_panel_visible() and not cards.floating,
+          "↺ restaura el subpanel oculto")
+    cards.detach()
+    pump(app, 0.2)
+    qv_win.reset_btn.click()
+    check(cards.is_panel_visible() and not cards.floating,
           "↺ re-acopla el subpanel flotado")
     # cada auto debe estar sobre la pista (cerca del trazado) y coherente con
     # su dist_lap (el mapa demo se genera desde la misma distancia de arco)
@@ -970,21 +1579,145 @@ def test_app_demo(app: QApplication) -> None:
           f"estado de ventana persistible ({st})")
     tower_panel._win.pin_btn.setChecked(False)
 
-    # subpanel interno: las tablas de Times/Gap flotadas aparte siguen
-    # refrescando aunque su ventana madre esté cerrada
-    tp = win.chart_timing.tables_panel
-    tp.detach()
+    # 📷: captura del panel al portapapeles (sin diálogo en el test)
+    pix = win._panels["tower"].capture_panel(ask_save=False)
+    check(not pix.isNull() and pix.width() > 10,
+          f"captura: imagen del panel ({pix.width()}x{pix.height()})")
+    clip = QApplication.clipboard().pixmap()
+    check(clip is not None and not clip.isNull(),
+          "captura: copiada al portapapeles")
+    check(win._panels["tower"]._win.shot_btn.isVisible()
+          or win._panels["tower"]._win.shot_btn is not None,
+          "captura: botón 📷 en la barra de la ventana")
+
+    # imán de ventanas: acercar un borde a otro lo pega sin hueco
+    from f1telem.ui import docks as _docks
+    mw_w = win._panels["map"]._win
+    tw_w = win._panels["tower"]._win
+    _docks.set_snap_enabled(True)
+    # zona despejada (lejos de la cascada de ventanas del test); el borde
+    # se mide DESPUÉS de posicionar mw (su propio imán pudo ajustarla)
+    mw_w.move(100, 900)
+    mw_w.resize(300, 300)
+    tw_w.resize(200, 260)
+    mg = mw_w.frameGeometry()
+    edge = mg.x() + mg.width()
+    tw_w.move(edge + 7, mg.y() + 20)   # a 7 px del borde: debe pegarse
+    check(tw_w.pos().x() == edge,
+          f"imán: borde pegado sin hueco (x={tw_w.pos().x()} vs {edge})")
+    _docks.set_snap_enabled(False)
+    tw_w.move(edge + 7, mg.y() + 20)
+    check(tw_w.pos().x() == edge + 7,
+          f"imán: apagado respeta la posición exacta (x={tw_w.pos().x()})")
+    _docks.set_snap_enabled(True)
+    # ajuste fino por teclado: flecha = 1 px, Ctrl+flecha = estirar 1 px
+    from PySide6.QtCore import QEvent as _QEvent
+    from PySide6.QtGui import QKeyEvent as _QKeyEvent
+    x0 = tw_w.pos().x()
+    tw_w.keyPressEvent(_QKeyEvent(_QEvent.KeyPress, Qt.Key_Right,
+                                  Qt.KeyboardModifier.NoModifier))
+    check(tw_w.pos().x() == x0 + 1, "teclado: flecha mueve 1 px")
+    w0 = tw_w.width()
+    tw_w.keyPressEvent(_QKeyEvent(_QEvent.KeyPress, Qt.Key_Right,
+                                  Qt.KeyboardModifier.ControlModifier))
+    check(tw_w.width() == w0 + 1, "teclado: Ctrl+flecha estira 1 px")
+    check(win.snap_check.isChecked(), "imán: toggle en Settings activo")
+
+    # timeline: botones de salto relativo −15m…−5s / +5s…+15m, agrupados
+    # ARRIBA de la barra (la barra ocupa todo el ancho)
+    check(len(win.seek_back_btns) == 6 and len(win.seek_fwd_btns) == 6,
+          "timeline: 6 saltos hacia atrás y 6 hacia adelante")
+    from PySide6.QtWidgets import QVBoxLayout as _QVBL
+    check(isinstance(win.seek_row.layout(), _QVBL)
+          and win.seek_row.layout().count() == 2,
+          "timeline: controles arriba, barra a todo el ancho abajo")
+    seeks: list[float] = []
+    orig_seek = win._seek_to_time
+    win._seek_to_time = seeks.append
+    win._progress = (0.0, 100.0, 1000.0)
+    win._seek_relative(30)
+    win._seek_relative(-900)   # clamp al inicio
+    win._seek_relative(900)
+    win._progress = None
+    win._seek_relative(5)      # sin progreso: no hace nada
+    win._seek_to_time = orig_seek
+    check(seeks == [130.0, 0.0, 1000.0],
+          f"timeline: saltos relativos con clamp ({seeks})")
+
+    # Data tables: las tablas de timing viven en su propio panel, con las
+    # pestañas clásicas adoptadas + "All data" (piloto × vuelta)
+    win._panels["data_table"].set_panel_visible(True)
     pump(app, 0.3)
-    check(tp.floating and win.chart_timing.tabs.isVisible(),
-          "tablas de Times/Gap flotantes")
+    dt = win.data_table_view
+    check(dt.tabs.count() == 7 and dt.tabs.tabText(0) == "All data",
+          f"data tables: pestañas adoptadas + All data ({dt.tabs.count()})")
+    dt.tabs.setCurrentWidget(win.chart_timing.summary_table)
     win._catalog_checks["times_gap"].setChecked(False)
     pump(app, 1.2)
     check(win.chart_timing.summary_table.rowCount() > 0,
-          "tablas flotantes se refrescan con su ventana madre cerrada")
-    tp.attach()
+          "data tables: Summary se refresca con Times/Gap cerrado")
     win._catalog_checks["times_gap"].setChecked(True)
+    dt.tabs.setCurrentIndex(0)
+    dt.refresh()
+    total_rows = sum(len(dt._laps_for(d)) for d in dt.drivers())
+    check(dt.table.rowCount() == total_rows and total_rows > 0
+          and dt.table.columnCount() == 11,
+          f"data tables: fila por piloto y vuelta ({dt.table.rowCount()})")
+    # coherencia de una fila: S1+S2+S3 = tiempo; AVG5 poblado
+    d0 = dt.drivers()[0]
+    l0 = dt._laps_for(d0)[-1]
+    secs = win.chart_timing.analyzer.sector_times(d0, l0)
+    lt0 = win.chart_timing.analyzer.lap_time(d0, l0)
+    check(abs(sum(secs) - lt0) < 0.05,
+          f"data tables: S1+S2+S3 = vuelta ({sum(secs):.3f} vs {lt0:.3f})")
+    check(dt.table.item(0, 8).text() != "—",
+          "data tables: AVG5 poblado en la primera fila")
+    # filtro de pilotos: destildar uno saca sus filas
+    d_hide = dt.drivers()[0]
+    n_hide = len(dt._laps_for(d_hide))
+    item_dt = next(dt.sel_btn.list.item(i)
+                   for i in range(dt.sel_btn.list.count())
+                   if dt.sel_btn.list.item(i).data(Qt.UserRole) == d_hide)
+    item_dt.setCheckState(Qt.Unchecked)
+    check(dt.table.rowCount() == total_rows - n_hide,
+          f"data tables: filtro de pilotos ({dt.table.rowCount()})")
+    item_dt.setCheckState(Qt.Checked)
+    # rango de vueltas: [3, 4] son 2 filas por piloto en All data y By lap
+    dt.from_spin.setValue(3)
+    dt.to_spin.setValue(4)
+    check(dt.table.rowCount() == 2 * len(dt.drivers()),
+          f"data tables: rango de vueltas ({dt.table.rowCount()})")
+    dt.tabs.setCurrentWidget(win.chart_timing.laps_table)
+    dt.refresh()
+    check(win.chart_timing.laps_table.rowCount() == 2,
+          "data tables: By lap respeta el rango")
+    # Summary también: el Best debe salir de las vueltas 3-4
+    dt.tabs.setCurrentWidget(win.chart_timing.summary_table)
+    dt.refresh()
+    best_txt = win.chart_timing.summary_table.item(0, 3).text()
+    check("(L3)" in best_txt or "(L4)" in best_txt,
+          f"data tables: Summary respeta el rango ({best_txt})")
+    check("laps 3–4" in win.chart_timing._note.text(),
+          "data tables: la nota indica el rango activo")
+    # Degradation: stints recortados al rango elegido
+    dt.from_spin.setValue(6)
+    dt.to_spin.setValue(9)
+    dt.tabs.setCurrentWidget(win.chart_timing._deg_container)
+    dt.refresh()
+    st_deg = win.chart_timing.stint_table
+    check(st_deg.rowCount() >= 1 and all(
+        st_deg.item(r, 3).text().startswith("L6-")
+        and int(st_deg.item(r, 3).text().split("-L")[1]) <= 9
+        for r in range(st_deg.rowCount())),
+        "data tables: Degradation respeta el rango "
+        f"({st_deg.item(0, 3).text() if st_deg.rowCount() else '—'})")
+    dt.from_spin.setValue(1)
+    dt.to_spin.setValue(0)
+    dt.refresh()
+    best_all = win.chart_timing.summary_table.item(0, 3).text()
+    check("(L" in best_all, "data tables: sin rango vuelve el Best global")
+    dt.tabs.setCurrentIndex(0)
     pump(app, 0.3)
-    check(not tp.floating, "tablas reacopladas dentro de su ventana")
 
     # el hub concentra fuente, catálogo y perfiles; Drivers y Timeline son
     # ventanas destacadas (borde de acento), cerradas por defecto
@@ -1311,6 +2044,75 @@ def test_app_demo(app: QApplication) -> None:
     win.hub.weather.pop()
     win.weather_chart._sig = None
 
+    # clima extendido (humedad, presión, dirección del viento) + brújula
+    check(all(len(r) == 8 for r in win.hub.weather),
+          "clima: filas normalizadas a 8 campos")
+    win.weather_now.refresh()
+    check(win.weather_now._values["hum"].text() == "60%"
+          and win.weather_now._values["press"].text() == "1011 mb",
+          f"clima: humedad y presión ({win.weather_now._values['hum'].text()}, "
+          f"{win.weather_now._values['press'].text()})")
+    check("205°" in win.weather_now._values["wind"].text(),
+          f"clima: dirección en la celda de viento "
+          f"({win.weather_now._values['wind'].text()})")
+    win.track_map.refresh()
+    badge = win.track_map.wind_badge
+    check(badge._dir == 205.0 and abs(badge._speed - 3.1) < 1e-6
+          and not badge.isHidden(),
+          f"map: brújula de viento con la última lectura ({badge._dir}°)")
+    check("205" in badge.toolTip(), "map: tooltip de la brújula")
+
+    # grilla oficial (OpenF1): el Δ posición se ancla en ella, no en el
+    # primer orden observado
+    win.tower.refresh()
+    order_now = [r.drv for r in win.tower.rows]
+    grid_official = {drv: len(order_now) - i
+                     for i, drv in enumerate(order_now)}  # grilla invertida
+    win.hub.on_grid(grid_official)
+    win.tower.refresh()
+    ok_delta = all(
+        r.delta == grid_official[r.drv] - r.pos and r.grid == grid_official[r.drv]
+        for r in win.tower.rows if r.ready)
+    check(ok_delta, "torre: Δ posición contra la grilla oficial")
+    check(f"grid P{win.tower.rows[0].grid}"
+          in win.tower._row_tooltip(win.tower.rows[0]),
+          "torre: grilla oficial en el tooltip")
+    win.hub.grid = {}
+
+    # paradas oficiales (OpenF1): contraste contra el tiempo medido
+    win.hub.on_official_pits({first: {4: (21.3, 2.4)}})
+    win.tower.refresh()
+    row_f = next(r for r in win.tower.rows if r.drv == first)
+    check(abs(row_f.pit_stop_off - 2.4) < 1e-9,
+          f"torre: parada oficial de la vuelta 4 ({row_f.pit_stop_off})")
+    check("official 2.4s" in win.tower._row_tooltip(row_f),
+          "torre: parada oficial en el tooltip")
+    check(win.hub.official_stop(first, 5) == (21.3, 2.4)
+          and win.hub.official_stop(first, 6) is None,
+          "hub: parada oficial con tolerancia de ±1 vuelta")
+    win.hub.official_pits = {}
+
+    # fotos de pilotos (OpenF1/CDN): tooltips con la imagen local
+    photo = Path(os.environ["LOCALAPPDATA"]) / "fake-headshot.png"
+    photo.write_bytes(b"\x89PNG\r\n\x1a\n")
+    win.hub.on_headshots({first: str(photo)})
+    pump(app, 0.3)  # driversChanged rearma la lista de pilotos
+    check("<img" in win.tower._row_tooltip(
+        next(r for r in win.tower.rows if r.drv == first)),
+        "torre: tooltip con foto del piloto")
+    item_first = next(
+        win.driver_list.item(i) for i in range(win.driver_list.count())
+        if win.driver_list.item(i).data(Qt.UserRole) == first)
+    check("<img" in item_first.toolTip(),
+          "drivers: tooltip de la lista con foto")
+    other = next(d for d in order_now if d != first)
+    item_other = next(
+        win.driver_list.item(i) for i in range(win.driver_list.count())
+        if win.driver_list.item(i).data(Qt.UserRole) == other)
+    check("<img" not in item_other.toolTip() and item_other.toolTip(),
+          "drivers: sin foto el tooltip queda en texto")
+    win.hub.headshots.clear()
+
     win.tower.refresh()
     tyres_shown = {r.tyre for r in win.tower.rows}
     check(tyres_shown == {"MEDIUM"} and all(r.tyre_age > 0 for r in win.tower.rows),
@@ -1469,25 +2271,38 @@ def test_app_demo(app: QApplication) -> None:
     win._panels["pitlane"].set_panel_visible(True)
     pump(app, 0.2)
     win.pitlane_view.refresh()
-    check(len(win.pitlane_view.rows) == 0,
-          "pit lane: vacío con todas las visitas cerradas")
+    pl_rows = win.pitlane_view.rows
+    n_pit = sum(1 for d in win.hub.pit_lane
+                if win.hub.last_pit_visit(d) is not None)
+    check(n_pit >= 1 and len(pl_rows) == n_pit
+          and all(not r.inside for r in pl_rows)
+          and win.pitlane_view.sep_index == 0,
+          f"pit lane: los que ya salieron siguen listados ({len(pl_rows)})")
+    check(all(r.tyre_in == "SOFT" and r.tyre_out == "MEDIUM" for r in pl_rows),
+          "pit lane: compuestos de entrada y salida (SOFT → MEDIUM)")
+    check(all(r.laps_ago is not None and r.laps_ago >= 1 for r in pl_rows),
+          "pit lane: indicador de vueltas desde la salida")
     win.hub.pit_lane.setdefault(first, []).append(
         [9, win.hub.latest_t - 15.0, None])
     win.pitlane_view.refresh()
     win.tower.refresh()
-    check(len(win.pitlane_view.rows) == 1, "pit lane: piloto adentro listado")
-    _code, _color, compound, lane_s, _stop_s, _out = win.pitlane_view.rows[0]
-    check(compound == "MEDIUM" and lane_s >= 14.5,
-          f"pit lane: compuesto de entrada y reloj corriendo ({compound}, {lane_s:.1f}s)")
+    pl_rows = win.pitlane_view.rows
+    check(len(pl_rows) == n_pit and pl_rows[0].drv == first
+          and pl_rows[0].inside and win.pitlane_view.sep_index == 1,
+          "pit lane: el reingreso renueva la fila y la sube a opacidad plena")
+    check(pl_rows[0].tyre_in == "MEDIUM" and pl_rows[0].lane_s >= 14.5,
+          f"pit lane: compuesto de entrada y reloj corriendo "
+          f"({pl_rows[0].tyre_in}, {pl_rows[0].lane_s:.1f}s)")
     # filtro 👥 propio: ocultar al piloto lo saca del panel
     item_pl = next(win.pitlane_view.filter_btn.list.item(i)
                    for i in range(win.pitlane_view.filter_btn.list.count())
                    if win.pitlane_view.filter_btn.list.item(i)
                    .data(Qt.UserRole) == first)
     item_pl.setCheckState(Qt.Unchecked)
-    check(len(win.pitlane_view.rows) == 0, "pit lane: filtro 👥 oculta al piloto")
+    check(len(win.pitlane_view.rows) == n_pit - 1,
+          "pit lane: filtro 👥 oculta al piloto")
     item_pl.setCheckState(Qt.Checked)
-    check(len(win.pitlane_view.rows) == 1, "pit lane: filtro 👥 restaurado")
+    check(len(win.pitlane_view.rows) == n_pit, "pit lane: filtro 👥 restaurado")
     row_f = next(r for r in win.tower.rows if r.drv == first)
     check(row_f.pit_open and row_f.pit_lap == 9,
           "torre: pasada abierta marcada (en calle ahora)")
@@ -1511,45 +2326,403 @@ def test_app_demo(app: QApplication) -> None:
         [12, win.hub.latest_t + 500.0, None])
     win.pitlane_view.refresh()
     win.tower.refresh()
-    check(len(win.pitlane_view.rows) == 0,
-          "pit lane: visita futura (replay) no lista al auto")
+    row_pl = next(r for r in win.pitlane_view.rows if r.drv == first)
+    check(not row_pl.inside,
+          "pit lane: visita futura (replay) no lo marca en boxes")
     row_f = next(r for r in win.tower.rows if r.drv == first)
     check(not row_f.pit_open and row_f.pit_lap == 4,
           "torre: visita futura no marca 'en calle ahora'")
     win.hub.pit_lane[first].pop()
     win.pitlane_view.refresh()
 
-    # retención del que sale del pit: atenuado hasta fin de S2 o 2 minutos
+    # pit lane sintético: persistencia, vueltas desde la salida, dato
+    # oficial, compuesto con retraso, reingreso y clavados
     from f1telem.hub import DataHub as _DH
     from f1telem.models import Sample as _S
     from f1telem.ui.pitlane import PitlaneView as _PLV
     hub_pl = _DH()
-    hub_pl.on_track_length(3000.0)  # sin bounds: fin de S2 = 2000 m
+    hub_pl.on_track_length(3000.0)
     plv = _PLV(hub_pl)
     hub_pl.on_batch([_S("9", k * 0.5, 1, 50.0 * (k * 0.5), 50.0 * (k * 0.5),
                         180.0, 0.0, 0.0, 0.0, 0, 0) for k in range(61)])
-    hub_pl.pit_lane["9"] = [[1, 2.0, 6.0]]  # salió en t=6 (pos 300 m)
+    hub_pl.pit_lane["9"] = [[1, 2.0, 6.0]]  # salió en t=6
     plv.refresh()
-    check(len(plv.rows) == 1 and plv.rows[0][5] is True
-          and abs(plv.rows[0][3] - 4.0) < 1e-6,
-          "pit lane: el que salió queda atenuado con relojes congelados")
-    hub_pl.on_batch([_S("9", t, 1, 50.0 * t, 50.0 * t, 180.0,
-                        0.0, 0.0, 0.0, 0, 0)
-                     for t in [30.5 + k * 0.5 for k in range(24)]])  # 2100 m
+    check(len(plv.rows) == 1 and not plv.rows[0].inside
+          and abs(plv.rows[0].lane_s - 4.0) < 1e-6,
+          "pit lane: el que salió queda listado con relojes congelados")
+    check(plv.rows[0].laps_ago == 0 and plv.sep_index == 0,
+          "pit lane: salida en la misma vuelta = 0L")
+    # el dato oficial de OpenF1 corrige la detención medida
+    hub_pl.on_official_pits({"9": {1: (4.1, 2.3)}})
     plv.refresh()
-    check(not plv.rows, "pit lane: al cruzar el fin del S2 desaparece")
-    hub_pl.on_batch([_S("10", k * 2.0, 1, 400.0 + 0.2 * (k * 2.0),
-                        400.0 + 0.2 * (k * 2.0), 20.0, 0.0, 0.0, 0.0, 0, 0)
-                     for k in range(51)])  # nunca llega al S2
-    hub_pl.pit_lane["10"] = [[1, 2.0, 6.0]]
+    check(abs(plv.rows[0].stop_s - 2.3) < 1e-9 and plv.rows[0].stop_official,
+          "pit lane: detención corregida con el dato oficial (STOP✓)")
+    # mucho después (otras vueltas, >2 min) la fila NO desaparece
+    hub_pl.on_batch([_S("9", 130.0 + k, 3, 500.0 + 10.0 * k, 6500.0 + 10.0 * k,
+                        180.0, 0.0, 0.0, 0.0, 0, 0) for k in range(11)])
     plv.refresh()
-    check(len(plv.rows) == 1 and plv.rows[0][5] is True,
-          "pit lane: sin cruzar el S2 sigue retenido (< 2 min)")
-    hub_pl.on_batch([_S("10", t, 1, 400.0 + 0.2 * t, 400.0 + 0.2 * t, 20.0,
-                        0.0, 0.0, 0.0, 0, 0)
-                     for t in [102.0 + k * 2.0 for k in range(15)]])
+    check(len(plv.rows) == 1 and not plv.rows[0].inside,
+          "pit lane: la fila persiste (sin expirar por tiempo ni S2)")
+    check(plv.rows[0].laps_ago == 2,
+          f"pit lane: salió hace 2 vueltas ({plv.rows[0].laps_ago})")
+    # compuesto de salida con retraso de origen: se completa al llegar
+    hub_pl.on_tyres({"9": {1: ("SOFT", 5)}})
     plv.refresh()
-    check(not plv.rows, "pit lane: a los 2 minutos expira la retención")
+    check(plv.rows[0].tyre_in == "SOFT" and plv.rows[0].tyre_out == "",
+          "pit lane: compuesto de salida aún sin dato (aro '?')")
+    hub_pl.on_tyres({"9": {1: ("SOFT", 5), 2: ("HARD", 1)}})
+    plv.refresh()
+    check(plv.rows[0].tyre_out == "HARD",
+          "pit lane: el compuesto de salida se completa al llegar el dato")
+    # reingreso: la visita nueva renueva la fila (opacidad plena, sin ✓)
+    hub_pl.pit_lane["9"].append([3, hub_pl.latest_t - 5.0, None])
+    plv.refresh()
+    check(len(plv.rows) == 1 and plv.rows[0].inside
+          and not plv.rows[0].stop_official and plv.sep_index == 1,
+          "pit lane: reingreso renueva la fila a opacidad plena")
+    # clavado a velocidad 0 más de 30 s: resaltado (¿abandono/reparación?)
+    hub_pl.on_batch([_S("10", 100.0 + k, 2, 800.0, 3800.0, 0.0,
+                        0.0, 0.0, 0.0, 0, 0) for k in range(41)])
+    hub_pl.pit_lane["10"] = [[2, 102.0, None]]
+    plv.refresh()
+    row10 = next(r for r in plv.rows if r.drv == "10")
+    row9 = next(r for r in plv.rows if r.drv == "9")
+    check(row10.inside and row10.stalled and not row9.stalled,
+          "pit lane: clavado ≥30 s a velocidad 0 resaltado")
+    check([r.drv for r in plv.rows] == ["9", "10"] and plv.sep_index == 2,
+          "pit lane: adentro arriba, ingreso más reciente primero")
+    # línea separadora entre los que están adentro y los que salieron
+    hub_pl.on_batch([_S("11", k * 1.0, 1, 30.0 * k, 30.0 * k, 150.0,
+                        0.0, 0.0, 0.0, 0, 0) for k in range(51)])
+    hub_pl.pit_lane["11"] = [[1, 10.0, 20.0]]
+    plv.refresh()
+    check(len(plv.rows) == 3 and plv.sep_index == 2
+          and [r.inside for r in plv.rows] == [True, True, False],
+          "pit lane: línea separadora entre adentro y afuera")
+
+    # control hub: destacados con ícono/color y catálogo completo en grupos
+    check(win._catalog_checks["drivers"].text().startswith("👥")
+          and win._catalog_checks["timeline"].text().startswith("⏱"),
+          "hub: Drivers y Timeline destacados con ícono")
+    check(set(win._catalog_checks)
+          == {pid for pid, _t, _d in win.PANEL_CATALOG},
+          "hub: todos los paneles presentes tras el agrupado")
+    grouped_ids = set(win._FEATURED) | {
+        p for _n, pids in win.PANEL_GROUPS for p in pids}
+    check({pid for pid, _t, _d in win.PANEL_CATALOG} <= grouped_ids,
+          "hub: ningún panel quedó fuera de las secciones")
+    # columnas responsivas del catálogo según el ancho del hub (ancho
+    # explícito: el mínimo alcanzable depende de las fuentes del sistema)
+    grid0, btns0 = win._catalog_sections[0]
+    win._relayout_catalog(250)
+    check(win._catalog_cols == 1
+          and grid0.getItemPosition(grid0.indexOf(btns0[1]))[:2] == (1, 0),
+          f"hub: 1 columna con ancho angosto ({win._catalog_cols})")
+    win._relayout_catalog(1000)
+    check(win._catalog_cols == 4
+          and grid0.getItemPosition(grid0.indexOf(btns0[1]))[:2] == (0, 1),
+          f"hub: 4 columnas con ancho amplio ({win._catalog_cols})")
+    win._relayout_catalog(500)
+    check(win._catalog_cols == 3, "hub: 3 columnas en ancho intermedio")
+    win._relayout_catalog()  # vuelve al ancho real de la ventana
+    # el hub escrolea: puede achicarse verticalmente sin límite de contenido
+    from PySide6.QtWidgets import QScrollArea as _QSA
+    check(isinstance(win.centralWidget(), _QSA),
+          "hub: contenido dentro de un scroll")
+    g_hub2 = win.geometry()
+    win.resize(g_hub2.width(), 380)
+    pump(app, 0.2)
+    check(win.height() <= 400,
+          f"hub: se reduce verticalmente ({win.height()})")
+    win.resize(g_hub2.width(), g_hub2.height())
+    pump(app, 0.2)
+    # sesión status encogible + rename del editor de microsectores
+    check(win.session_strip.minimumSizeHint().width() <= 200
+          or win.session_strip.minimumWidth() == 90,
+          "session strip: puede encogerse horizontalmente")
+    check(win._panels["micro_config"].title == "Microsectors Editor",
+          "hub: botón renombrado a Microsectors Editor")
+
+    # sección Analysis: hub lanzador + paneles con datos del demo
+    btn_an = win._catalog_checks["analysis"]
+    btn_an.setChecked(True)
+    pump(app, 0.2)
+    check(win._panels["analysis"].is_panel_visible(),
+          "analysis: ventana del hub abierta desde el catálogo")
+    win.analysis_launcher.buttons["an_gg"].setChecked(True)
+    win.analysis_launcher.buttons["an_deploy"].setChecked(True)
+    pump(app, 0.3)
+    check(win._panels["an_gg"].is_panel_visible()
+          and win._panels["an_deploy"].is_panel_visible(),
+          "analysis: paneles abiertos desde el lanzador")
+    gg = win.analysis_views["an_gg"]
+    gg.refresh()
+    check(len(gg._items) >= 1, "analysis: g-g con contenido del demo")
+    check(gg.table.rowCount() >= 1, "analysis: tabla del g-g con filas")
+    gg.points_check.setChecked(False)
+    check(len(gg._items) >= 1 and all(
+        type(i).__name__ != "ScatterPlotItem" for i in gg._items),
+        "analysis: solo la envolvente al ocultar los puntos")
+    gg.points_check.setChecked(True)
+    dp = win.analysis_views["an_deploy"]
+    dp.refresh()
+    check(dp.controls.zone_btn.list.count() >= 2,
+          "analysis: selector multi-zona poblado "
+          f"({dp.controls.zone_btn.list.count()})")
+    check(len(dp.controls.drivers()) == win.driver_list.count(),
+          "analysis: todos los autos por defecto en la botonera")
+    check(dp.table.rowCount() >= 1, "analysis: tabla por vuelta con filas")
+    # modo Total: barras por piloto y tabla agregada
+    dp.controls.mode_combo.setCurrentIndex(1)
+    dp.refresh()
+    check(dp.controls.mode() == "total" and dp.table.rowCount() >= 1
+          and dp.table.columnCount() == 6,
+          "analysis: modo Total con tabla agregada")
+    dp.controls.mode_combo.setCurrentIndex(0)
+    # multi-zona: solo curvas via atajo
+    dp.controls.zone_btn._quick("corner")
+    dp.refresh()
+    check(dp.controls.selector()[0] == "multi",
+          "analysis: atajo Corners deja selección múltiple")
+    dp.controls.zone_btn._quick(None)
+    # tildes del mapa: mostrar/ocultar derate y lift & coast por separado
+    dp.refresh()
+    n_lines_on = sum(1 for i in dp._overlay
+                     if type(i).__name__ == "PlotDataItem")
+    check(n_lines_on >= 1,
+          f"deploy map: tramos pintados sobre el trazado ({n_lines_on})")
+    dp.derate_check.setChecked(False)
+    dp.coast_check.setChecked(False)
+    n_lines_off = sum(1 for i in dp._overlay
+                      if type(i).__name__ == "PlotDataItem")
+    check(n_lines_off == 0,
+          "deploy map: ambos tildes destildados limpian el trazado")
+    dp.derate_check.setChecked(True)
+    dp.coast_check.setChecked(True)
+    bal = win.analysis_views["an_battery"]
+    bal.refresh()
+    check(bal.table.rowCount() >= 1, "analysis: tabla de batería con filas")
+    n_b0 = len(bal.p_charge.listDataItems())
+    bal.trend_check.setChecked(True)
+    bal.refresh()
+    check(len(bal.p_charge.listDataItems()) > n_b0,
+          "battery: tendencias agregadas")
+    bal.trend_check.setChecked(False)
+    bal.refresh()
+    grip = win.analysis_views["an_grip"]
+    grip.refresh()
+    # tendencias en Grip degradation (y Deploy & Coast): tilde + tipo
+    # (el panel está cerrado: _dirty difiere el redraw al refresh visible)
+    n_g0 = len(grip.p_g.listDataItems())
+    grip.trend_check.setChecked(True)
+    grip.refresh()
+    check(len(grip.p_g.listDataItems()) > n_g0,
+          f"grip: tendencias agregadas ({len(grip.p_g.listDataItems())})")
+    grip.trend_combo.setCurrentIndex(2)  # exponencial: no debe crashear
+    grip.refresh()
+    grip.trend_check.setChecked(False)
+    grip.refresh()
+    check(len(grip.p_g.listDataItems()) == n_g0,
+          "grip: tendencias ocultadas")
+    dp.trend_check.setChecked(True)
+    dp.refresh()
+    dp.trend_check.setChecked(False)
+    dp.refresh()
+    gf = win.analysis_views["an_gforce"]
+    win.analysis_launcher.buttons["an_gforce"].setChecked(True)
+    win._panels["map"].set_panel_visible(True)
+    pump(app, 0.2)
+    gf.refresh()
+    # sincronización de hover: un punto de pista se refleja en todos
+    win._on_analysis_hover(1000.0)
+    check(gf._hover_lines[0].isVisible() and gf.map_probe.isVisible()
+          and dp.map_probe.isVisible(),
+          "analysis: hover sincronizado entre gráficos y mapas")
+    check(win.track_map.probe_marker.isVisible(),
+          "analysis: hover reflejado en el track map principal")
+    win._on_analysis_hover(None)
+    check(not gf.map_probe.isVisible() and not dp.map_probe.isVisible(),
+          "analysis: hover None limpia los marcadores")
+    win.analysis_launcher.buttons["an_gg"].setChecked(False)
+    pump(app, 0.2)
+    check(not win._panels["an_gg"].is_panel_visible(),
+          "analysis: cierre desde el lanzador sincroniza")
+
+    # panel Acceleration: puntos v vs G y tendencias opcionales
+    win.analysis_launcher.buttons["an_accel"].setChecked(True)
+    pump(app, 0.2)
+    ac = win.analysis_views["an_accel"]
+    ac.refresh()
+    check(len(ac._items) >= 1 and ac.table.rowCount() >= 1,
+          "accel: nube de puntos y tabla")
+    # solo aceleración: sin puntos de frenada (G negativa)
+    sc0 = next(i for i in ac._items
+               if type(i).__name__ == "ScatterPlotItem")
+    _sx, sy = sc0.getData()
+    check(float(min(sy)) >= 0.0,
+          f"accel: sin frenada en la nube (min {float(min(sy)):.2f}G)")
+    n_before = len(ac._items)
+    ac.trend_check.setChecked(True)
+    ac.refresh()
+    check(len(ac._items) > n_before and any(
+        type(i).__name__ == "PlotDataItem" for i in ac._items),
+        "accel: líneas de tendencia agregadas")
+    ac.trend_combo.setCurrentIndex(2)  # exponencial: no debe crashear
+    ac.refresh()
+    check(any(type(i).__name__ == "PlotDataItem" for i in ac._items),
+          "accel: tendencia exponencial dibujada")
+    ac.trend_check.setChecked(False)
+    ac.refresh()
+
+    # Lap Compare histórico: sets piloto→vuelta con target para el delta
+    check(win._panels["quali_view"].title == "Lap Compare - Live",
+          "lap compare: panel en vivo renombrado")
+    win._panels["lap_compare"].set_panel_visible(True)
+    pump(app, 0.2)
+    lc = win.lap_compare_view
+    lc.refresh()
+    check(lc.driver_combo.count() == win.driver_list.count()
+          and lc.lap_combo.count() >= 3,
+          f"lap compare: combos poblados ({lc.driver_combo.count()} "
+          f"pilotos, {lc.lap_combo.count()} vueltas)")
+    lc._add_clicked()
+    lc.lap_combo.setCurrentIndex(0)
+    lc._add_clicked()
+    lc.driver_combo.setCurrentIndex(1)
+    lc._add_clicked()
+    check(len(lc.entries) == 3 and lc.target == 0,
+          f"lap compare: 3 sets agregados ({lc.entries})")
+    check(len(lc.p_chan.listDataItems()) == 3
+          and len(lc.p_delta.listDataItems()) == 2,
+          "lap compare: 3 trazas y 2 deltas contra el target")
+    lc.sets_list.setCurrentRow(2)
+    lc._target_clicked()
+    check(lc.target == 2 and "🎯" in lc.sets_list.item(2).text(),
+          "lap compare: target cambiado al tercer set")
+    lc.sets_list.setCurrentRow(0)
+    lc._remove_clicked()
+    check(len(lc.entries) == 2 and lc.target == 1,
+          "lap compare: quitar un set reubica el target")
+    idx_g = lc.channel_combo.findData("gear")
+    lc.channel_combo.setCurrentIndex(idx_g)
+    check(len(lc.p_chan.listDataItems()) == 2,
+          "lap compare: cambio de canal redibuja")
+    # correlación gráfico <-> pista en ambos sentidos
+    win._on_analysis_hover(800.0)
+    check(lc._hover_lines[0].isVisible() and lc._hover_lines[1].isVisible(),
+          "lap compare: hover ajeno marca la línea en sus gráficos")
+    lc.hover_dist_cb(600.0)
+    check(win.track_map.probe_marker.isVisible(),
+          "lap compare: hover propio marca el punto en el track map")
+    lc.hover_dist_cb(None)
+    check(not lc._hover_lines[0].isVisible(),
+          "lap compare: hover None limpia la línea")
+
+    # Pit lane map: recorrido por los dos carriles con un auto sintético
+    from f1telem.ui.pitlane_map import PitlaneMapView as _PLM
+    hub_pm = _DH()
+    hub_pm.on_track_length(3000.0)
+    hub_pm.on_tyres({"9": {1: ("SOFT", 3), 2: ("HARD", 1)}})
+    plm = _PLM(hub_pm)
+    plm.smooth = False  # los saltos sintéticos de datos van sin animación
+
+    def _seg(t0, t1, d0, v_ms, spd):
+        out, t = [], t0
+        while t < t1 - 1e-9:
+            d = d0 + v_ms * (t - t0)
+            out.append(_S("9", t, 1, d, d, spd, 0.0, 0.0, 0.0, 0, 0))
+            t += 0.5
+        return out
+
+    # llega a 180 km/h, entra a la calle en t=10 (dist 500) a 60 km/h
+    hub_pm.on_batch(_seg(0.0, 10.0, 0.0, 50.0, 180.0)
+                    + _seg(10.0, 12.01, 500.0, 16.67, 60.0))
+    hub_pm.pit_lane["9"] = [[1, 10.0, None]]
+    plm.refresh()
+    check(len(plm.cars) == 1 and not plm.cars[0].stopped
+          and 0.15 <= plm.cars[0].frac <= 0.35
+          and 1.5 <= plm.cars[0].lane_s <= 2.5
+          and plm.cars[0].tyre == "SOFT",
+          f"pit map: circulando con ruedas de entrada "
+          f"(frac {plm.cars[0].frac:.2f}, {plm.cars[0].lane_s:.1f}s)")
+    # se clava a 0 km/h: carril de detención, reloj de parada corriendo
+    hub_pm.on_batch(_seg(12.0, 14.0, 533.3, 16.67, 60.0)
+                    + _seg(14.0, 16.01, 566.7, 0.0, 0.0))
+    plm.refresh()
+    check(plm.cars[0].stopped and 0.35 <= plm.cars[0].frac <= 0.65
+          and 1.4 <= plm.cars[0].stop_s <= 2.6,
+          f"pit map: detenido en el carril de boxes "
+          f"({plm.cars[0].stop_s:.1f}s)")
+    check(plm.cars[0].tyre == "SOFT",
+          "pit map: durante la detención siguen las gomas de entrada")
+    # reanuda: vuelve al carril de circulación con las gomas nuevas y el
+    # tiempo de detención congelado
+    hub_pm.on_batch(_seg(16.0, 17.0, 566.7, 0.0, 0.0)
+                    + _seg(17.0, 19.51, 566.7, 16.67, 60.0))
+    plm.refresh()
+    check(not plm.cars[0].stopped and plm.cars[0].frac > 0.65
+          and 2.5 <= plm.cars[0].stop_s <= 3.5
+          and plm.cars[0].tyre == "HARD",
+          f"pit map: reanudó con gomas de salida y parada congelada "
+          f"({plm.cars[0].stop_s:.1f}s, {plm.cars[0].tyre})")
+    plm.canvas.grab()  # el pintado no debe crashear
+    # animación: con reloj de pared simulado, lotes de 0.5 s de datos a
+    # cadencia real — la posición reproduce con retraso, avanza monótona
+    # y nunca alcanza de golpe al último dato
+    fake_wall = [1000.0]
+    plm._now = lambda: fake_wall[0]
+    plm.smooth = True
+    plm._tsm.clear()
+    plm.refresh()  # inicializa el reloj de reproducción en el estado actual
+    f0 = plm.cars[0].frac
+    fracs = []
+    for k in range(4):
+        t0 = 19.5 + 0.5 * k
+        hub_pm.on_batch(_seg(t0, t0 + 0.51,
+                             608.4 + 16.67 * (t0 - 19.5), 16.67, 60.0))
+        fake_wall[0] += 0.5
+        plm.refresh()
+        fracs.append(plm.cars[0].frac)
+    plm.smooth = False
+    plm._now = time.monotonic
+    plm.refresh()
+    f_raw = plm.cars[0].frac
+    steps = [b - a for a, b in zip([f0] + fracs, fracs)]
+    check(all(s >= -1e-9 for s in steps) and fracs[-1] > f0 + 0.03
+          and fracs[-1] <= f_raw + 1e-9 and fracs[0] < f_raw - 0.02,
+          f"pit map: animación retrasada y progresiva "
+          f"({f0:.2f} → {[round(f, 2) for f in fracs]} → {f_raw:.2f})")
+    # dos autos detenidos juntos: las etiquetas no deben superponerse
+    # (de-conflicto por fila) — se ejercita el pintado con ambos parados
+    hub_pm.on_tyres({"9": {1: ("SOFT", 3), 2: ("HARD", 1)},
+                     "10": {1: ("MEDIUM", 5)}})
+    hub_pm.on_batch([_S("10", t, 1, 560.0, 560.0, 0.0, 0.0, 0.0, 0.0, 0, 0)
+                     for t in [12.0 + k * 0.5 for k in range(20)]])
+    hub_pm.pit_lane["10"] = [[1, 12.0, None]]
+    plm.refresh()
+    plm.canvas.grab()
+    check(len(plm.cars) == 2, "pit map: dos autos en la calle a la vez")
+    # filtro 👥 propio (persistible): ocultar un auto lo saca del mapa
+    item_pm = next(plm.filter_btn.list.item(i)
+                   for i in range(plm.filter_btn.list.count())
+                   if plm.filter_btn.list.item(i).data(Qt.UserRole) == "10")
+    item_pm.setCheckState(Qt.Unchecked)
+    check(len(plm.cars) == 1 and all(c.drv != "10" for c in plm.cars),
+          "pit map: filtro 👥 oculta al piloto")
+    item_pm.setCheckState(Qt.Checked)
+    check(len(plm.cars) == 2, "pit map: filtro 👥 restaurado")
+    plm.canvas.grab()  # pintado completo con garajes/entrada/salida
+    # visita cerrada: fuera del mapa
+    hub_pm.pit_lane["9"][0][2] = 20.0
+    plm.refresh()
+    check(all(c.drv != "9" for c in plm.cars),
+          "pit map: al salir de la calle desaparece")
+    win._panels["pitlane_map"].set_panel_visible(True)
+    pump(app, 0.2)
+    win.pitlane_map_view.refresh()
+    win.pitlane_map_view.canvas.grab()
+    check(win.pitlane_map_view.cars == [],
+          "pit map: en el demo sin visitas abiertas queda vacío")
 
     # gestor de notificaciones: los eventos del demo quedaron en el log
     kinds_logged = {k for _s, k, _c, _t in win.notifier.log}
@@ -1589,6 +2762,43 @@ def test_app_demo(app: QApplication) -> None:
     n_classif = sum(1 for g in gaps_ps.values() if g is not None)
     check(proj_big is not None and proj_big[0] == n_classif,
           f"undercut: ventana enorme manda al líder al fondo (P{proj_big[0]})")
+    # gráfico de reinserción: chips [adelante] ─s─ [propio] ─s─ [atrás]
+    from f1telem.ui.pit_strategy import _RejoinGraphic
+    check(ps.table.columnCount() == 6, "rejoin: columnas Behind/Margin "
+          "reemplazadas por el gráfico")
+    g0 = ps.table.cellWidget(0, 5)
+    check(isinstance(g0, _RejoinGraphic) and g0._data is not None
+          and g0._data[0] is not None,
+          "rejoin: gráfico con datos en la fila del líder")
+    with_sides = [ps.table.cellWidget(i, 5) for i in range(ps.table.rowCount())]
+    check(any(w._data and (w._data[1] or w._data[2]) for w in with_sides),
+          "rejoin: al menos una fila con vecinos y márgenes")
+    tt = next((w.toolTip() for w in with_sides
+               if w._data and (w._data[1] or w._data[2])), "")
+    check("pits now" in tt and ("behind" in tt or "ahead of" in tt),
+          f"rejoin: tooltip explica la reinserción ({tt!r})")
+
+    # parada "gratis" (gap con el de atrás > Ventana de Box + 1 s): con
+    # una ventana enorme solo el último la tiene, en torre y en strategy
+    ps.window_spin.setValue(120.0)
+    win.tower.refresh()
+    frees = [r.free_stop for r in win.tower.rows]
+    check(frees[-1] and sum(frees) == 1,
+          f"free stop: solo el último con ventana enorme ({frees})")
+    check("FREE stop" in win.tower._row_tooltip(win.tower.rows[-1]),
+          "free stop: tooltip de la torre lo explica")
+    ps._last_table = 0.0
+    ps.refresh()
+    marks = [ps.table.item(i, 4).text().endswith("✓")
+             for i in range(ps.table.rowCount())]
+    check(marks[-1] and sum(marks) == 1,
+          f"free stop: tag ✓ en pit strategy solo en el último ({marks})")
+    check("FREE" in ps.table.item(ps.table.rowCount() - 1, 4).toolTip(),
+          "free stop: tooltip del ✓ en pit strategy")
+    ps.window_spin.setValue(20.0)
+    win.tower.refresh()
+    check(win.tower.rows[-1].free_stop,
+          "free stop: el último siempre puede parar gratis")
 
     # estado del capturador en el hub (sandbox: no hay capturador)
     win._update_capturer_status()
@@ -1687,12 +2897,18 @@ def test_app_demo(app: QApplication) -> None:
     dv.from_spin.setValue(0)
     check(sum(dv.counts.values()) == n_mu_dom,
           "dominance: rango restaurado repinta todo")
+    # pausar el demo: los relojes suavizados convergen al último dato y la
+    # comparación deja de depender de la carga de la máquina
+    win.source.set_paused(True)
+    pump(app, 1.3)
+    lw.refresh()
     L_w = win.hub.track_length
     worst_deg = 0.0
     for drv, (angle, _code, _color) in lw._dots.items():
         real = float(win.hub.buffers[drv].col("dist_lap")[-1]) % L_w / L_w * 360.0
         diff = abs((angle - real + 180.0) % 360.0 - 180.0)
         worst_deg = max(worst_deg, diff)
+    win.source.set_paused(False)
     check(worst_deg < 30.0,
           f"rueda: ángulos coherentes con la posición real (peor {worst_deg:.1f}°)")
     b1_deg, b2_deg = lw._sector_bounds_deg()
@@ -1940,6 +3156,10 @@ def main() -> int:
     test_gap_grid_offset()
     test_catch_projection()
     test_delta_wave()
+    test_openf1()
+    test_analysis_engine()
+    test_preprocessing()
+    test_quali_tower()
     test_app_demo(app)
     print()
     if FAILURES:

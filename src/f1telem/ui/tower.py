@@ -14,8 +14,8 @@ import numpy as np
 from PySide6.QtCore import QEvent, QPointF, Qt, QRectF
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QHBoxLayout, QLabel, QMenu, QScrollArea, QToolButton,
-    QToolTip, QVBoxLayout, QWidget, QWidgetAction,
+    QCheckBox, QComboBox, QHBoxLayout, QLabel, QMenu, QScrollArea,
+    QToolButton, QToolTip, QVBoxLayout, QWidget, QWidgetAction,
 )
 
 from .. import config
@@ -50,6 +50,18 @@ _COLUMNS = [
     ("micro", "Mini-sectors"),
 ]
 
+def quali_drops(n: int) -> tuple[int, int]:
+    """Eliminados en Q1 y Q2 según el tamaño de la grilla. La invariante
+    del formato es que Q3 SIEMPRE corre con 10 autos: con 22 (2026) son
+    6+6, con 20 eran 5+5; una grilla impar reparte el resto (21 → 5+6).
+    Grillas chicas (tests/demos): proporcional."""
+    if n > 12:
+        d1 = (n - 10) // 2
+        return d1, (n - 10) - d1
+    d = max(1, n // 4)
+    return d, d
+
+
 ROW_H = 38
 WAVE_BINS = 240  # bins de la onda delta (una vuelta = 240 casilleros)
 _WAVE_FRS = (np.arange(WAVE_BINS) + 0.5) / WAVE_BINS
@@ -62,7 +74,8 @@ class TowerRow:
     color: str
     pos: int
     ready: bool                # posición de pista confiable (ancla o proyección)
-    delta: int | None          # posiciones ganadas (+) desde el inicio
+    delta: int | None          # posiciones ganadas (+) desde la grilla oficial
+                               # (OpenF1) o, sin ella, el primer orden observado
     speed: float
     gap_txt: str               # al líder
     int_txt: str               # al de adelante
@@ -86,6 +99,13 @@ class TowerRow:
     retired: bool = False       # fuera de carrera (abandono / clavado)
     ref_gap_txt: str = ""       # gap contra la referencia elegida ("—" en la ref)
     stew: str = ""              # chip de comisarios: ⚠ / +5s / DT / SG
+    grid: int | None = None     # posición de grilla oficial (OpenF1)
+    pit_stop_off: float = float("nan")  # parada oficial (s detenido, OpenF1)
+    free_stop: bool = False     # parada "gratis": el de atrás está a más
+                                # de una Ventana de Box + 1 s
+    out_tag: str = ""           # quali: eliminado ("OUT Q1" / "OUT SQ2")
+    cut_txt: str = ""           # quali: cuánto le falta para salvarse
+    drop: bool = False          # quali: hoy queda eliminado (zona roja)
     wave: object = None         # onda delta de la última vuelta (frac, ±s)
     wave_now: float = 0.0       # fracción de vuelta de la posición actual
 
@@ -162,6 +182,12 @@ class TimingTower(QWidget):
         self._best_sec: dict[str, np.ndarray] = {}
         self._sess_sec = np.full(3, np.inf)
         self._sess_sec_by: list[str | None] = [None] * 3
+        # clasificación por tandas (Q1-Q3): cachés y estado de la tanda
+        self._lap_end_cache: dict[tuple[str, int], float] = {}
+        self._quali_phase = 0
+        self._quali_hdr: str | None = None
+        self.quali_seps: list[tuple[int, str]] = []
+        self.quali_cut_row: int | None = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -178,6 +204,26 @@ class TimingTower(QWidget):
         self.wx_label = QLabel("")
         self.wx_label.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         head.addWidget(self.wx_label)
+        # ordenamiento de las filas: "Position" = posición de carrera en
+        # race/sprint y vuelta rápida en el resto; o una métrica a demanda
+        self.sort_combo = QComboBox()
+        for label, key in (("Position", "position"), ("Last lap", "last"),
+                           ("Best lap", "best"), ("AVG5", "a5"),
+                           ("AVG10", "a10"), ("S1", "s1"), ("S2", "s2"),
+                           ("S3", "s3")):
+            self.sort_combo.addItem(label, key)
+        self.sort_combo.setToolTip(
+            "Row order. Position = race order in races/sprints, fastest "
+            "lap in practice/quali; the rest sort by that metric (best "
+            "sector = personal best)")
+        self.sort_combo.setFixedHeight(18)
+        self.sort_combo.setStyleSheet("font-size: 7pt;")
+        stored_sort = (cfg or {}).get("ui", {}).get("tower_sort", "position")
+        idx_sort = self.sort_combo.findData(stored_sort)
+        if idx_sort >= 0:
+            self.sort_combo.setCurrentIndex(idx_sort)
+        self.sort_combo.currentIndexChanged.connect(self._sort_changed)
+        head.addWidget(self.sort_combo)
         # columnas visibles (▦): mucha info no siempre hace falta
         stored_cols = (cfg or {}).get("ui", {}).get("tower_cols", {})
         self._cols: dict[str, bool] = {
@@ -262,6 +308,37 @@ class TimingTower(QWidget):
             chk.blockSignals(False)
         self.canvas.update()
 
+    def _sort_changed(self, _i: int = 0) -> None:
+        if self.cfg is not None:
+            self.cfg.setdefault("ui", {})["tower_sort"] = \
+                self.sort_combo.currentData()
+            config.save_config(self.cfg)
+        self.refresh()
+
+    def _race_like(self) -> bool:
+        """Carrera o sprint: el orden natural es el de pista; en práctica
+        y clasificación, la vuelta rápida."""
+        meta = self.hub.session_meta
+        name = str(meta.get("name", "")).strip().lower()
+        typ = str(meta.get("type", "")).strip().lower()
+        return typ == "race" or name in ("race", "sprint")
+
+    def _sort_value(self, drv: str, mode: str) -> float:
+        an = self.analyzer
+        if mode == "last":
+            lap = an.last_completed_lap(drv)
+            v = an.lap_time(drv, lap) if lap else float("nan")
+        elif mode == "best":
+            b = an.best_lap(drv)
+            v = b[1] if b is not None else float("nan")
+        elif mode in ("a5", "a10"):
+            v = self._avg_lap(drv, 5 if mode == "a5" else 10)
+        else:  # s1 / s2 / s3: mejor sector personal acumulado
+            arr = self._best_sec.get(drv)
+            k = {"s1": 0, "s2": 1, "s3": 2}.get(mode, 0)
+            v = float(arr[k]) if arr is not None else float("nan")
+        return v if v == v and math.isfinite(v) else float("inf")
+
     def set_reference(self, drv: str | None) -> None:
         """Referencia de la torre: gap, LAST/BEST, sectores y promedios se
         muestran como delta contra este auto; el mismo click la saca."""
@@ -288,13 +365,21 @@ class TimingTower(QWidget):
         self._best_sec.clear()
         self._sess_sec = np.full(3, np.inf)
         self._sess_sec_by = [None] * 3
+        self._lap_end_cache.clear()
+        self._quali_phase = 0
+        self._quali_hdr = None
+        self.quali_seps = []
+        self.quali_cut_row = None
         self.lap_label.setText("")
         self.flag_label.setVisible(False)
         self.wx_label.setText("")
         self.canvas.update()
 
     def _update_header(self, t_now: float, leader_lap: int) -> None:
-        self.lap_label.setText(f"LAP {leader_lap}" if leader_lap else "")
+        if self._quali_hdr:
+            self.lap_label.setText(self._quali_hdr)
+        else:
+            self.lap_label.setText(f"LAP {leader_lap}" if leader_lap else "")
         badge = _CLEAR_BADGE
         for t0, t1, code in self.hub.track_status:
             if t0 <= t_now <= t1 and code in theme.TRACK_STATUS:
@@ -309,10 +394,153 @@ class TimingTower(QWidget):
         self.flag_label.setVisible(True)
         weather = self.hub.weather_at(t_now)
         if weather is not None:
-            _t, air, track, _wind, rain = weather
+            _t, air, track, _wind, rain = weather[:5]
             self.wx_label.setText(
                 f"Air {air:.0f}° · Trk {track:.0f}°" + (" · RAIN" if rain else "")
             )
+
+    # -------------------------------------------- clasificación por tandas
+
+    def _lap_end(self, drv: str, lap: int) -> float | None:
+        """Instante de cierre de una vuelta (cacheado: es inmutable)."""
+        key = (drv, lap)
+        cached = self._lap_end_cache.get(key)
+        if cached is not None:
+            return cached
+        marks = self.analyzer.lap_marks(drv, lap)
+        if marks is None:
+            return None
+        value = float(marks[-1])
+        self._lap_end_cache[key] = value
+        return value
+
+    def _phase_best(self, drv: str, t0: float,
+                    t1: float) -> tuple[int, float] | None:
+        """Mejor vuelta CERRADA dentro de la ventana de una tanda (y nunca
+        después del timeline: sin spoilers ni con datos por delante)."""
+        buf = self.hub.buffers.get(drv)
+        if buf is None or not buf.n:
+            return None
+        t1 = min(t1, self.hub.latest_t + 1.0)
+        best: tuple[int, float] | None = None
+        for lap in buf.completed_laps():
+            end = self._lap_end(drv, lap)
+            if end is None or not (t0 <= end < t1):
+                continue
+            lt = self.analyzer.lap_time(drv, lap)
+            if math.isfinite(lt) and (best is None or lt < best[1]):
+                best = (lap, lt)
+        return best
+
+    def _quali_reset_folds(self, phase_start: float) -> None:
+        """Al cruzar de tanda, los mejores (violeta/verde de sectores y µ)
+        arrancan de cero: solo cuentan las vueltas de la tanda actual."""
+        n_mu = self.analyzer.n_micro()
+        self._best_micro.clear()
+        self._sess_micro = np.full(n_mu, np.inf)
+        self._sess_micro_by = [None] * n_mu
+        self._best_sec.clear()
+        self._sess_sec = np.full(3, np.inf)
+        self._sess_sec_by = [None] * 3
+        self._folded.clear()
+        for drv, buf in self.hub.buffers.items():
+            last_prev = 0
+            for lap in (buf.completed_laps() if buf.n else []):
+                end = self._lap_end(drv, lap)
+                if end is not None and end < phase_start:
+                    last_prev = lap
+            self._folded[drv] = last_prev
+
+    def _quali_model(self, pts: dict, metric: str | None, phase: int,
+                     ws: list[float]) -> dict:
+        """Bloques de la torre en clasificación: vivos ordenados por el
+        mejor de la tanda ACTUAL, luego eliminados de Q2 y de Q1 (con sus
+        tiempos congelados). Un eliminado jamás supera a un vivo. Con una
+        métrica elegida, ordena por ella DENTRO de cada bloque."""
+        hub = self.hub
+        drivers = list(pts)
+        n = len(drivers)
+        drops = quali_drops(n)  # (eliminados en Q1, en Q2): Q3 = 10 autos
+        name = str(hub.session_meta.get("name", "")).lower()
+        prefix = "SQ" if ("sprint" in name or "shootout" in name) else "Q"
+        pb: dict[int, dict] = {}
+        for k in range(1, phase + 1):
+            pb[k] = {}
+            for drv in drivers:
+                b = self._phase_best(drv, ws[k - 1], ws[k])
+                if b is not None:
+                    pb[k][drv] = b
+
+        def rank_key(k):
+            return lambda d: (pb[k].get(d, (0, math.inf))[1], d)
+
+        alive = list(drivers)
+        out_phase: dict[str, int] = {}
+        out_best: dict[str, tuple | None] = {}
+        for k in range(1, phase):  # tandas ya completadas: eliminaciones
+            ranked = sorted(alive, key=rank_key(k))
+            surv = max(1, len(ranked) - drops[k - 1])
+            for d in ranked[surv:]:
+                out_phase[d] = k
+                out_best[d] = pb[k].get(d)
+            alive = ranked[:surv]
+        # bloque activo: mejor de la tanda actual (los sin tiempo, abajo,
+        # ordenados por su ranking de la tanda anterior)
+        if phase > 1:
+            prev_order = sorted(alive, key=rank_key(phase - 1))
+            prev_rank = {d: i for i, d in enumerate(prev_order)}
+        else:
+            prev_rank = {d: i for i, d in enumerate(sorted(alive))}
+        if metric is None:
+            active = sorted(alive, key=lambda d: (
+                pb[phase].get(d, (0, math.inf))[1], prev_rank.get(d, 99)))
+        else:
+            active = sorted(alive, key=lambda d: self._sort_value(d, metric))
+        groups = [active]
+        seps: list[tuple[int, str]] = []
+        for k in range(phase - 1, 0, -1):
+            grp = [d for d, p in out_phase.items() if p == k]
+            if metric is None:
+                grp.sort(key=lambda d: (out_best.get(d) or (0, math.inf))[1])
+            else:
+                grp.sort(key=lambda d: self._sort_value(d, metric))
+            if grp:
+                seps.append((sum(len(g) for g in groups),
+                             f"ELIMINATED {prefix}{k}"))
+                groups.append(grp)
+        ordered = [d for g in groups for d in g]
+        best_disp = {
+            d: (out_best.get(d) if d in out_phase else pb[phase].get(d))
+            for d in ordered}
+        sb = min(((b[1], b[0], d) for d in active
+                  for b in (pb[phase].get(d),) if b is not None),
+                 default=None)
+        p1_best = pb[phase].get(active[0])[1] if (
+            active and active[0] in pb[phase]) else None
+        # zona de eliminación (Q1/Q2 en curso, orden por posición)
+        cut_row = None
+        cut_txts: dict[str, str] = {}
+        drop_set: set[str] = set()
+        if phase < 3 and metric is None and len(active) > drops[phase - 1]:
+            surv_now = len(active) - drops[phase - 1]
+            cut_row = surv_now
+            ref_b = pb[phase].get(active[surv_now - 1])
+            for d in active[surv_now:]:
+                drop_set.add(d)
+                own = pb[phase].get(d)
+                if own is None:
+                    cut_txts[d] = "NO TIME"
+                elif ref_b is not None:
+                    cut_txts[d] = f"CUT +{own[1] - ref_b[1]:.3f}"
+        out_tag = {d: f"OUT {prefix}{k}" for d, k in out_phase.items()}
+        n_thru = (max(1, len(active) - drops[phase - 1]) if phase < 3
+                  else len(active))
+        hdr = (f"{prefix}{phase} · top {n_thru} through" if phase < 3
+               else f"{prefix}3")
+        return dict(phase=phase, ordered=ordered, best=best_disp,
+                    out_tag=out_tag, seps=seps, cut_row=cut_row,
+                    cut_txts=cut_txts, drop=drop_set, sb=sb,
+                    p1_best=p1_best, n_active=len(active), hdr=hdr)
 
     def _fold_bests(self, drv: str) -> None:
         """Acumula los mejores µsectores/sectores (personal y de la sesión)
@@ -592,27 +820,67 @@ class TimingTower(QWidget):
             self.rows = []
             self.canvas.update()
             return
-        # sin ancla de meta ni proyección la posición no es real (conexión a
-        # mitad de sesión): esos autos van al fondo con posición "–"; los
-        # fuera de carrera (abandono / clavados) van últimos con tag RET
-        ready_set = {d for d in ordered if an.real_positions_ready(d)}
-        active_set = {d for d in ordered if self.hub.is_active(d)}
-        ordered = ([d for d in ordered if d in ready_set and d in active_set]
-                   + [d for d in ordered
-                      if d not in ready_set and d in active_set]
-                   + [d for d in ordered if d not in active_set])
-        if not self._order0 and len(ready_set) == len(ordered):
+        # clasificación (Q1-Q3): detectar la tanda y resetear los mejores
+        # acumulados al cruzar de tanda (el reloj rápido arranca de cero)
+        quali = None
+        qphase, ws = 0, []
+        raw_mode = self.sort_combo.currentData() or "position"
+        if self.hub.is_quali():
+            bounds = self.hub.quali_phase_bounds()
+            qphase = min(len(bounds) + 1, 3)
+            ws = [0.0] + list(bounds)[:2]
+            while len(ws) < 4:
+                ws.append(float("inf"))
+            if qphase != self._quali_phase:
+                self._quali_phase = qphase
+                self._quali_reset_folds(ws[qphase - 1])
+        for drv in ordered:
+            self._fold_bests(drv)  # antes del orden: S1-3 usan los mejores
+        if qphase:
+            metric = None if raw_mode == "position" else raw_mode
+            quali = self._quali_model(pts, metric, qphase, ws)
+            ordered = quali["ordered"]
+            ready_set = set(ordered)
+            active_set = set(ordered)
+            self.quali_seps = list(quali["seps"])
+            self.quali_cut_row = quali["cut_row"]
+            self._quali_hdr = quali["hdr"]
+            mode = raw_mode
+        else:
+            self._quali_hdr = None
+            self.quali_seps = []
+            self.quali_cut_row = None
+            # ordenamiento elegido: "position" = pista en race/sprint y
+            # vuelta rápida en el resto; métricas ascendente (mejor arriba)
+            mode = raw_mode
+            if mode == "position" and not self._race_like():
+                mode = "best"
+            if mode != "position":
+                ordered.sort(key=lambda d: self._sort_value(d, mode))
+            # sin ancla de meta ni proyección la posición no es real; los
+            # fuera de carrera van últimos con tag RET
+            ready_set = {d for d in ordered if an.real_positions_ready(d)}
+            active_set = {d for d in ordered if self.hub.is_active(d)}
+            ordered = ([d for d in ordered
+                        if d in ready_set and d in active_set]
+                       + [d for d in ordered
+                          if d not in ready_set and d in active_set]
+                       + [d for d in ordered if d not in active_set])
+        if (quali is None and mode == "position" and not self._order0
+                and len(ready_set) == len(ordered)):
+            # solo el orden de pista sirve de línea base del Δ posición
             self._order0 = {drv: i + 1 for i, drv in enumerate(ordered)}
         L = self.hub.track_length
         leader = ordered[0]
         pos_leader, t_leader = pts[leader]
-        for drv in ordered:
-            self._fold_bests(drv)
-        bests = {drv: an.best_lap(drv) for drv in ordered}
+        bests = (quali["best"] if quali is not None
+                 else {drv: an.best_lap(drv) for drv in ordered})
         # mejor absoluto con dueño (desempate por vuelta y auto: el violeta
-        # de vuelta es de UN solo piloto en toda la tanda)
-        sb = min(((b[1], b[0], drv) for drv, b in bests.items() if b is not None),
-                 default=None)
+        # de vuelta es de UN solo piloto); en quali, el de la tanda actual
+        # entre los que siguen vivos
+        sb = (quali["sb"] if quali is not None else
+              min(((b[1], b[0], drv) for drv, b in bests.items()
+                   if b is not None), default=None))
         session_best = sb[0] if sb else math.inf
         session_best_by = sb[2] if sb else None
         t_now_max = max(float(pts[d][1][-1]) for d in ordered)
@@ -628,6 +896,7 @@ class TimingTower(QWidget):
             self._clear_waves()
         stew_flags = self.hub.stewards_flags()
         rows: list[TowerRow] = []
+        row_gaps: list[float | None] = []
         prev_gap: float | None = 0.0
         for i, drv in enumerate(ordered):
             info = self.hub.drivers.get(drv)
@@ -656,6 +925,22 @@ class TimingTower(QWidget):
                            if gap_val is not None and prev_gap is not None else "—")
                 catch = self._catch_laps(drv, ordered[i - 1], pts, L)
             prev_gap = gap_val
+            if quali is not None:
+                # en clasificación los gaps son deltas de MEJORES tiempos
+                # (de la tanda que corresponda a cada bloque), no de pista
+                catch = None
+                b_own = quali["best"].get(drv)
+                gap_txt = int_txt = "—"
+                if i == 0:
+                    gap_txt, int_txt = "leader", "—"
+                elif b_own is not None:
+                    if (i < quali["n_active"]
+                            and quali["p1_best"] is not None):
+                        gap_txt = f"+{b_own[1] - quali['p1_best']:.3f}"
+                    starts_group = any(idx == i for idx, _l in quali["seps"])
+                    b_above = quali["best"].get(ordered[i - 1])
+                    if b_above is not None and not starts_group:
+                        int_txt = f"+{b_own[1] - b_above[1]:.3f}"
 
             ref_gap_txt = ""
             if ref_ok is not None:
@@ -716,6 +1001,7 @@ class TimingTower(QWidget):
 
             # última pasada por boxes: vuelta, tiempo en calle y detenido
             pit_lap, pit_lane_s, pit_stop_s = 0, float("nan"), float("nan")
+            pit_stop_off = float("nan")
             pit_open = False
             pit_out = False
             visit = self.hub.last_pit_visit(drv)
@@ -732,8 +1018,17 @@ class TimingTower(QWidget):
                 stops = self.hub.pit_stops_done(drv)
                 if stops:
                     pit_lap = int(stops[-1][0])
+            if pit_lap and not pit_open:
+                # parada oficial (OpenF1): contraste del s detenido medido
+                official = self.hub.official_stop(drv, pit_lap)
+                if official is not None:
+                    pit_stop_off = float(official[1])
 
-            base0 = self._order0.get(drv)
+            # Δ posición: contra la grilla oficial si OpenF1 la trajo;
+            # si no, contra el primer orden observado en pista (en quali
+            # no aplica: la posición es la clasificación por tandas)
+            base0 = (None if quali is not None
+                     else self.hub.grid.get(drv, self._order0.get(drv)))
             row_ready = drv in ready_set
             rows.append(TowerRow(
                 drv=drv,
@@ -765,22 +1060,60 @@ class TimingTower(QWidget):
                 retired=drv not in active_set,
                 ref_gap_txt=ref_gap_txt,
                 stew=stew_flags.get(drv, ""),
+                grid=self.hub.grid.get(drv),
+                pit_stop_off=pit_stop_off,
+                out_tag=(quali["out_tag"].get(drv, "")
+                         if quali is not None else ""),
+                cut_txt=(quali["cut_txts"].get(drv, "")
+                         if quali is not None else ""),
+                drop=quali is not None and drv in quali["drop"],
                 wave=wave,
                 wave_now=wave_now,
             ))
+            row_gaps.append(gap_val if drv in active_set else None)
+        # parada "gratis": el que viene atrás está a más de una Ventana de
+        # Box (+1 s de margen) — puede parar sin perder la posición. Solo
+        # tiene sentido en carrera (hay vueltas totales o tipo Race)
+        is_race = (str(self.hub.session_meta.get("type", "")).lower()
+                   == "race" or self.hub.lap_count[1] > 0)
+        if is_race and mode == "position":
+            # con un orden por métrica los vecinos de fila no son los de
+            # pista: el tag FREE no aplica
+            window = float((self.cfg or {}).get("strategy", {})
+                           .get("pit_window", 20.0)) + 1.0
+            for i, row in enumerate(rows):
+                if row.retired or row_gaps[i] is None:
+                    continue
+                if i + 1 >= len(rows):
+                    row.free_stop = True  # nadie atrás: no pierde nada
+                elif row_gaps[i + 1] is not None:
+                    row.free_stop = (row_gaps[i + 1] - row_gaps[i]) > window
         # valores de la referencia para pintar deltas (antes del filtro 👥:
         # la ref puede estar oculta y los deltas siguen valiendo)
         self._ref_vals = next((r for r in rows if r.drv == self.ref_drv), None)
         # el filtro 👥 solo saca filas de la vista: posiciones, gaps e INT se
-        # calculan siempre sobre todos los autos (P y gaps reales)
+        # calculan siempre sobre todos los autos (P y gaps reales). Los
+        # separadores de tandas se re-indexan a las filas visibles
         if self.filter_btn.hidden:
-            rows = [r for r in rows if r.drv not in self.filter_btn.hidden]
+            hidden = self.filter_btn.hidden
+
+            def _visible_before(idx: int) -> int:
+                return sum(1 for r in rows[:idx] if r.drv not in hidden)
+
+            self.quali_seps = [(_visible_before(idx), label)
+                               for idx, label in self.quali_seps]
+            if self.quali_cut_row is not None:
+                self.quali_cut_row = _visible_before(self.quali_cut_row)
+            rows = [r for r in rows if r.drv not in hidden]
         self.rows = rows
         self.canvas.setMinimumHeight(len(rows) * self.row_h)
         self.canvas.update()
 
     def _row_tooltip(self, row: TowerRow) -> str:
-        parts = [f"{row.code} — P{row.pos}",
+        head = f"{row.code} — P{row.pos}"
+        if row.grid:
+            head += f" · grid P{row.grid}"
+        parts = [head,
                  f"Pits: {row.pits}",
                  f"AVG5: {fmt_laptime(row.avg5)} · AVG10: {fmt_laptime(row.avg10)}"]
         if row.tyre:
@@ -790,13 +1123,31 @@ class TimingTower(QWidget):
                     if row.pit_lane_s == row.pit_lane_s else "—")
             stop = (f"{row.pit_stop_s:.1f}s"
                     if row.pit_stop_s == row.pit_stop_s else "—")
+            if row.pit_stop_off == row.pit_stop_off:
+                stop += f" (official {row.pit_stop_off:.1f}s)"
             parts.append(
                 f"In pit lane NOW — {lane} (stopped {stop})" if row.pit_open
                 else f"Last pit: L{row.pit_lap} · lane {lane} · stopped {stop}")
         if row.catch is not None:
             parts.append(f"Catching the car ahead in ~{row.catch:.1f} laps")
+        if row.free_stop:
+            parts.append("FREE stop: can pit and keep position "
+                         "(gap behind > pit window + 1 s)")
         parts.append("Click: compare everyone against this driver "
                      "(click again to clear)")
+        photo = self.hub.headshots.get(row.drv)
+        if photo:
+            # con foto el tooltip pasa a rich text (QToolTip lo detecta)
+            import html as _html
+            from pathlib import Path
+
+            try:
+                uri = Path(photo).as_uri()
+            except ValueError:
+                uri = ""
+            if uri:
+                return (f"<img src='{uri}' width='84'><br>"
+                        + "<br>".join(_html.escape(p) for p in parts))
         return "\n".join(parts)
 
     # ------------------------------------------------------------- pintado
@@ -811,8 +1162,13 @@ class TimingTower(QWidget):
 
         for i, row in enumerate(self.rows):
             y = i * row_h
+            # eliminados de quali: fila atenuada con su tiempo congelado
+            p.setOpacity(0.55 if row.out_tag else 1.0)
             if i % 2:
                 p.fillRect(0, y, width, row_h, QColor(theme.SURFACE_ALT))
+            if row.drop:
+                # zona de eliminación: hoy queda afuera
+                p.fillRect(0, y, width, row_h, QColor(255, 80, 80, 24))
             if row.drv == self.ref_drv:
                 hl = QColor(theme.ACCENT)
                 hl.setAlpha(30)
@@ -890,14 +1246,19 @@ class TimingTower(QWidget):
                 p.drawText(QRectF(x, bot, 34 * s, line_h), Qt.AlignCenter, "km/h")
                 x += 38 * s
 
-            # píldoras LAST y BEST; con referencia elegida, delta contra ella
+            # píldoras LAST y BEST con su letra al estilo A5/A10; con
+            # referencia elegida, delta contra ella
             pill_specs = () if not self._col("pills") else (
-                    (row.last, row.last_kind, top,
+                    ("L", row.last, row.last_kind, top,
                      ref_vals.last if comparing else float("nan")),
-                    (row.best, row.best_kind, bot,
+                    ("B", row.best, row.best_kind, bot,
                      ref_vals.best if comparing else float("nan")))
-            for value, kind, y_pill, ref_val in pill_specs:
-                rect = QRectF(x, y_pill + 1, 66 * s, line_h - 1)
+            for letter, value, kind, y_pill, ref_val in pill_specs:
+                p.setFont(f_small)
+                p.setPen(QColor(theme.TEXT_MUTED))
+                p.drawText(QRectF(x, y_pill, 10 * s, line_h),
+                           Qt.AlignVCenter | Qt.AlignLeft, letter)
+                rect = QRectF(x + 11 * s, y_pill + 1, 66 * s, line_h - 1)
                 if comparing:
                     # signo desde la referencia: + = la ref pierde (la fila
                     # tiene mejor tiempo), − = la ref gana
@@ -922,17 +1283,21 @@ class TimingTower(QWidget):
                 p.setFont(f_val)
                 p.drawText(rect, Qt.AlignCenter, fmt_laptime(value))
             if self._col("pills"):
-                x += 70 * s
+                x += 81 * s
 
             # INT (arriba, con contador de pits) y gap al líder (abajo); en
             # boxes o en la vuelta de salida un tag PIT/OUT reemplaza al
             # INT, y un auto fuera de carrera lleva RET
             show_int = self._col("interval")
-            if show_int and (row.retired or row.pit_open or row.pit_out):
+            if show_int and (row.retired or row.pit_open or row.pit_out
+                             or row.out_tag):
                 tag, bg = (("RET", QColor("#b3404a")) if row.retired
                            else ("PIT", QColor("#d6be3c")) if row.pit_open
-                           else ("OUT", QColor("#2fbf71")))
-                rect_tag = QRectF(x, top + 1, 36 * s, line_h - 1)
+                           else ("OUT", QColor("#2fbf71")) if row.pit_out
+                           else (row.out_tag, QColor("#5a5f6a")))
+                rect_tag = QRectF(x, top + 1,
+                                  (50 if row.out_tag else 36) * s,
+                                  line_h - 1)
                 p.setPen(Qt.NoPen)
                 p.setBrush(bg)
                 p.drawRoundedRect(rect_tag, 4, 4)
@@ -967,6 +1332,11 @@ class TimingTower(QWidget):
                     p.drawText(QRectF(x, bot, 52 * s, line_h),
                                Qt.AlignVCenter | Qt.AlignLeft,
                                "REF " + txt_g)
+                elif row.cut_txt:
+                    # zona de eliminación: cuánto necesita para salvarse
+                    p.setPen(QColor("#ff6b5e"))
+                    p.drawText(QRectF(x, bot, 52 * s, line_h),
+                               Qt.AlignVCenter | Qt.AlignLeft, row.cut_txt)
                 else:
                     p.setPen(QColor(theme.TEXT_MUTED))
                     p.drawText(QRectF(x, bot, 52 * s, line_h),
@@ -979,6 +1349,12 @@ class TimingTower(QWidget):
                              else QColor("#ff6b5e"))
                     p.drawText(QRectF(x, bot, 52 * s, line_h),
                                Qt.AlignVCenter | Qt.AlignRight, row.stew)
+                elif row.free_stop and not (row.pit_open or row.pit_out):
+                    # parada gratis: puede parar sin perder la posición
+                    p.setFont(f_small)
+                    p.setPen(QColor("#2fbf71"))
+                    p.drawText(QRectF(x, bot, 52 * s, line_h),
+                               Qt.AlignVCenter | Qt.AlignRight, "FREE")
                 x += 54 * s
 
             # onda delta de la última vuelta contra la referencia (o el
@@ -1101,3 +1477,20 @@ class TimingTower(QWidget):
             # separador
             p.setPen(QPen(QColor(theme.BORDER), 1))
             p.drawLine(0, y + row_h - 1, width, y + row_h - 1)
+        p.setOpacity(1.0)
+        # clasificación: separadores de bloque rotulados y línea de corte
+        f_sep = QFont(base)
+        f_sep.setPointSizeF(6.0 * s)
+        for idx, label in self.quali_seps:
+            y = idx * row_h
+            p.setPen(QPen(QColor(theme.TEXT_MUTED), 2))
+            p.drawLine(0, y, width, y)
+            p.setFont(f_sep)
+            p.drawText(QRectF(width - 130.0, y + 1, 126.0, 10 * s),
+                       Qt.AlignRight | Qt.AlignTop, label)
+        if (self.quali_cut_row is not None
+                and 0 < self.quali_cut_row < len(self.rows)):
+            y = self.quali_cut_row * row_h
+            pen = QPen(QColor("#ff6b5e"), 2, Qt.DashLine)
+            p.setPen(pen)
+            p.drawLine(0, y, width, y)

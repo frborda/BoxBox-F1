@@ -14,19 +14,28 @@ from PySide6.QtGui import QColor, QCursor, QPainter, QPixmap, QPolygonF, QIcon
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGridLayout, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QPushButton, QSlider, QSpinBox,
-    QToolButton, QToolTip, QVBoxLayout, QWidget, QWidgetAction,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
+    QSlider, QSpinBox, QToolButton, QToolTip, QVBoxLayout, QWidget,
+    QWidgetAction,
 )
 
 from .. import __version__, config
+from ..analysis import AnalysisEngine
 from ..hub import DataHub
 from ..models import CHANNELS, CHANNEL_ORDER
+from ..openf1 import OpenF1Client
 from ..sources import BaseSource, CaptureSource, DemoSource, LiveSource, ReplaySource
 from . import theme
+from .analysis_panels import (
+    ANALYSIS_SECTIONS, AccelPanel, AnalysisLauncher, DeployCoastPanel,
+    EnergyBalancePanel, GForcePanel, GGDiagramPanel, GripDegPanel,
+)
 from .charts import RollingChart, WrapChart
+from .data_table import DataTableView
 from .docks import Detachable
 from .dominance_map import DominanceMapView
 from .driver_filter import DriverSelectButton
+from .lap_compare import LapCompareView
 from .lap_wheel import LapWheelView
 from .micro_config import MicroConfigView
 from .notifications import (
@@ -34,6 +43,7 @@ from .notifications import (
 )
 from .pit_strategy import PitStrategyView
 from .pitlane import PitlaneView
+from .pitlane_map import PitlaneMapView
 from .qualy_view import QualyView
 from .race_control import RaceControlPanel
 from .session_strip import SessionStrip
@@ -315,6 +325,12 @@ class MainWindow(QMainWindow):
                                          "notifications": True}, "float": {}},
             }
         self.hub = DataHub(self)
+        # enriquecimiento OpenF1 (histórico gratuito): grilla oficial,
+        # paradas oficiales y fotos de pilotos
+        self.openf1 = OpenF1Client(self)
+        self.openf1.gridReady.connect(self.hub.on_grid)
+        self.openf1.officialPitsReady.connect(self.hub.on_official_pits)
+        self.openf1.headshotsReady.connect(self.hub.on_headshots)
         self.source: BaseSource | None = None
         self._progress: tuple[float, float, float] | None = None
         self._source_status = "Not connected."
@@ -347,11 +363,29 @@ class MainWindow(QMainWindow):
         self.micro_config_view = MicroConfigView(self.hub, self.cfg)
         self._micro_cfg_key: str | None = None
         self.pitlane_view = PitlaneView(self.hub, self.cfg)
+        self.pitlane_map_view = PitlaneMapView(self.hub, self.cfg)
         self.pit_strategy_view = PitStrategyView(self.hub, self.cfg)
         self.notifier = NotificationCenter(self.hub, self.cfg, self)
         self.notifications_view = NotificationsPanel(self.notifier, self.cfg)
         self.weather_now = WeatherNowPanel(self.hub)
         self.weather_chart = WeatherChart(self.hub)
+        # sección Analysis: motor de canales derivados + paneles (energía y
+        # dinámica), lanzados desde su propia ventana-hub
+        self.analysis_engine = AnalysisEngine(self.hub)
+        self.analysis_views = {
+            "an_deploy": DeployCoastPanel(self.hub, self.analysis_engine),
+            "an_battery": EnergyBalancePanel(self.hub, self.analysis_engine),
+            "an_gg": GGDiagramPanel(self.hub, self.analysis_engine),
+            "an_gforce": GForcePanel(self.hub, self.analysis_engine),
+            "an_accel": AccelPanel(self.hub, self.analysis_engine),
+            "an_grip": GripDegPanel(self.hub, self.analysis_engine),
+        }
+        self.analysis_launcher = AnalysisLauncher(self._catalog_toggled)
+        self.lap_compare_view = LapCompareView(self.hub, self.cfg)
+        # las tablas de timing en su propia ventana (adopta las pestañas
+        # clásicas de Times/Gap y suma la vista piloto×vuelta)
+        self.data_table_view = DataTableView(self.hub, self.cfg,
+                                             self.chart_timing)
         self._tick_n = 0
         self._moments_n = 0
         # espera de la fuente Capture: sondear hasta que el capturador
@@ -385,11 +419,17 @@ class MainWindow(QMainWindow):
                 3000, lambda: run_check(self, self.cfg, silent=True)
             )
 
-        # restaurar la geometría guardada del hub
+        # restaurar la geometría guardada del hub; sin estado previo, un
+        # alto por defecto ACOTADO a la pantalla (el contenido escrolea)
         ui = self.cfg.get("ui", {})
         geom = ui.get("win_geom")
         if isinstance(geom, list) and len(geom) == 4:
             self.setGeometry(*[int(v) for v in geom])
+        else:
+            screen = self.screen()
+            avail_h = (screen.availableGeometry().height()
+                       if screen is not None else 800)
+            self.resize(400, min(820, avail_h - 60))
 
     # ------------------------------------------------------------------- UI
 
@@ -401,10 +441,18 @@ class MainWindow(QMainWindow):
          "Rolling telemetry vs track position (same corner = same vertical)"),
         ("race2_chart", "Race 2",
          "Fixed 0→L lap axis; each car overwrites its previous lap"),
-        ("quali_view", "Qualy Lap Compare",
+        ("quali_view", "Lap Compare - Live",
          "Current laps vs a target lap: traces, cumulative delta and cards"),
+        ("lap_compare", "Lap Compare",
+         "Pick driver→lap sets from laps already completed and chart any "
+         "channel; one set is the target for the delta"),
         ("times_gap", "Times / Gap",
-         "Gap chart vs a reference driver plus timing tables"),
+         "Gap chart vs a reference driver"),
+        ("data_table", "Data tables",
+         "Every timing table in one place — per driver AND per lap: time, "
+         "the 3 sectors, tyre compound/age, AVG5/AVG10 — plus the classic "
+         "Summary, By lap, Microsectors, Corners and Degradation tabs; "
+         "pick drivers and a lap range"),
         ("race_trace", "Race trace",
          "Gap evolution per microsector vs a selectable reference"),
         ("tower", "Timing tower",
@@ -430,11 +478,15 @@ class MainWindow(QMainWindow):
          "Stint bars per driver, colored by compound"),
         ("tyre_stints", "Tyre stints",
          "One chip per stint: compound, laps and a green N for a fresh set"),
-        ("micro_config", "Microsectors",
+        ("micro_config", "Microsectors Editor",
          "Move/add/remove the µ cuts on the map and table; saved per "
          "circuit and year (sector boundaries stay official)"),
         ("pitlane", "Pit lane",
          "Who is in the pits right now, entry compound and live clocks"),
+        ("pitlane_map", "Pit lane map",
+         "The whole pit lane left→right with its two lanes: cars roll "
+         "down the fast lane, drop to the inner lane while stationary "
+         "(mechanics on all four wheels) and rejoin the track"),
         ("pit_strategy", "Pit strategy",
          "Pit window loss (Ventana de Box) and rejoin projections"),
         ("race_control", "Race control",
@@ -445,11 +497,33 @@ class MainWindow(QMainWindow):
          "Temperatures and wind over the session (X = leader lap)"),
         ("notifications", "Notifications",
          "Event popups and log: pits, fastest lap, flags, penalties"),
+        ("analysis", "Analysis",
+         "Analysis toolbox: energy (clipping, lift & coast, battery) and "
+         "dynamics (G forces, friction circle, grip) — each tool opens in "
+         "its own window"),
     ]
     _CHART_IDS = ("race_chart", "race2_chart", "quali_view", "times_gap",
                   "race_trace")
     # botones destacados del catálogo (fila propia arriba, con acento)
     _FEATURED = ("drivers", "timeline")
+    _FEATURED_LOOK = {"drivers": "👥", "timeline": "⏱"}
+    _FEATURED_COLORS = {"drivers": "#2fbf71", "timeline": theme.ACCENT}
+    # secciones de "Windows": lo afín en contenido/función queda junto
+    PANEL_GROUPS = [
+        ("Comparison charts",
+         ("race_chart", "race2_chart", "quali_view", "lap_compare",
+          "times_gap", "race_trace")),
+        ("Track view",
+         ("map", "lap_wheel", "dominance", "micro_config")),
+        ("Timing & race",
+         ("tower", "data_table", "session", "race_control",
+          "notifications")),
+        ("Pits & strategy",
+         ("strategy", "tyre_stints", "pitlane", "pitlane_map",
+          "pit_strategy")),
+        ("Conditions & analysis",
+         ("weather", "weather_chart", "analysis")),
+    ]
     # arranque limpio: solo el hub (fuente + pilotos + catálogo); las
     # ventanas se abren a demanda o aplicando un perfil
     _DEFAULT_OPEN = frozenset()
@@ -483,6 +557,10 @@ class MainWindow(QMainWindow):
         self.gp_combo = QComboBox()
         self.gp_combo.setEditable(True)
         self.gp_combo.setInsertPolicy(QComboBox.NoInsert)
+        # los nombres largos de GP no deben imponer el ancho del hub
+        self.gp_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.gp_combo.setMinimumContentsLength(10)
         self.gp_combo.setEditText(str(rep.get("gp", "Bahrain")))
         self.gp_combo.lineEdit().setPlaceholderText("Loading calendar…")
         self.session_combo = QComboBox(); self.session_combo.addItems(SESSIONS)
@@ -501,20 +579,53 @@ class MainWindow(QMainWindow):
 
         self.connect_btn = QPushButton("Connect")
         src_lay.addWidget(self.connect_btn)
-        # línea de tiempo del replay/captura (solo visible cuando aplica)
+        # línea de tiempo del replay/captura (solo visible cuando aplica):
+        # fila de controles arriba (pausa, LIVE, saltos ±, reloj, capas) y
+        # la barra (regla + slider) abajo A TODO EL ANCHO del panel
         self.seek_row = QWidget()
-        seek_lay = QHBoxLayout(self.seek_row)
-        seek_lay.setContentsMargins(0, 0, 0, 0)
+        seek_col = QVBoxLayout(self.seek_row)
+        seek_col.setContentsMargins(0, 0, 0, 0)
+        seek_col.setSpacing(2)
+        ctl = QHBoxLayout()
+        ctl.setSpacing(2)
         self.pause_btn = QPushButton("⏸")
         self.pause_btn.setCheckable(True)
         self.pause_btn.setFixedWidth(30)
         self.pause_btn.setToolTip("Pause / resume playback")
-        seek_lay.addWidget(self.pause_btn)
+        ctl.addWidget(self.pause_btn)
         self.live_btn = QPushButton("LIVE")
         self.live_btn.setFixedWidth(48)
         self.live_btn.setToolTip("Jump to the latest captured data")
         self.live_btn.setVisible(False)
-        seek_lay.addWidget(self.live_btn)
+        ctl.addWidget(self.live_btn)
+        ctl.addStretch(1)
+        # saltos relativos agrupados y centrados sobre la barra
+        self.seek_back_btns: list[QToolButton] = []
+        self.seek_fwd_btns: list[QToolButton] = []
+        for secs, label in ((-900, "−15m"), (-300, "−5m"), (-60, "−1m"),
+                            (-30, "−30s"), (-10, "−10s"), (-5, "−5s")):
+            btn = QToolButton()
+            btn.setText(label)
+            btn.setAutoRaise(True)
+            btn.setFixedWidth(36)
+            btn.setStyleSheet("font-size: 7pt;")
+            btn.setToolTip(f"Jump {label}")
+            btn.clicked.connect(lambda _=False, s=secs: self._seek_relative(s))
+            ctl.addWidget(btn)
+            self.seek_back_btns.append(btn)
+        ctl.addSpacing(12)
+        for secs, label in ((5, "+5s"), (10, "+10s"), (30, "+30s"),
+                            (60, "+1m"), (300, "+5m"), (900, "+15m")):
+            btn = QToolButton()
+            btn.setText(label)
+            btn.setAutoRaise(True)
+            btn.setFixedWidth(36)
+            btn.setStyleSheet("font-size: 7pt;")
+            btn.setToolTip(f"Jump {label}")
+            btn.clicked.connect(lambda _=False, s=secs: self._seek_relative(s))
+            ctl.addWidget(btn)
+            self.seek_fwd_btns.append(btn)
+        ctl.addStretch(1)
         self.seek_slider = QSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 1000)
         self.lap_ruler = LapRuler(self._seek_to_time)
@@ -522,9 +633,8 @@ class MainWindow(QMainWindow):
         mid.setSpacing(0)
         mid.addWidget(self.lap_ruler)
         mid.addWidget(self.seek_slider)
-        seek_lay.addLayout(mid, stretch=1)
         self.time_label = QLabel("0:00 / 0:00")
-        seek_lay.addWidget(self.time_label)
+        ctl.addWidget(self.time_label)
         # capas de referencias de la línea de tiempo (persistidas)
         self.timeline_layers_btn = QToolButton()
         self.timeline_layers_btn.setText("▦")
@@ -554,7 +664,9 @@ class MainWindow(QMainWindow):
         tl_action.setDefaultWidget(tl_box)
         tl_menu.addAction(tl_action)
         self.timeline_layers_btn.setMenu(tl_menu)
-        seek_lay.addWidget(self.timeline_layers_btn)
+        ctl.addWidget(self.timeline_layers_btn)
+        seek_col.addLayout(ctl)
+        seek_col.addLayout(mid, stretch=1)
         # la línea de tiempo es un panel más del catálogo (ventana propia);
         # acá solo se deshabilita hasta que la fuente sea replay/captura
         self.seek_row.setEnabled(False)
@@ -572,40 +684,80 @@ class MainWindow(QMainWindow):
         # pasar el mouse y en el renglón de ayuda) ---
         panels_box = QGroupBox("Windows")
         panels_lay = QVBoxLayout(panels_box)
-        featured_row = QHBoxLayout()
-        featured_row.setSpacing(4)
-        grid = QGridLayout()
-        grid.setSpacing(4)
+        panels_lay.setSpacing(4)
         self._catalog_checks: dict[str, QPushButton] = {}
         self._catalog_desc: dict[str, str] = {}
-        grid_i = 0
-        for pid, title, desc in self.PANEL_CATALOG:
+        titles = {pid: (title, desc)
+                  for pid, title, desc in self.PANEL_CATALOG}
+
+        def _make_btn(pid: str) -> QPushButton:
+            title, desc = titles[pid]
             btn = QPushButton(title)
             btn.setCheckable(True)
             btn.setToolTip(desc)
-            if pid in self._FEATURED:
-                btn.setStyleSheet(
-                    "QPushButton { text-align: left; padding: 6px 8px;"
-                    f" font-weight: bold; border: 1px solid {theme.ACCENT};"
-                    " border-radius: 4px; }"
-                    f"QPushButton:checked {{ background: {theme.ACCENT};"
-                    " color: #ffffff; }}")
-            else:
+            # los botones no imponen el ancho del hub: con la ventana
+            # angosta se recortan (el tooltip siempre tiene el nombre)
+            btn.setMinimumWidth(56)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            btn.toggled.connect(
+                lambda on, p=pid: self._catalog_toggled(p, on))
+            btn.installEventFilter(self)
+            self._catalog_checks[pid] = btn
+            self._catalog_desc[pid] = desc
+            return btn
+
+        # destacados: Drivers y Timeline con ícono y color propios
+        featured_row = QHBoxLayout()
+        featured_row.setSpacing(4)
+        for pid in self._FEATURED:
+            color = self._FEATURED_COLORS.get(pid, theme.ACCENT)
+            btn = _make_btn(pid)
+            btn.setMinimumWidth(80)
+            btn.setText(f"{self._FEATURED_LOOK.get(pid, '')} "
+                        f"{titles[pid][0]}")
+            btn.setStyleSheet(
+                "QPushButton { text-align: left; padding: 7px 10px;"
+                f" font-weight: bold; font-size: 9pt; color: {color};"
+                f" border: 2px solid {color}; border-radius: 5px; }}"
+                f"QPushButton:checked {{ background: {color};"
+                " color: #ffffff; }")
+            featured_row.addWidget(btn)
+        panels_lay.addLayout(featured_row)
+
+        # secciones por afinidad; lo que no tenga grupo cae en "Other".
+        # Las columnas de cada grilla se adaptan al ancho de la ventana
+        # (1 a 4) en _relayout_catalog
+        self._catalog_sections: list[tuple[QGridLayout, list]] = []
+        self._catalog_cols = 2
+        groups = list(self.PANEL_GROUPS)
+        placed = set(self._FEATURED) | {
+            p for _name, pids in groups for p in pids}
+        leftovers = tuple(pid for pid, _t, _d in self.PANEL_CATALOG
+                          if pid not in placed)
+        if leftovers:
+            groups.append(("Other", leftovers))
+        for name, pids in groups:
+            pids = [p for p in pids if p in titles]
+            if not pids:
+                continue
+            head = QLabel(name.upper())
+            head.setStyleSheet(
+                f"color: {theme.TEXT_MUTED}; font-size: 7pt;"
+                " letter-spacing: 1px; margin-top: 3px;")
+            panels_lay.addWidget(head)
+            grid = QGridLayout()
+            grid.setSpacing(4)
+            btns = []
+            for i, pid in enumerate(pids):
+                btn = _make_btn(pid)
                 btn.setStyleSheet(
                     "QPushButton { text-align: left; padding: 4px 8px; }"
                     f"QPushButton:checked {{ background: {theme.ACCENT};"
                     " color: #ffffff; font-weight: bold; }}")
-            btn.toggled.connect(lambda on, p=pid: self._catalog_toggled(p, on))
-            btn.installEventFilter(self)
-            self._catalog_checks[pid] = btn
-            self._catalog_desc[pid] = desc
-            if pid in self._FEATURED:
-                featured_row.addWidget(btn)
-            else:
-                grid.addWidget(btn, grid_i // 2, grid_i % 2)
-                grid_i += 1
-        panels_lay.addLayout(featured_row)
-        panels_lay.addLayout(grid)
+                grid.addWidget(btn, i // 2, i % 2)
+                btns.append(btn)
+            self._catalog_sections.append((grid, btns))
+            panels_lay.addLayout(grid)
         self.catalog_hint = QLabel(
             "Click a window to open or close it — every view opens in its "
             "own window.")
@@ -660,8 +812,32 @@ class MainWindow(QMainWindow):
         self.trails_check.setChecked(bool(self.cfg["ui"].get("show_trails", True)))
         self.peaks_check = QCheckBox("Peak values (max/min)")
         self.peaks_check.setChecked(bool(self.cfg["ui"].get("show_peaks", False)))
+        self.refine_check = QCheckBox("Corner model refinement")
+        self.refine_check.setToolTip(
+            "Analysis panels only: reconstruct corner minimum speeds with "
+            "per-corner profiles learned from every lap of the session "
+            "(and previous ones on this circuit). Fixes the 4-5 Hz "
+            "sampling bias when no tick lands on the apex. Atypical laps "
+            "(mistakes) keep their raw data. Official timing is never "
+            "touched.")
+        self.refine_check.setChecked(
+            bool(self.cfg["ui"].get("refine_corners", False)))
+        self.analysis_engine.set_refine(self.refine_check.isChecked())
+        self.refine_check.toggled.connect(self._refine_toggled)
+        self.snap_check = QCheckBox("Magnetic windows")
+        self.snap_check.setToolTip(
+            "Windows stick to each other and to screen edges when moved or "
+            "resized close — no pixel-hunting to build tiled layouts. "
+            "Arrow keys on a window fine-tune by 1 px (Ctrl = resize).")
+        self.snap_check.setChecked(
+            bool(self.cfg["ui"].get("snap_windows", True)))
+        from .docks import set_snap_enabled
+        set_snap_enabled(self.snap_check.isChecked())
+        self.snap_check.toggled.connect(self._snap_toggled)
         set_lay.addWidget(self.trails_check)
         set_lay.addWidget(self.peaks_check)
+        set_lay.addWidget(self.refine_check)
+        set_lay.addWidget(self.snap_check)
         self.notif_settings_btn = QPushButton("Notifications…")
         self.notif_settings_btn.setToolTip(
             "Choose which events to announce and whether popups show")
@@ -697,29 +873,47 @@ class MainWindow(QMainWindow):
             "dominance": self.dominance_view,
             "lap_wheel": self.lap_wheel,
             "session": self.session_strip,
+            "lap_compare": self.lap_compare_view,
+            "data_table": self.data_table_view,
             "drivers": self._drivers_box,
             "timeline": self.seek_row,
             "strategy": self.strategy_view,
             "tyre_stints": self.tyre_stints_view,
             "micro_config": self.micro_config_view,
             "pitlane": self.pitlane_view,
+            "pitlane_map": self.pitlane_map_view,
             "pit_strategy": self.pit_strategy_view,
             "race_control": self.race_control_view,
             "weather": self.weather_now,
             "weather_chart": self.weather_chart,
             "notifications": self.notifications_view,
+            "analysis": self.analysis_launcher,
         }
         self._panels: dict[str, Detachable] = {}
         for pid, title, _desc in self.PANEL_CATALOG:
             self._panels[pid] = Detachable(pid, title, hosts[pid],
                                            window_only=True)
+        # paneles de análisis: fuera del catálogo (se abren desde la
+        # ventana Analysis), pero con la misma mecánica de ventana propia
+        for section, items in ANALYSIS_SECTIONS:
+            for pid, title, _desc in items:
+                self._panels[pid] = Detachable(
+                    pid, f"{section} · {title}", self.analysis_views[pid],
+                    window_only=True)
         # subpaneles internos (siguen acoplados dentro de su ventana, con la
         # opción de flotarlos aparte desde su propio botón ⧉)
-        self._panels["times_tables"] = self.chart_timing.tables_panel
         self._panels["quali_cards"] = self.chart_qualy.cards_panel
         self._cascade_n = 0
 
-        self.setCentralWidget(root)
+        # el hub escrolea: su alto mínimo dejó de ser la suma de todas las
+        # secciones (en pantallas chicas superaba el escritorio)
+        hub_scroll = QScrollArea()
+        hub_scroll.setWidgetResizable(True)
+        hub_scroll.setFrameShape(QScrollArea.NoFrame)
+        hub_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        hub_scroll.setWidget(root)
+        self.setCentralWidget(hub_scroll)
+        self.setMinimumSize(260, 320)
         self.status_label = QLabel(self._source_status)
         self.statusBar().addWidget(self.status_label, 1)
         self.meta_label = QLabel("")
@@ -776,6 +970,9 @@ class MainWindow(QMainWindow):
                       self.chart_qualy.chart, self.chart_timing):
             chart.hover_dist_cb = self._on_chart_hover
         self.track_map.hover_dist_cb = self._on_map_hover
+        for view in self.analysis_views.values():
+            view.hover_dist_cb = self._on_analysis_hover
+        self.lap_compare_view.hover_dist_cb = self._on_analysis_hover
         self.trails_check.toggled.connect(self._trails_toggled)
         self.track_map.set_trails_enabled(self.trails_check.isChecked())
         self.peaks_check.toggled.connect(self._peaks_toggled)
@@ -1007,6 +1204,10 @@ class MainWindow(QMainWindow):
         # identifica al fin de semana (después de que el hub la guardó)
         self._micro_cfg_key = None
         source.sessionMeta.connect(self._load_micro_cfg)
+        # enriquecimiento OpenF1: se dispara con la misma meta de sesión
+        self.openf1.reset()
+        self.openf1.set_live(isinstance(source, (LiveSource, CaptureSource)))
+        source.sessionMeta.connect(self._load_openf1)
         # Live/Capture: el marco de vuelta llega con la latencia del feed y
         # se re-ancla con los S1 oficiales
         self.hub.live_frames = isinstance(source, (LiveSource, CaptureSource))
@@ -1026,11 +1227,18 @@ class MainWindow(QMainWindow):
         self.micro_config_view.clear_data()
         self.dominance_view.clear_data()
         self.pitlane_view.clear_data()
+        self.pitlane_map_view.clear_data()
         self.pit_strategy_view.clear_data()
         self.notifier.reset()
         self.notifications_view.clear_data()
         self.weather_now.clear_data()
         self.weather_chart.clear_data()
+        self.analysis_engine.save_profiles()  # el entrenamiento no se pierde
+        self.analysis_engine.reset()
+        for view in self.analysis_views.values():
+            view.clear_data()
+        self.lap_compare_view.clear_data()
+        self.data_table_view.clear_data()
         if isinstance(source, (ReplaySource, CaptureSource)):
             source.progress.connect(self._on_progress)
             source.seekReset.connect(self._on_seek_reset)
@@ -1055,6 +1263,7 @@ class MainWindow(QMainWindow):
 
     def _disconnect(self) -> None:
         self._cap_follow_timer.stop()
+        self.analysis_engine.save_profiles()
         if self.source is None:
             return
         source, self.source = self.source, None
@@ -1089,6 +1298,14 @@ class MainWindow(QMainWindow):
         if isinstance(self.source, (ReplaySource, CaptureSource)):
             self.source.request_seek(t)
 
+    def _seek_relative(self, delta_s: float) -> None:
+        """Salto relativo desde la posición actual (botones ±5s…±15m),
+        acotado al rango de la sesión."""
+        if self._progress is None:
+            return
+        t0, t, t1 = self._progress
+        self._seek_to_time(min(max(t + delta_s, t0), t1))
+
     def _go_live(self) -> None:
         if isinstance(self.source, CaptureSource):
             self.pause_btn.setChecked(False)
@@ -1103,12 +1320,29 @@ class MainWindow(QMainWindow):
         """Hover en un gráfico -> anillo en el punto de pista del mapa."""
         if self.track_map.isVisible():
             self.track_map.set_probe_dist(dist)
+        self._hover_to_analysis(dist)
 
     def _on_map_hover(self, dist) -> None:
         """Hover en el mapa -> línea de referencia en el gráfico activo."""
         for pid, chart in zip(self._CHART_IDS, self.charts):
             if self._panels[pid].is_panel_visible():
                 chart.show_track_marker(dist)
+        self._hover_to_analysis(dist)
+
+    def _hover_to_analysis(self, dist) -> None:
+        for view in (*self.analysis_views.values(), self.lap_compare_view):
+            if view.isVisible():
+                view.set_hover_dist(dist)
+
+    def _on_analysis_hover(self, dist) -> None:
+        """Hover en un mapa/gráfico de análisis -> el mismo punto de pista
+        en TODO el resto: mapa principal, gráficos y demás paneles."""
+        if self.track_map.isVisible():
+            self.track_map.set_probe_dist(dist)
+        for pid, chart in zip(self._CHART_IDS, self.charts):
+            if self._panels[pid].is_panel_visible():
+                chart.show_track_marker(dist)
+        self._hover_to_analysis(dist)
 
     def _on_pits(self, data) -> None:
         self.hub.on_pits(data)
@@ -1128,7 +1362,8 @@ class MainWindow(QMainWindow):
         # períodos de lluvia para la línea de tiempo
         periods = []
         start = None
-        for t, _air, _track, _wind, rain in self.hub.weather:
+        for row in self.hub.weather:
+            t, rain = row[0], row[4]
             if rain and start is None:
                 start = t
             elif not rain and start is not None:
@@ -1241,6 +1476,7 @@ class MainWindow(QMainWindow):
         for info in drivers:
             item = QListWidgetItem(info.label)
             item.setData(Qt.UserRole, info.number)
+            item.setToolTip(self._driver_tooltip(info))
             pix = QPixmap(12, 12)
             pix.fill(QColor(info.color))
             item.setIcon(QIcon(pix))
@@ -1249,6 +1485,22 @@ class MainWindow(QMainWindow):
             self.driver_list.addItem(item)
         self.driver_list.blockSignals(False)
         self._selection_changed()
+
+    def _driver_tooltip(self, info) -> str:
+        """Nombre y equipo; con la foto de OpenF1/CDN si ya se descargó."""
+        import html as _html
+        from pathlib import Path
+
+        text = _html.escape(
+            " · ".join(p for p in (info.name or info.code, info.team) if p))
+        photo = self.hub.headshots.get(info.number)
+        if photo:
+            try:
+                return (f"<img src='{Path(photo).as_uri()}' width='96'>"
+                        f"<br>{text}")
+            except ValueError:
+                pass
+        return text
 
     def _selected_drivers(self) -> list[str]:
         return [
@@ -1293,6 +1545,12 @@ class MainWindow(QMainWindow):
             layers[key] = False
         config.save_config(self.cfg)
 
+    def _load_openf1(self, meta) -> None:
+        """Pide el enriquecimiento OpenF1 con la meta de sesión (el cliente
+        es idempotente y se rinde solo si no hay red o no aplica)."""
+        if isinstance(meta, dict):
+            self.openf1.request(meta)
+
     def _load_micro_cfg(self, *_meta) -> None:
         """Config de microsectores del circuito+año: se carga UNA vez por
         fin de semana, sin importar qué tanda se cargue."""
@@ -1310,7 +1568,37 @@ class MainWindow(QMainWindow):
         self.cfg.setdefault("ui", {})["show_trails"] = on
         config.save_config(self.cfg)
 
+    def _refine_toggled(self, on: bool) -> None:
+        self.analysis_engine.set_refine(on)
+        self.cfg.setdefault("ui", {})["refine_corners"] = bool(on)
+        config.save_config(self.cfg)
+
+    def _snap_toggled(self, on: bool) -> None:
+        from .docks import set_snap_enabled
+
+        set_snap_enabled(on)
+        self.cfg.setdefault("ui", {})["snap_windows"] = on
+        config.save_config(self.cfg)
+
     # ------------------------------------------------ ventanas (catálogo)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "_catalog_sections"):
+            self._relayout_catalog()
+
+    def _relayout_catalog(self, w: int | None = None) -> None:
+        """Columnas de la sección Windows según el ancho del hub: 1-4."""
+        w = self.width() if w is None else w
+        cols = 1 if w < 310 else 2 if w < 470 else 3 if w < 650 else 4
+        if cols == self._catalog_cols:
+            return
+        self._catalog_cols = cols
+        for grid, btns in self._catalog_sections:
+            for btn in btns:
+                grid.removeWidget(btn)
+            for i, btn in enumerate(btns):
+                grid.addWidget(btn, i // cols, i % cols)
 
     def eventFilter(self, obj, event) -> bool:
         # hover sobre un botón del catálogo -> descripción en el renglón de
@@ -1338,14 +1626,21 @@ class MainWindow(QMainWindow):
         """Posición por defecto de una ventana nueva: cascada a la derecha
         del hub, con tamaño según el tipo de vista."""
         base = self.geometry()
-        wide = pid in self._CHART_IDS or pid in ("strategy", "weather_chart",
-                                                 "timeline")
+        wide = (pid in self._CHART_IDS or pid.startswith("an_")
+                or pid in ("strategy", "weather_chart", "timeline",
+                           "lap_compare", "data_table"))
         width = 860 if wide else (320 if pid == "drivers" else 420)
         height = (620 if wide else 520)
-        if pid in ("session", "timeline"):
+        if pid == "session":
             height = 110
+        elif pid == "timeline":
+            height = 132
+        elif pid == "pitlane_map":
+            width, height = 860, 150
         elif pid == "lap_wheel":
             width, height = 520, 580
+        elif pid == "analysis":
+            width, height = 300, 460
         offset = 34 * (self._cascade_n % 8)
         self._cascade_n += 1
         return QRect(base.right() + 16 + offset, base.y() + offset,
@@ -1356,6 +1651,8 @@ class MainWindow(QMainWindow):
             box.blockSignals(True)
             box.setChecked(self._panels[pid].is_panel_visible())
             box.blockSignals(False)
+        self.analysis_launcher.sync(
+            lambda pid: self._panels[pid].is_panel_visible())
 
     def _on_panel_state(self) -> None:
         """Persiste el estado de cada ventana (geometría, fijado, visible)."""
@@ -1383,13 +1680,16 @@ class MainWindow(QMainWindow):
         # plan primero, aplicar después: cada detach dispara _on_panel_state,
         # que reescribe estos mismos dicts mientras se itera
         plan = []
-        for pid, _title, _desc in self.PANEL_CATALOG:
+        analysis_ids = [(pid, title, desc)
+                        for _s, items in ANALYSIS_SECTIONS
+                        for pid, title, desc in items]
+        for pid, _title, _desc in self.PANEL_CATALOG + analysis_ids:
             state = float_cfg.get(pid)
             plan.append((pid,
                          dict(state) if isinstance(state, dict) else None,
                          bool(visible.get(pid, pid in self._DEFAULT_OPEN))))
         subs = [(pid, dict(float_cfg[pid]))
-                for pid in ("times_tables", "quali_cards")
+                for pid in ("quali_cards",)
                 if isinstance(float_cfg.get(pid), dict)
                 and float_cfg[pid].get("floating")]
         for pid, state, open_it in plan:
@@ -1565,6 +1865,9 @@ class MainWindow(QMainWindow):
             self._safe_refresh(self.track_map.refresh)
         if self.lap_wheel.isVisible():
             self._safe_refresh(self.lap_wheel.refresh)
+        # el mapa de la calle de boxes anima entre lotes: refresco pleno
+        if self.pitlane_map_view.isVisible():
+            self._safe_refresh(self.pitlane_map_view.refresh)
         if self.tower.isVisible() and self._tick_n % 15 == 0:
             self._safe_refresh(self.tower.refresh)
         if self._tick_n % 30 == 0:
@@ -1588,14 +1891,12 @@ class MainWindow(QMainWindow):
                          self.dominance_view,
                          self.pitlane_view, self.pit_strategy_view,
                          self.weather_now, self.weather_chart,
-                         self.notifications_view):
+                         self.notifications_view, self.lap_compare_view,
+                         self.data_table_view,
+                         *self.analysis_views.values()):
                 if view.isVisible():
                     self._safe_refresh(view.refresh)
             # sub-paneles flotados aparte con su ventana madre cerrada
-            tables = self.chart_timing.tables_panel
-            if (not self._panels["times_gap"].is_panel_visible()
-                    and tables.floating and tables.is_panel_visible()):
-                self.chart_timing.refresh_tables()
             cards = self.chart_qualy.cards_panel
             if (not self._panels["quali_view"].is_panel_visible()
                     and cards.floating and cards.is_panel_visible()):
@@ -1603,7 +1904,7 @@ class MainWindow(QMainWindow):
         meta = f"Lap: {self.hub.track_length:,.0f} m  ·  Samples: {self.hub.total_samples:,}"
         weather = self.hub.weather_at(self.hub.latest_t)
         if weather is not None:
-            _t, air, track, wind, rain = weather
+            _t, air, track, wind, rain = weather[:5]
             meta = (f"Air {air:.0f}°  ·  Track {track:.0f}°  ·  Wind {wind:.1f} m/s"
                     + ("  ·  RAIN" if rain else "") + "  |  " + meta)
         self.meta_label.setText(meta)
@@ -1615,7 +1916,7 @@ class MainWindow(QMainWindow):
         loader = getattr(self, "_sched_loader", None)
         if loader is not None and loader.isRunning():
             loader.wait(5000)
-        self._disconnect()
+        self._disconnect()  # (guarda también los perfiles entrenados)
         self._on_panel_state()  # persiste la geometría de cada ventana
         for panel in self._panels.values():
             panel.close_float()

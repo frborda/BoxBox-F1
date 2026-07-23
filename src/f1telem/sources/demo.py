@@ -115,9 +115,9 @@ class DemoSource(BaseSource):
         # la amarilla sintética aplica al sector de la curva T5 (2600-3200 m)
         self.sectorYellows.emit([(60.0, 90.0, 2600.0, 3200.0)])
         self.weather.emit([
-            (0.0, 26.0, 41.0, 2.5, False),
-            (150.0, 24.5, 37.0, 4.2, True),   # chaparrón sintético
-            (180.0, 25.5, 39.0, 3.1, False),
+            (0.0, 26.0, 41.0, 2.5, False, 48.0, 1013.0, 210.0),
+            (150.0, 24.5, 37.0, 4.2, True, 74.0, 1009.5, 195.0),  # chaparrón
+            (180.0, 25.5, 39.0, 3.1, False, 60.0, 1011.0, 205.0),
         ])
         self.sessionMeta.emit(
             {"type": "Race", "meeting": "Demo Grand Prix", "name": "Race"})

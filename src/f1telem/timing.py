@@ -207,6 +207,56 @@ class TimingAnalyzer:
             return None
         return t_b1 - float(off[0])
 
+    @staticmethod
+    def _despike(v: np.ndarray) -> np.ndarray:
+        """Limpieza de picos imposibles de velocidad (errores del feed):
+        una muestra que se aparta > 40 km/h de la mediana de sus vecinas
+        se reemplaza por esa mediana."""
+        if len(v) < 3:
+            return v
+        med = np.median(np.stack([v[:-2], v[1:-1], v[2:]]), axis=0)
+        out = v.copy()
+        core = out[1:-1]
+        bad = np.abs(core - med) > 40.0
+        core[bad] = med[bad]
+        return out
+
+    @staticmethod
+    def _crossing_times(d: np.ndarray, t: np.ndarray, v: np.ndarray,
+                        targets: np.ndarray) -> np.ndarray:
+        """Instante de cruce de cada distancia objetivo, interpolando la
+        trayectoria entre muestras con un Hermite cúbico que usa la
+        velocidad como derivada (d′(t) = v(t)): bajo aceleración constante
+        es EXACTO, donde la interpolación lineal sesga los cruces en
+        frenadas/aceleraciones (~0,04 s a 4-5 Hz). Cae a lineal ante
+        cualquier segmento degenerado."""
+        lin = np.interp(targets, d, t, left=np.nan, right=np.nan)
+        if len(d) < 2:
+            return lin
+        idx = np.clip(np.searchsorted(d, targets, side="right") - 1,
+                      0, len(d) - 2)
+        h = t[idx + 1] - t[idx]
+        dd = d[idx + 1] - d[idx]
+        ok = np.isfinite(lin) & (h > 1e-4) & (dd > 1e-6)
+        v0h = v[idx] * h
+        v1h = v[idx + 1] * h
+        d0 = d[idx]
+        d1 = d[idx + 1]
+        s = np.where(ok, (targets - d0) / np.where(dd == 0, 1.0, dd), 0.5)
+        for _ in range(3):  # Newton sobre el cúbico (converge en 2-3)
+            s2 = s * s
+            s3 = s2 * s
+            f = (d0 * (2 * s3 - 3 * s2 + 1) + v0h * (s3 - 2 * s2 + s)
+                 + d1 * (-2 * s3 + 3 * s2) + v1h * (s3 - s2) - targets)
+            fp = (d0 * (6 * s2 - 6 * s) + v0h * (3 * s2 - 4 * s + 1)
+                  + d1 * (-6 * s2 + 6 * s) + v1h * (3 * s2 - 2 * s))
+            fp = np.where(np.abs(fp) < 1e-9, 1.0, fp)
+            s = s - np.where(ok, f / fp, 0.0)
+        good = ok & (s >= -0.01) & (s <= 1.01)
+        t_h = t[idx] + np.clip(s, 0.0, 1.0) * h
+        # el resultado jamás sale del segmento: si el Newton se fue, lineal
+        return np.where(good & (np.abs(t_h - lin) <= h), t_h, lin)
+
     def _frame_marks(self, drv: str, lap: int) -> np.ndarray | None:
         """Marcas en el marco de distancia de la vuelta (sin re-anclaje).
 
@@ -230,6 +280,9 @@ class TimingAnalyzer:
         L = self.hub.track_length
         d = buf.col("dist_lap")[i0:i1].astype(np.float64)
         t = buf.col("t")[i0:i1].astype(np.float64)
+        # velocidad limpia en m/s: derivada de d(t) para el Hermite
+        v = self._despike(
+            buf.col("speed")[i0:i1].astype(np.float64)) / 3.6
         completed = lap < buf.current_lap()
 
         # conexión a mitad de sesión (vivo): la primera vuelta observada no
@@ -274,6 +327,7 @@ class TimingAnalyzer:
             if anchor is not None:
                 d = np.concatenate(([anchor[0]], d))
                 t = np.concatenate(([anchor[1]], t))
+                v = np.concatenate(([v[0]], v))
 
         # ancla final: cruce de meta en dist L·scale (solo vueltas cerradas)
         if d[-1] < L * scale:
@@ -290,9 +344,9 @@ class TimingAnalyzer:
             if anchor is not None and anchor[0] > d[-1]:
                 d = np.append(d, anchor[0])
                 t = np.append(t, anchor[1])
+                v = np.append(v, v[-1])
 
-        marks = np.interp(self._mark_dists() * scale, d, t,
-                          left=np.nan, right=np.nan)
+        marks = self._crossing_times(d, t, v, self._mark_dists() * scale)
         if completed:  # vuelta cerrada: inmutable, cachear
             self._marks_cache[(drv, lap)] = marks
         return marks
@@ -313,6 +367,12 @@ class TimingAnalyzer:
     def sector_times(self, drv: str, lap: int) -> list[float]:
         """Sectores de la vuelta: cada uno el oficial si ya llegó, si no el
         interpolado."""
+        off = self.hub.official_times.get((drv, lap))
+        if off is not None and off[0] == off[0] and off[1] == off[1] \
+                and off[2] == off[2]:
+            # los 3 oficiales ya están: sin interpolar (las tablas por
+            # rango consultan muchas vueltas por refresco)
+            return [float(off[0]), float(off[1]), float(off[2])]
         marks = self.lap_marks(drv, lap)
         if marks is None:
             times = [float("nan")] * 3

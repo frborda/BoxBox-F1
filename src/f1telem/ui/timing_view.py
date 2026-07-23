@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
 from ..hub import DataHub
 from ..timing import N_MICRO, TimingAnalyzer
 from . import theme
-from .docks import Detachable
 from .charts import DoubleClickHider, EdgeSmoother, HoverProbe, legend_set_dim, series_pens
 
 _BEST_COLOR = "#c9a1ff"  # mejor tiempo (violeta, convención F1)
@@ -245,8 +244,10 @@ class TimingView(QWidget):
         self.tabs.addTab(self.segments_table, "Official µ")
         self.tabs.addTab(self.corners_table, "Corners")
         self.tabs.addTab(self._deg_container, "Degradation")
-        self.tables_panel = Detachable("times_tables", "Times / Gap tables", self.tabs)
-        layout.addWidget(self.tables_panel, stretch=2)
+        # las tablas viven en su PROPIO panel del catálogo (Data tables),
+        # que adopta self.tabs; acá queda solo el gráfico de gap. El panel
+        # externo fija este filtro: (pilotos|None, vuelta_desde, hasta|None)
+        self.table_filter: tuple = (None, 1, None)
 
         hub.driversChanged.connect(self._on_drivers_changed)
 
@@ -357,25 +358,30 @@ class TimingView(QWidget):
             self.refresh_tables(ref)
 
     def refresh_tables(self, ref: str | None = None) -> None:
-        """Refresca la pestaña de tablas visible; también se llama con el
-        panel de tablas flotante mientras otro modo está activo."""
-        if not self.selected:
+        """Refresca la pestaña de tablas visible (las tablas viven en el
+        panel Data tables; su filtro puede poblarlas aunque el gráfico no
+        tenga selección propia)."""
+        population = self._by_track_position()
+        if not population:
             return
         if ref is None:
-            ref = self.ref_combo.currentData() or self.selected[0]
+            ref = self.ref_combo.currentData() or (
+                self.selected[0] if self.selected else population[0])
         self._update_note()
-        tab = self.tabs.currentIndex()
-        if tab == 0:
+        # despacho por widget (no por índice): el panel Data tables puede
+        # anteponer pestañas propias sin romper el mapeo
+        tab = self.tabs.currentWidget()
+        if tab is self.summary_table:
             self._update_summary(ref)
-        elif tab == 1:
+        elif tab is self.laps_table:
             self._update_laps_table()
-        elif tab == 2:
+        elif tab is self.micro_table:
             self._update_micro(ref)
-        elif tab == 3:
+        elif tab is self.segments_table:
             self._update_segments()
-        elif tab == 4:
+        elif tab is self.corners_table:
             self._update_corners(ref)
-        else:
+        elif tab is self._deg_container:
             self._update_degradation()
 
     # -------------------------------------------------------------- interno
@@ -418,14 +424,18 @@ class TimingView(QWidget):
         return f"{x:,.0f} m · L{lap} +{rem:,.0f} m"
 
     def _by_track_position(self) -> list[str]:
-        """Pilotos seleccionados ordenados por posición en pista (1ro primero),
-        con la misma posición anclada a los cruces de meta que usa el gap."""
+        """Pilotos de las TABLAS ordenados por posición en pista (1ro
+        primero). Con filtro del panel Data tables, esa selección manda;
+        sin él, la selección del gráfico."""
+        flt = self.table_filter[0]
+        drivers = ([d for d in flt if d in self.hub.buffers]
+                   if flt else self.selected)
 
         def pos(drv: str) -> float:
             pt = self.analyzer.position_time(drv)
             return float(pt[0][-1]) if pt is not None else -math.inf
 
-        return sorted(self.selected, key=pos, reverse=True)
+        return sorted(drivers, key=pos, reverse=True)
 
     def _mark_legend_ref(self, ref: str) -> None:
         for sample, label in self.legend.items:
@@ -513,13 +523,38 @@ class TimingView(QWidget):
         rows = []
         best_overall = math.inf
         ordered = self._by_track_position()
+        # rango de vueltas del panel Data tables: Last/Best/S1-3 DENTRO
+        # del rango; sin rango, el comportamiento clásico (rodante)
+        lo, hi = int(self.table_filter[1]), self.table_filter[2]
+        ranged = lo > 1 or hi is not None
         for drv in ordered:
             buf = self.hub.buffers.get(drv)
             cur_lap = buf.current_lap() if buf else 0
-            last = an.last_completed_lap(drv)
-            last_time = an.lap_time(drv, last) if last else float("nan")
-            best = an.best_lap(drv)
-            sectors = an.latest_sector_times(drv)  # rodantes: vuelta en curso + anterior
+            if ranged:
+                laps = [l for l in (buf.completed_laps() if buf else [])
+                        if l >= lo and (hi is None or l <= hi)]
+                last = laps[-1] if laps else 0
+                last_time = an.lap_time(drv, last) if last else float("nan")
+                best = None
+                sec_best = [math.inf] * 3
+                for l in laps:
+                    lt = an.lap_time(drv, l)
+                    if math.isfinite(lt) and (best is None or lt < best[1]):
+                        best = (l, lt)
+                    st = an.sector_times(drv, l)
+                    for k in range(3):
+                        if math.isfinite(float(st[k])):
+                            sec_best[k] = min(sec_best[k], float(st[k]))
+                sectors = (
+                    [t if math.isfinite(t) else float("nan")
+                     for t in sec_best],
+                    None,  # mejores del rango: sin atenuar por vuelta
+                )
+            else:
+                last = an.last_completed_lap(drv)
+                last_time = an.lap_time(drv, last) if last else float("nan")
+                best = an.best_lap(drv)
+                sectors = an.latest_sector_times(drv)  # rodantes
             if best and best[1] < best_overall:
                 best_overall = best[1]
             rows.append((drv, cur_lap, last_time, best, sectors))
@@ -542,7 +577,8 @@ class TimingView(QWidget):
                     self.summary_table.setItem(r, 4 + k, _cell("—"))
                 else:
                     times, laps = sectors
-                    dim = int(laps[k]) != cur_lap
+                    # laps None = mejores del rango (no hay "vuelta vieja")
+                    dim = laps is not None and int(laps[k]) != cur_lap
                     self.summary_table.setItem(
                         r, 4 + k,
                         _cell(fmt_secs(float(times[k])),
@@ -560,16 +596,22 @@ class TimingView(QWidget):
         an = self.analyzer
         ordered = self._by_track_position()
         completed = {drv: an.last_completed_lap(drv) or 0 for drv in ordered}
-        signature = (tuple(ordered), tuple(sorted(completed.items())), round(self.hub.track_length))
+        signature = (tuple(ordered), tuple(sorted(completed.items())),
+                     round(self.hub.track_length), self.table_filter[1:])
         if signature == self._laps_signature:
             return
         self._laps_signature = signature
+        lap_lo = max(1, int(self.table_filter[1]))
         max_lap = max(completed.values(), default=0)
+        if self.table_filter[2] is not None:
+            max_lap = min(max_lap, int(self.table_filter[2]))
+        n_rows = max(0, max_lap - lap_lo + 1)
         self.laps_table.setColumnCount(len(ordered))
         self.laps_table.setHorizontalHeaderLabels([self._code_of(d) for d in ordered])
-        self.laps_table.setRowCount(max_lap)
-        self.laps_table.setVerticalHeaderLabels([f"L{n}" for n in range(1, max_lap + 1)])
-        for lap in range(1, max_lap + 1):
+        self.laps_table.setRowCount(n_rows)
+        self.laps_table.setVerticalHeaderLabels(
+            [f"L{n}" for n in range(lap_lo, max_lap + 1)])
+        for lap in range(lap_lo, max_lap + 1):
             times = [an.lap_time(drv, lap) if lap <= completed[drv] else float("nan")
                      for drv in ordered]
             finite = [t for t in times if math.isfinite(t)]
@@ -595,7 +637,7 @@ class TimingView(QWidget):
                     tooltip.append("Pit stop on this lap")
                 if tooltip:
                     item.setToolTip("\n".join(tooltip))
-                self.laps_table.setItem(lap - 1, c, item)
+                self.laps_table.setItem(lap - lap_lo, c, item)
         self.laps_table.scrollToBottom()
 
     def _update_status_regions(self, ref: str) -> None:
@@ -646,9 +688,14 @@ class TimingView(QWidget):
             return []
         an = self.analyzer
         pit_laps = {p_lap for p_lap, _t in self.hub.pits.get(drv, [])}
+        # rango de vueltas del panel Data tables: la degradación se
+        # analiza SOLO dentro del rango (stints recortados a él)
+        lo, hi = int(self.table_filter[1]), self.table_filter[2]
+        laps = [l for l in buf.completed_laps()
+                if l >= lo and (hi is None or l <= hi)]
         stints: list[dict] = []
         prev_age = None
-        for lap in buf.completed_laps():
+        for lap in laps:
             compound, age = tyre_map.get(lap, ("", 0))
             if not compound:
                 prev_age = None
@@ -802,11 +849,14 @@ class TimingView(QWidget):
         self.micro_table.setVerticalHeaderLabels(labels)
 
     def _update_note(self) -> None:
-        """La nota refleja si los sectores ya están anclados a los oficiales."""
+        """La nota refleja si los sectores ya están anclados a los
+        oficiales y si hay un rango de vueltas activo (panel Data
+        tables)."""
         official = self.hub.sector_bounds is not None
-        if official == self._note_official:
+        lo_hi = (int(self.table_filter[1]), self.table_filter[2])
+        if (official, lo_hi) == self._note_official:
             return
-        self._note_official = official
+        self._note_official = (official, lo_hi)
         if official:
             b1, b2 = self.hub.sector_bounds
             self._note.setText("official sectors (?)")
@@ -826,6 +876,14 @@ class TimingView(QWidget):
                 "live over the current lap; dimmed values come from exactly one lap ago.\n"
                 "Accuracy ~±0.1 s — not official timing."
             )
+        lo, hi = int(self.table_filter[1]), self.table_filter[2]
+        if lo > 1 or hi is not None:
+            # el rango del panel Data tables aplica donde las vueltas son
+            # el dominio; las pestañas de estado actual quedan al margen
+            self._note.setText(
+                self._note.text()
+                + f"  ·  laps {lo}–{hi if hi is not None else 'now'} "
+                  "(All data, By lap, Summary, Degradation)")
 
     def _update_segments(self) -> None:
         """Microsectores oficiales del feed (rayitas de colores de la app de

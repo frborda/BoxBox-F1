@@ -282,7 +282,15 @@ class ReplaySource(BaseSource):
             pass
 
     def _emit_weather(self, session) -> None:
-        """Clima muestreado (~1/min): aire, pista, viento y lluvia."""
+        """Clima muestreado (~1/min): aire, pista, viento y lluvia, más
+        humedad, presión y dirección del viento si la sesión los trae."""
+
+        def _opt(row, key: str) -> float:
+            try:
+                return float(row[key])
+            except (KeyError, ValueError, TypeError):
+                return float("nan")
+
         try:
             rows = []
             for _, row in session.weather_data.iterrows():
@@ -293,6 +301,9 @@ class ReplaySource(BaseSource):
                         float(row["TrackTemp"]),
                         float(row["WindSpeed"]),
                         bool(row["Rainfall"]),
+                        _opt(row, "Humidity"),
+                        _opt(row, "Pressure"),
+                        _opt(row, "WindDirection"),
                     ))
                 except (ValueError, TypeError):
                     continue

@@ -20,8 +20,8 @@ import math
 import time
 
 import numpy as np
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QDoubleSpinBox, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QVBoxLayout, QWidget,
@@ -238,6 +238,103 @@ class PitWindowEstimator:
         return float(np.median(losses)), len(losses), n_ref
 
 
+def _text_on(bg: QColor) -> QColor:
+    lum = 0.299 * bg.redF() + 0.587 * bg.greenF() + 0.114 * bg.blueF()
+    return QColor("#111318") if lum > 0.55 else QColor("#ffffff")
+
+
+class _RejoinGraphic(QWidget):
+    """Gráfico de reinserción de una fila: a dónde cae el auto si para
+    AHORA — `[HAM] ─3.5s─ [COL] ─2.6s─ [BOR]` con chips en color de
+    equipo, orden de pista de izquierda (adelante) a derecha (atrás) y el
+    propio auto resaltado."""
+
+    CHIP_W, CHIP_H = 36.0, 15.0
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data: tuple | None = None
+        self.setMinimumWidth(200)
+
+    def set_data(self, own: tuple | None,
+                 ahead: tuple | None, behind: tuple | None) -> None:
+        """own=(code,color); ahead/behind=(code,color,margen_s) o None."""
+        data = (own, ahead, behind)
+        if data == self._data:
+            return
+        self._data = data
+        if own is None:
+            self.setToolTip("")
+        else:
+            parts = []
+            if ahead is not None:
+                parts.append(f"{ahead[2]:.1f}s behind {ahead[0]}")
+            if behind is not None:
+                parts.append(f"{behind[2]:.1f}s ahead of {behind[0]}")
+            self.setToolTip(
+                f"If {own[0]} pits now (3 s stop): "
+                + (" and ".join(parts) if parts else "comes out alone"))
+        self.update()
+
+    def _chip(self, p: QPainter, x: float, cy: float, code: str,
+              color: str, own: bool) -> float:
+        rect = QRectF(x, cy - self.CHIP_H / 2, self.CHIP_W, self.CHIP_H)
+        team = QColor(color)
+        p.setPen(QPen(QColor(theme.ACCENT), 1.5) if own
+                 else QPen(Qt.NoPen))
+        p.setBrush(team)
+        p.drawRoundedRect(rect, 3, 3)
+        f = QFont(self.font())
+        f.setPointSizeF(6.5)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(_text_on(team))
+        p.drawText(rect, Qt.AlignCenter, code)
+        return x + self.CHIP_W
+
+    def _gap(self, p: QPainter, x: float, cy: float, width: float,
+             seconds: float) -> float:
+        f = QFont(self.font())
+        f.setPointSizeF(6.5)
+        p.setFont(f)
+        text = f"{seconds:.1f}s"
+        tw = p.fontMetrics().horizontalAdvance(text) + 6
+        seg = max(4.0, (width - tw) / 2)
+        p.setPen(QPen(QColor(theme.TEXT_MUTED), 1))
+        p.drawLine(int(x), int(cy), int(x + seg), int(cy))
+        p.drawText(QRectF(x + seg, cy - 8, tw, 16), Qt.AlignCenter, text)
+        p.drawLine(int(x + seg + tw), int(cy),
+                   int(x + width), int(cy))
+        return x + width
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        cy = self.height() / 2.0
+        if self._data is None or self._data[0] is None:
+            f = QFont(self.font())
+            f.setPointSizeF(7.0)
+            p.setFont(f)
+            p.setPen(QColor(theme.TEXT_MUTED))
+            p.drawText(self.rect(), Qt.AlignVCenter | Qt.AlignLeft, "  —")
+            p.end()
+            return
+        own, ahead, behind = self._data
+        n_gaps = (ahead is not None) + (behind is not None)
+        n_chips = 1 + n_gaps
+        gap_w = max(40.0, (self.width() - 4 - n_chips * self.CHIP_W)
+                    / max(n_gaps, 1))
+        x = 2.0
+        if ahead is not None:
+            x = self._chip(p, x, cy, ahead[0], ahead[1], False)
+            x = self._gap(p, x, cy, gap_w, ahead[2])
+        x = self._chip(p, x, cy, own[0], own[1], True)
+        if behind is not None:
+            x = self._gap(p, x, cy, gap_w, behind[2])
+            self._chip(p, x, cy, behind[0], behind[1], False)
+        p.end()
+
+
 class PitStrategyView(QWidget):
     """Panel Pit strategy: Ventana de Box (auto/manual con traba) y la
     proyección de rejoin de cada auto si parara ahora (detención de 3 s)."""
@@ -281,18 +378,24 @@ class PitStrategyView(QWidget):
         row.addStretch(1)
         lay.addLayout(row)
 
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(
-            ["P", "Driver", "Gap", "Net", "→ P", "Behind", "Margin"])
+            ["P", "Driver", "Gap", "Net", "→ P", "Rejoin"])
         self.table.horizontalHeaderItem(3).setToolTip(
             "Net position in the pit cycle: virtual order once every car "
             "with pending stops pays one Pit window (green = gains, red = "
             "loses vs today's track position)")
+        self.table.horizontalHeaderItem(5).setToolTip(
+            "If this car pits now (3 s stop): where it rejoins — the car "
+            "it comes out behind (left) and ahead of (right), with the "
+            "margins in seconds")
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setStyleSheet("QTableWidget { font-size: 8pt; }")
-        for col, width in ((0, 28), (2, 56), (3, 40), (4, 36), (6, 64)):
+        for col, width in ((0, 28), (2, 56), (3, 40), (4, 48)):
             self.table.setColumnWidth(col, width)
+        self.table.horizontalHeader().setStretchLastSection(True)
         lay.addWidget(self.table, stretch=1)
 
     # ------------------------------------------------------------- config
@@ -352,23 +455,45 @@ class PitStrategyView(QWidget):
                 virtual[d] = g + (max_stops - stops[d]) * window
         net_order = sorted(virtual, key=lambda d: virtual[d])
         net_pos = {d: k + 1 for k, d in enumerate(net_order)}
+        # parada "gratis": el de atrás está a más de una Ventana + 1 s de
+        # margen — parar no cuesta la posición (el último siempre califica)
+        free_set: set[str] = set()
+        for i, drv in enumerate(ordered):
+            g = gaps.get(drv)
+            if g is None:
+                continue
+            nxt = next((gaps[d] for d in ordered[i + 1:]
+                        if gaps.get(d) is not None), None)
+            if nxt is None or (nxt - g) > window + 1.0:
+                free_set.add(drv)
         self.table.setRowCount(len(ordered))
         for i, drv in enumerate(ordered):
             info = self.hub.drivers.get(drv)
             code = info.code if info else drv
+            color = info.color if info else "#9aa0a6"
             gap = gaps.get(drv)
             proj = project_rejoin(gaps, drv, window)
             net = net_pos.get(drv)
             cells = [str(i + 1), code,
                      "—" if gap is None else f"+{gap:.1f}",
                      f"P{net}" if net else "—",
-                     "—", "—", "—"]
+                     "—"]
+            ahead_g = behind_g = None
             if proj is not None:
-                new_pos, (behind_drv, margin), _ahead = proj
-                binfo = self.hub.drivers.get(behind_drv or "")
+                new_pos, (ahead_drv, m_ahead), (behind_drv, m_behind) = proj
                 cells[4] = f"P{new_pos}"
-                cells[5] = (binfo.code if binfo else (behind_drv or "—"))
-                cells[6] = "—" if margin != margin else f"+{margin:.1f}s"
+                if ahead_drv is not None and m_ahead == m_ahead:
+                    a_info = self.hub.drivers.get(ahead_drv)
+                    ahead_g = (a_info.code if a_info else ahead_drv,
+                               a_info.color if a_info else "#9aa0a6",
+                               m_ahead)
+                if behind_drv is not None and m_behind == m_behind:
+                    b_info = self.hub.drivers.get(behind_drv)
+                    behind_g = (b_info.code if b_info else behind_drv,
+                                b_info.color if b_info else "#9aa0a6",
+                                m_behind)
+            if drv in free_set:
+                cells[4] = (cells[4] + " ✓") if cells[4] != "—" else "✓"
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if c == 1 and info is not None:
@@ -378,4 +503,16 @@ class PitStrategyView(QWidget):
                         item.setForeground(QColor("#2fbf71"))
                     elif net > i + 1:
                         item.setForeground(QColor("#ff6b5e"))
+                if c == 4 and drv in free_set:
+                    item.setForeground(QColor("#2fbf71"))
+                    item.setToolTip(
+                        "FREE stop: pits and keeps track position "
+                        "(gap behind > pit window + 1 s)")
                 self.table.setItem(i, c, item)
+            # gráfico de reinserción: [adelante] ─s─ [propio] ─s─ [atrás]
+            graphic = self.table.cellWidget(i, 5)
+            if not isinstance(graphic, _RejoinGraphic):
+                graphic = _RejoinGraphic()
+                self.table.setCellWidget(i, 5, graphic)
+            graphic.set_data((code, color) if proj is not None else None,
+                             ahead_g, behind_g)

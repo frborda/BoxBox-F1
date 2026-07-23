@@ -31,7 +31,8 @@ class WeatherNowPanel(QWidget):
         self._values: dict[str, QLabel] = {}
         for col, (key, title) in enumerate(
                 (("air", "Air"), ("track", "Track"),
-                 ("wind", "Wind"), ("rain", "Rain"))):
+                 ("wind", "Wind"), ("hum", "Hum"),
+                 ("press", "Press"), ("rain", "Rain"))):
             head = QLabel(title)
             head.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-size: 8pt;")
             value = QLabel("—")
@@ -49,10 +50,19 @@ class WeatherNowPanel(QWidget):
         row = self.hub.weather_at(self.hub.latest_t)
         if row is None:
             return
-        _t, air, track, wind, rain = row
+        _t, air, track, wind, rain = row[:5]
+        # extras (humedad %, presión mbar, dirección °): NaN si la fuente
+        # no los trae — la celda queda en "—"
+        hum, press, wdir = (list(row[5:8]) + [float("nan")] * 3)[:3]
         self._values["air"].setText(f"{air:.1f}°")
         self._values["track"].setText(f"{track:.1f}°")
-        self._values["wind"].setText(f"{wind:.1f} m/s")
+        wind_txt = f"{wind:.1f} m/s"
+        if wdir == wdir:
+            wind_txt += f" · {wdir:.0f}°"
+        self._values["wind"].setText(wind_txt)
+        self._values["hum"].setText(f"{hum:.0f}%" if hum == hum else "—")
+        self._values["press"].setText(
+            f"{press:.0f} mb" if press == press else "—")
         rain_label = self._values["rain"]
         rain_label.setText("YES" if rain else "no")
         rain_label.setStyleSheet(

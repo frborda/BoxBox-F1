@@ -1,17 +1,36 @@
 """Paneles desacoplables: cualquier widget envuelto en `Detachable` gana una
 barrita de título con botones para desacoplarlo a una ventana propia (con
 marco nativo: se mueve y redimensiona libremente), fijarlo (sin marco,
-siempre encima e inamovible), ocultarlo y volver a acoplarlo donde estaba.
+siempre encima e inamovible), capturarlo en imagen (📷: clipboard + guardar),
+ocultarlo y volver a acoplarlo donde estaba.
+
+Colocación precisa para armar mosaicos sin huecos:
+- IMÁN: al mover o redimensionar cerca de otra ventana de la app (o del
+  borde de pantalla), los bordes se pegan solos (≤ 12 px).
+- Teclado sobre la ventana: flechas mueven 1 px (Shift = 10);
+  Ctrl+flechas estiran/encogen 1 px (Ctrl+Shift = 10).
 """
 from __future__ import annotations
 
+import re
+import time
+from pathlib import Path
+
 from PySide6.QtCore import QRect, Qt, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QSlider, QToolButton, QVBoxLayout,
-    QWidget,
+    QApplication, QFileDialog, QHBoxLayout, QLabel, QPushButton, QSlider,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from . import theme
+
+SNAP_PX = 12          # distancia a la que los bordes se atraen
+_SNAP_ON = [True]     # imán global (Settings del hub)
+
+
+def set_snap_enabled(on: bool) -> None:
+    _SNAP_ON[0] = bool(on)
 
 
 def _mini_btn(text: str, tip: str, checkable: bool = False) -> QToolButton:
@@ -32,16 +51,28 @@ class _FloatWindow(QWidget):
         super().__init__(None, Qt.Window)
         self.holder = holder
         self.pinned = False
+        self._snap_guard = False
         self.setObjectName("floatwin")
         self.setWindowTitle(f"BoxBox-F1 — {holder.title}")
+        self.setFocusPolicy(Qt.StrongFocus)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(4, 2, 4, 4)
         lay.setSpacing(2)
         bar = QHBoxLayout()
         title = QLabel(holder.title)
         title.setStyleSheet(f"color: {theme.TEXT_MUTED}; font-weight: bold;")
+        title.setToolTip(
+            "Precise placement: arrow keys move 1 px (Shift = 10);\n"
+            "Ctrl+arrows resize 1 px (Ctrl+Shift = 10). Windows snap\n"
+            "to each other and to screen edges when close.")
         bar.addWidget(title)
         bar.addStretch(1)
+        self.shot_btn = _mini_btn(
+            "📷", "Capture this panel: copies the image to the clipboard "
+                  "and offers to save it as PNG")
+        self.shot_btn.clicked.connect(
+            lambda _=False: holder.capture_panel(ask_save=True))
+        bar.addWidget(self.shot_btn)
         # restaurar los subpaneles internos ocultados/flotados (solo visible
         # en ventanas que los tienen, p.ej. tablas de Times/Gap o tarjetas
         # de Quali): sin esto un subpanel cerrado con ✕ era irrecuperable
@@ -106,6 +137,111 @@ class _FloatWindow(QWidget):
         event.ignore()
         self.hide()
         self.holder.stateChanged.emit()
+
+    # ------------------------------------------- imán y colocación precisa
+
+    def _snap_edges(self) -> tuple[list, list]:
+        """Bordes candidatos (xs, ys) de las otras ventanas de la app y de
+        la pantalla. Para cada eje: posiciones a las que puede pegarse el
+        borde izquierdo/derecho (o superior/inferior) propio."""
+        g = self.frameGeometry()
+        xs: list[tuple[int, int]] = []   # (x_objetivo_para_left, peso)
+        ys: list[tuple[int, int]] = []
+        for w in QApplication.topLevelWidgets():
+            if w is self or not isinstance(w, _FloatWindow) \
+                    or not w.isVisible():
+                continue
+            o = w.frameGeometry()
+            v_overlap = (g.top() <= o.bottom() + SNAP_PX
+                         and o.top() <= g.bottom() + SNAP_PX)
+            h_overlap = (g.left() <= o.right() + SNAP_PX
+                         and o.left() <= g.right() + SNAP_PX)
+            if v_overlap:
+                # adyacencia sin hueco y alineación de bordes
+                xs += [(o.x() + o.width(), 0), (o.x() - g.width(), 0),
+                       (o.x(), 1), (o.x() + o.width() - g.width(), 1)]
+            if h_overlap:
+                ys += [(o.y() + o.height(), 0), (o.y() - g.height(), 0),
+                       (o.y(), 1), (o.y() + o.height() - g.height(), 1)]
+        screen = self.screen()
+        if screen is not None:
+            a = screen.availableGeometry()
+            xs += [(a.left(), 0), (a.right() + 1 - g.width(), 0)]
+            ys += [(a.top(), 0), (a.bottom() + 1 - g.height(), 0)]
+        return xs, ys
+
+    def _apply_snap(self) -> None:
+        if (self._snap_guard or not _SNAP_ON[0] or self.pinned
+                or not self.isVisible()):
+            return
+        g = self.frameGeometry()
+        xs, ys = self._snap_edges()
+        best_dx = min((x - g.x() for x, _w in xs
+                       if abs(x - g.x()) <= SNAP_PX),
+                      key=abs, default=0)
+        best_dy = min((y - g.y() for y, _w in ys
+                       if abs(y - g.y()) <= SNAP_PX),
+                      key=abs, default=0)
+        if best_dx or best_dy:
+            self._snap_guard = True
+            self.move(self.pos().x() + best_dx, self.pos().y() + best_dy)
+            self._snap_guard = False
+
+    def moveEvent(self, event) -> None:
+        super().moveEvent(event)
+        self._apply_snap()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # al estirar, el borde derecho/inferior también se imanta (a la
+        # izquierda de otra ventana, a su borde derecho, o a la pantalla)
+        if (self._snap_guard or not _SNAP_ON[0] or self.pinned
+                or not self.isVisible()):
+            return
+        g = self.frameGeometry()
+        right, bottom = g.x() + g.width(), g.y() + g.height()
+        rights: list[int] = []
+        bottoms: list[int] = []
+        for w in QApplication.topLevelWidgets():
+            if w is self or not isinstance(w, _FloatWindow) \
+                    or not w.isVisible():
+                continue
+            o = w.frameGeometry()
+            if g.top() <= o.bottom() + SNAP_PX \
+                    and o.top() <= g.bottom() + SNAP_PX:
+                rights += [o.x(), o.x() + o.width()]
+            if g.left() <= o.right() + SNAP_PX \
+                    and o.left() <= g.right() + SNAP_PX:
+                bottoms += [o.y(), o.y() + o.height()]
+        screen = self.screen()
+        if screen is not None:
+            a = screen.availableGeometry()
+            rights.append(a.right() + 1)
+            bottoms.append(a.bottom() + 1)
+        dw = min((r - right for r in rights if abs(r - right) <= SNAP_PX),
+                 key=abs, default=0)
+        dh = min((b - bottom for b in bottoms
+                  if abs(b - bottom) <= SNAP_PX), key=abs, default=0)
+        if dw or dh:
+            self._snap_guard = True
+            self.resize(self.width() + dw, self.height() + dh)
+            self._snap_guard = False
+
+    def keyPressEvent(self, event) -> None:
+        step = 10 if event.modifiers() & Qt.ShiftModifier else 1
+        dx = {Qt.Key_Left: -step, Qt.Key_Right: step}.get(event.key(), 0)
+        dy = {Qt.Key_Up: -step, Qt.Key_Down: step}.get(event.key(), 0)
+        if not dx and not dy:
+            super().keyPressEvent(event)
+            return
+        if event.modifiers() & Qt.ControlModifier:
+            self.resize(max(120, self.width() + dx),
+                        max(80, self.height() + dy))
+        else:
+            self._snap_guard = True  # el ajuste fino no debe re-imantarse
+            self.move(self.pos().x() + dx, self.pos().y() + dy)
+            self._snap_guard = False
+        event.accept()
 
 
 class Detachable(QWidget):
@@ -278,6 +414,22 @@ class Detachable(QWidget):
             self._placeholder = box
         self._lay.addWidget(self._placeholder, stretch=1)
         self._placeholder.show()
+
+    def capture_panel(self, ask_save: bool = True):
+        """Captura el contenido del panel: SIEMPRE al portapapeles y, si
+        ask_save, ofrece guardarla como PNG (cancelar deja solo la copia)."""
+        pix = self.content.grab()
+        QApplication.clipboard().setPixmap(pix)
+        if ask_save:
+            safe = re.sub(r"[^\w\- ]", "", self.title).strip() or "panel"
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            suggested = str(Path.home() / f"BoxBox-F1 {safe} {stamp}.png")
+            path, _flt = QFileDialog.getSaveFileName(
+                self._win or self, "Save panel image (already copied to "
+                "the clipboard)", suggested, "PNG image (*.png)")
+            if path:
+                pix.save(path, "PNG")
+        return pix
 
     def close_float(self) -> None:
         """Cierra la ventana flotante al salir de la app: el contenido vuelve
