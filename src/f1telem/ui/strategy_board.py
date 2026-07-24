@@ -5,6 +5,11 @@ proyectada y las amenazas de undercut. El tooltip de cada fila muestra el
 RAZONAMIENTO COMPLETO del motor (valores medidos, estimaciones marcadas,
 alternativas descartadas), y abajo corre el log de cambios de veredicto —
 todo también persistido en strategy-log.jsonl para afinar fases futuras.
+
+Fase 2: el renglón "Measured" muestra lo aprendido de las paradas reales
+(pérdida de box, factores SC/VSC, ganancia de goma fresca) y la columna
+"Pit scan" pinta el escáner de vuelta de parada: un punto por candidata
+(ahora..+5) — verde aire, amarillo zona poblada, rojo atrapado.
 """
 from __future__ import annotations
 
@@ -33,7 +38,10 @@ _ACTION_COLORS = {
     "STAY": "",
 }
 
-_COLS = ["P", "Car", "Tyre", "Action", "Why", "Rejoin now", "Threats"]
+_COLS = ["P", "Car", "Tyre", "Action", "Why", "Pit scan", "Rejoin now",
+         "Threats"]
+_SCAN_COL = _COLS.index("Pit scan")
+_SCAN_COLORS = {"green": "#2fbf71", "yellow": "#d6be3c", "red": "#e10600"}
 
 
 class StrategyBoardView(QWidget):
@@ -53,6 +61,11 @@ class StrategyBoardView(QWidget):
         self.banner.setAlignment(Qt.AlignCenter)
         self.banner.setVisible(False)
         lay.addWidget(self.banner)
+        # fase 2: qué aprendió el motor de las paradas ya ocurridas
+        self.measures_lbl = QLabel("")
+        self.measures_lbl.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-size: 7.5pt;")
+        lay.addWidget(self.measures_lbl)
         self.table = QTableWidget(0, len(_COLS))
         self.table.setHorizontalHeaderLabels(_COLS)
         self.table.verticalHeader().setVisible(False)
@@ -60,7 +73,8 @@ class StrategyBoardView(QWidget):
         self.table.setSelectionMode(QTableWidget.NoSelection)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("QTableWidget { font-size: 8pt; }")
-        for col, width in ((0, 26), (1, 44), (2, 52), (3, 92)):
+        for col, width in ((0, 26), (1, 44), (2, 52), (3, 92),
+                           (_SCAN_COL, 92)):
             self.table.setColumnWidth(col, width)
         self.table.horizontalHeader().setStretchLastSection(True)
         lay.addWidget(self.table, stretch=3)
@@ -78,6 +92,7 @@ class StrategyBoardView(QWidget):
         self.table.setRowCount(0)
         self.log_list.clear()
         self.banner.setVisible(False)
+        self.measures_lbl.setText("")
         self._last_eval = 0.0
 
     def refresh(self) -> None:
@@ -89,6 +104,8 @@ class StrategyBoardView(QWidget):
         self.engine.pit_window = float(
             self.cfg.get("strategy", {}).get("pit_window", 20.0))
         advices = self.engine.evaluate()
+        self.measures_lbl.setText(
+            "Measured: " + self.engine.measures.summary())
         neutral = neutralization(self.hub)
         if neutral:
             factor = 0.45 if neutral == "SC" else 0.55
@@ -111,7 +128,7 @@ class StrategyBoardView(QWidget):
                     f"{stint.get('age', 0)}")
             cells = [str(adv.factors.get("pos", r + 1)),
                      info.code if info else drv, tyre, adv.action,
-                     adv.reason, adv.rejoin_txt,
+                     adv.reason, "", adv.rejoin_txt,
                      " · ".join(adv.threats) if adv.threats else "—"]
             tooltip = "\n".join(adv.trace)
             for c, text in enumerate(cells):
@@ -129,7 +146,33 @@ class StrategyBoardView(QWidget):
                     font.setBold(adv.urgency >= 1)
                     item.setFont(font)
                 self.table.setItem(r, c, item)
+            self._set_scan_cell(r, adv)
         # log de cambios (el motor lo mantiene; acá solo se refleja)
+        self._refresh_log()
+
+    def _set_scan_cell(self, r: int, adv) -> None:
+        """Tira del escáner de vuelta de parada: un punto por candidata
+        (ahora..+5) coloreado por el tráfico proyectado del rejoin."""
+        self.table.removeCellWidget(r, _SCAN_COL)
+        scan = adv.factors.get("pit_lap_scan")
+        if not scan:
+            return
+        html = " ".join(
+            f"<span style='color:{_SCAN_COLORS[e['rating']]}'>●</span>"
+            for e in scan["ratings"])
+        lbl = QLabel(html)
+        lbl.setAlignment(Qt.AlignCenter)
+        tips = ["Pit-lap scan (projected rejoin traffic):"]
+        for e in scan["ratings"]:
+            when = "now" if e["k"] == 0 else f"+{e['k']} laps"
+            who = f" — behind {e['who']}" if e["who"] else ""
+            tips.append(f"{when}: {e['rating']}{who}")
+        best = scan["best"]
+        tips.append("cleanest: " + ("now" if best == 0 else f"+{best} laps"))
+        lbl.setToolTip("\n".join(tips))
+        self.table.setCellWidget(r, _SCAN_COL, lbl)
+
+    def _refresh_log(self) -> None:
         if self.log_list.count() != len(self.engine.log):
             self.log_list.clear()
             for t, lap, code, action, reason in self.engine.log:

@@ -930,6 +930,11 @@ def test_strategy_board() -> None:
           f"estrategia: atrapado → BOX FOR AIR ({adv['4'].action})")
     check(all(a.trace and a.factors for a in adv.values()),
           "estrategia: toda decisión trae traza y factores")
+    scan = adv["1"].factors.get("pit_lap_scan")
+    check(scan is not None and scan["best"] == 0
+          and [e["rating"] for e in scan["ratings"]] == ["green"] * 6,
+          f"estrategia: escáner de vuelta de parada en verde "
+          f"({scan and [e['rating'] for e in scan['ratings']]})")
 
     # SC: la parada se abarata y el veredicto cambia al instante
     now_s = hub_s.latest_t
@@ -965,6 +970,23 @@ def test_strategy_board() -> None:
           and any("overcut" in t for t in adv["2"].threats),
           f"estrategia: adelante boxea → overcut, no cover "
           f"({adv['2'].action})")
+    # cover con el rejoin atrapado por un DOBLADO (pasada espacial): el
+    # gap del doblado dice "+1 vuelta" pero en pista está justo donde cae
+    # el rejoin — cubrir cambia la pérdida del undercut por una trampa
+    hub_s.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
+                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+    hub_s.on_batch([_S("5", 230.0 + k * 2.0, 3, 1550.0 + k * 100.0,
+                       7550.0 + k * 100.0, 180.0, 90.0, 0.0, 0.0, 6, 0)
+                    for k in range(5)])
+    hub_s.pit_lane = {"2": [[5, hub_s.latest_t - 10.0, None]]}
+    adv = eng.evaluate()
+    tr1 = " ".join(adv["1"].trace)
+    check(adv["1"].action == "WATCH" and "trap" in tr1
+          and "lapped" in tr1,
+          f"estrategia: cover atrapado por doblado → WATCH "
+          f"({adv['1'].action})")
+    check(adv["1"].factors["pit_lap_scan"]["best"] == 1,
+          "estrategia: el escáner sugiere parar a la vuelta siguiente")
     # fuera de carrera el motor no opina
     hub_s.on_session_meta({"type": "Practice", "name": "Practice 1"})
     check(eng.evaluate() == {}, "estrategia: solo opina en carrera")
@@ -979,6 +1001,56 @@ def test_strategy_board() -> None:
     check(isinstance(first.get("trace"), list)
           and isinstance(first.get("factors"), dict),
           "estrategia: el log persiste traza y factores")
+
+    # ---- fase 2: mediciones de paradas REALES (ventana, ganancia, factor)
+    from f1telem.ui.pit_strategy import STOP_NORM as _SN
+    hub_m = _DH()
+    hub_m.on_track_length(3000.0)
+    hub_m.on_session_meta({"type": "Race", "name": "Race",
+                           "meeting": "Measure GP", "year": 2099})
+    hub_m.on_tyres({"1": {1: ("HARD", 10)}, "2": {1: ("HARD", 10)},
+                    "3": {1: ("MEDIUM", 0)}})
+
+    def feed_m(drv, rows):
+        hub_m.on_batch([_S(drv, float(t), int(d // 3000.0) + 1,
+                           d % 3000.0, float(d), v, 90.0, 0.0, 0.0, 6, 0)
+                        for t, d, v in rows])
+
+    # referencias "1" y "2": 8 vueltas constantes a 50 m/s (60 s/vuelta)
+    for drv, off in (("1", 0.0), ("2", 300.0)):
+        feed_m(drv, [(t, 50.0 * t - off, 180.0)
+                     for t in range(0, 486, 2) if 50.0 * t - off >= 0.0])
+    # "3": 50 m/s hasta t=200; parada = 5 s clavado + 500 m a 25 m/s
+    # (pierde 15 s netos); sale con goma fresca a 57 s/vuelta
+    rows = [(float(t), 50.0 * t - 600.0, 180.0) for t in range(12, 201, 2)]
+    d0 = 50.0 * 200 - 600.0
+    rows += [(200.0 + k, d0, 0.0) for k in range(1, 6)]
+    rows += [(205.0 + k, d0 + 25.0 * k, 90.0) for k in range(1, 21)]
+    v2 = 3000.0 / 57.0
+    rows += [(225.0 + k * 2.0, d0 + 500.0 + v2 * k * 2.0, v2 * 3.6)
+             for k in range(1, 131)]
+    feed_m("3", rows)
+    hub_m.pit_lane = {"3": [[4, 200.0, 225.0]]}
+    eng_m = StrategyEngine(hub_m, _TA(hub_m))
+    eng_m.evaluate()
+    m = eng_m.measures
+    check(m.window is not None and abs(m.window[0] - (10.0 + _SN)) < 1.5,
+          f"estrategia: pérdida de box MEDIDA de la parada real "
+          f"({m.window})")
+    check(m.gain is not None and abs(m.gain[0] - 7.5) < 0.8,
+          f"estrategia: ganancia de goma fresca medida ({m.gain})")
+    # factor SC = pérdida bajo SC / pérdida verde (inyectada para el corte)
+    m._set_factor("sc", [m.window[0] * 0.4])
+    check(m.sc is not None and abs(m.sc[0] - 0.4) < 0.01,
+          f"estrategia: factor SC medido = neutral/verde ({m.sc})")
+    hub_m.on_track_status([(hub_m.latest_t - 5.0, hub_m.latest_t + 60.0,
+                            "4")])
+    adv_m = eng_m.evaluate()
+    tr_m = " ".join(adv_m["1"].trace)
+    check(adv_m["1"].action == "BOX NOW" and "0.40" in tr_m
+          and "measured" in tr_m,
+          f"estrategia: SC con factor MEDIDO en la traza "
+          f"({adv_m['1'].action})")
 
 
 def test_quali_tower() -> None:
@@ -2869,6 +2941,12 @@ def test_app_demo(app: QApplication) -> None:
     check(sb.table.item(0, 3) is not None
           and sb.table.item(0, 3).toolTip() != "",
           "strategy board: tooltip con el razonamiento completo")
+    check(sb.table.columnCount() == 8
+          and sb.table.horizontalHeaderItem(5).text() == "Pit scan",
+          "strategy board: columna del escáner de vuelta de parada")
+    check(sb.measures_lbl.text().startswith("Measured"),
+          f"strategy board: mediciones visibles "
+          f"({sb.measures_lbl.text()!r})")
 
     # gestor de notificaciones: los eventos del demo quedaron en el log
     kinds_logged = {k for _s, k, _c, _t in win.notifier.log}
