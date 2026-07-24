@@ -1,0 +1,128 @@
+# Carreras para BoxBox-F1-Harvest (una por linea, year:gp[:session])
+# Uso:  BoxBox-F1-Harvest.exe --list carreras.txt
+# Las fechas futuras quedan comentadas; descomentar cuando ocurran.
+# Solo carreras (R): el motor de estrategia no opina en quali/practica.
+
+# ---- 2022
+2022:Bahrain Grand Prix:R    # 2022-03-20
+2022:Saudi Arabian Grand Prix:R    # 2022-03-27
+2022:Australian Grand Prix:R    # 2022-04-10
+2022:Emilia Romagna Grand Prix:R    # 2022-04-24
+2022:Miami Grand Prix:R    # 2022-05-08
+2022:Spanish Grand Prix:R    # 2022-05-22
+2022:Monaco Grand Prix:R    # 2022-05-29
+2022:Azerbaijan Grand Prix:R    # 2022-06-12
+2022:Canadian Grand Prix:R    # 2022-06-19
+2022:British Grand Prix:R    # 2022-07-03
+2022:Austrian Grand Prix:R    # 2022-07-10
+2022:French Grand Prix:R    # 2022-07-24
+2022:Hungarian Grand Prix:R    # 2022-07-31
+2022:Belgian Grand Prix:R    # 2022-08-28
+2022:Dutch Grand Prix:R    # 2022-09-04
+2022:Italian Grand Prix:R    # 2022-09-11
+2022:Singapore Grand Prix:R    # 2022-10-02
+2022:Japanese Grand Prix:R    # 2022-10-09
+2022:United States Grand Prix:R    # 2022-10-23
+2022:Mexico City Grand Prix:R    # 2022-10-30
+2022:São Paulo Grand Prix:R    # 2022-11-13
+2022:Abu Dhabi Grand Prix:R    # 2022-11-20
+
+# ---- 2023
+2023:Bahrain Grand Prix:R    # 2023-03-05
+2023:Saudi Arabian Grand Prix:R    # 2023-03-19
+2023:Australian Grand Prix:R    # 2023-04-02
+2023:Azerbaijan Grand Prix:R    # 2023-04-30
+2023:Miami Grand Prix:R    # 2023-05-07
+2023:Monaco Grand Prix:R    # 2023-05-28
+2023:Spanish Grand Prix:R    # 2023-06-04
+2023:Canadian Grand Prix:R    # 2023-06-18
+2023:Austrian Grand Prix:R    # 2023-07-02
+2023:British Grand Prix:R    # 2023-07-09
+2023:Hungarian Grand Prix:R    # 2023-07-23
+2023:Belgian Grand Prix:R    # 2023-07-30
+2023:Dutch Grand Prix:R    # 2023-08-27
+2023:Italian Grand Prix:R    # 2023-09-03
+2023:Singapore Grand Prix:R    # 2023-09-17
+2023:Japanese Grand Prix:R    # 2023-09-24
+2023:Qatar Grand Prix:R    # 2023-10-08
+2023:United States Grand Prix:R    # 2023-10-22
+2023:Mexico City Grand Prix:R    # 2023-10-29
+2023:São Paulo Grand Prix:R    # 2023-11-05
+2023:Las Vegas Grand Prix:R    # 2023-11-18
+2023:Abu Dhabi Grand Prix:R    # 2023-11-26
+
+# ---- 2024
+2024:Bahrain Grand Prix:R    # 2024-03-02
+2024:Saudi Arabian Grand Prix:R    # 2024-03-09
+2024:Australian Grand Prix:R    # 2024-03-24
+2024:Japanese Grand Prix:R    # 2024-04-07
+2024:Chinese Grand Prix:R    # 2024-04-21
+2024:Miami Grand Prix:R    # 2024-05-05
+2024:Emilia Romagna Grand Prix:R    # 2024-05-19
+2024:Monaco Grand Prix:R    # 2024-05-26
+2024:Canadian Grand Prix:R    # 2024-06-09
+2024:Spanish Grand Prix:R    # 2024-06-23
+2024:Austrian Grand Prix:R    # 2024-06-30
+2024:British Grand Prix:R    # 2024-07-07
+2024:Hungarian Grand Prix:R    # 2024-07-21
+2024:Belgian Grand Prix:R    # 2024-07-28
+2024:Dutch Grand Prix:R    # 2024-08-25
+2024:Italian Grand Prix:R    # 2024-09-01
+2024:Azerbaijan Grand Prix:R    # 2024-09-15
+2024:Singapore Grand Prix:R    # 2024-09-22
+2024:United States Grand Prix:R    # 2024-10-20
+2024:Mexico City Grand Prix:R    # 2024-10-27
+2024:São Paulo Grand Prix:R    # 2024-11-03
+2024:Las Vegas Grand Prix:R    # 2024-11-23
+2024:Qatar Grand Prix:R    # 2024-12-01
+2024:Abu Dhabi Grand Prix:R    # 2024-12-08
+
+# ---- 2025
+2025:Australian Grand Prix:R    # 2025-03-16
+2025:Chinese Grand Prix:R    # 2025-03-23
+2025:Japanese Grand Prix:R    # 2025-04-06
+2025:Bahrain Grand Prix:R    # 2025-04-13
+2025:Saudi Arabian Grand Prix:R    # 2025-04-20
+2025:Miami Grand Prix:R    # 2025-05-04
+2025:Emilia Romagna Grand Prix:R    # 2025-05-18
+2025:Monaco Grand Prix:R    # 2025-05-25
+2025:Spanish Grand Prix:R    # 2025-06-01
+2025:Canadian Grand Prix:R    # 2025-06-15
+2025:Austrian Grand Prix:R    # 2025-06-29
+2025:British Grand Prix:R    # 2025-07-06
+2025:Belgian Grand Prix:R    # 2025-07-27
+2025:Hungarian Grand Prix:R    # 2025-08-03
+2025:Dutch Grand Prix:R    # 2025-08-31
+2025:Italian Grand Prix:R    # 2025-09-07
+2025:Azerbaijan Grand Prix:R    # 2025-09-21
+2025:Singapore Grand Prix:R    # 2025-10-05
+2025:United States Grand Prix:R    # 2025-10-19
+2025:Mexico City Grand Prix:R    # 2025-10-26
+2025:São Paulo Grand Prix:R    # 2025-11-09
+2025:Las Vegas Grand Prix:R    # 2025-11-22
+2025:Qatar Grand Prix:R    # 2025-11-30
+2025:Abu Dhabi Grand Prix:R    # 2025-12-07
+
+# ---- 2026
+2026:Australian Grand Prix:R    # 2026-03-08
+2026:Chinese Grand Prix:R    # 2026-03-15
+2026:Japanese Grand Prix:R    # 2026-03-29
+2026:Miami Grand Prix:R    # 2026-05-03
+2026:Canadian Grand Prix:R    # 2026-05-24
+2026:Monaco Grand Prix:R    # 2026-06-07
+2026:Barcelona Grand Prix:R    # 2026-06-14
+2026:Austrian Grand Prix:R    # 2026-06-28
+2026:British Grand Prix:R    # 2026-07-05
+2026:Belgian Grand Prix:R    # 2026-07-19
+# 2026:Hungarian Grand Prix:R    # futura: 2026-07-26
+# 2026:Dutch Grand Prix:R    # futura: 2026-08-23
+# 2026:Italian Grand Prix:R    # futura: 2026-09-06
+# 2026:Spanish Grand Prix:R    # futura: 2026-09-13
+# 2026:Azerbaijan Grand Prix:R    # futura: 2026-09-26
+# 2026:Singapore Grand Prix:R    # futura: 2026-10-11
+# 2026:United States Grand Prix:R    # futura: 2026-10-25
+# 2026:Mexico City Grand Prix:R    # futura: 2026-11-01
+# 2026:São Paulo Grand Prix:R    # futura: 2026-11-08
+# 2026:Las Vegas Grand Prix:R    # futura: 2026-11-21
+# 2026:Qatar Grand Prix:R    # futura: 2026-11-29
+# 2026:Abu Dhabi Grand Prix:R    # futura: 2026-12-06
