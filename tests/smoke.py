@@ -1103,6 +1103,44 @@ def test_strategy_board() -> None:
           f"estrategia: cliff en endgame se aguanta a bandera "
           f"({adv_c['1'].action})")
 
+    # ---- cosechador headless: cambios de veredicto CON desenlace
+    from f1telem.harvest import DecisionRecorder
+    hub_r = _DH()
+    hub_r.on_track_length(3000.0)
+    hub_r.on_session_meta({"type": "Race", "name": "Race",
+                           "meeting": "Harvest GP", "year": 2099})
+    hub_r.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
+                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+    eng_r = StrategyEngine(hub_r, _TA(hub_r))
+    rec_r = DecisionRecorder(hub_r, eng_r)
+    offsets_r = {"1": 0.0, "2": 150.0, "3": 1550.0, "4": 1620.0}
+    for lap in range(1, 7):
+        batch = []
+        for drv, off in offsets_r.items():
+            for k in range(30):
+                t = (lap - 1) * 60.0 + k * 2.0
+                d_abs = 50.0 * t - off
+                if d_abs < 0:
+                    continue
+                batch.append(_S(drv, t, int(d_abs // 3000.0) + 1,
+                                d_abs % 3000.0, d_abs, 180.0, 90.0,
+                                0.0, 0.0, 6, 0))
+        hub_r.on_batch(batch)
+        rec_r.evaluate()
+    rec_r.finalize()
+    check(len(rec_r.records) >= 4,
+          f"harvest: cambios de veredicto registrados "
+          f"({len(rec_r.records)})")
+    done = [r for r in rec_r.records
+            if r["outcome"]["resolved_lap"] is not None]
+    check(bool(done) and all(r["outcome"]["pos_then"] is not None
+                             and r["outcome"]["pitted_within"] is not None
+                             for r in done),
+          f"harvest: desenlaces resueltos a +3 vueltas ({len(done)})")
+    check(all(r["outcome"]["pos_final"] is not None
+              for r in rec_r.records),
+          "harvest: posición final en todos los registros")
+
 
 def test_quali_tower() -> None:
     """Torre en clasificación: tandas Q1-Q3 detectadas por banderas, best

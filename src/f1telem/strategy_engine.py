@@ -140,37 +140,41 @@ class SessionMeasures:
     Cada valor lleva su cantidad de muestras; el motor sigue usando la
     estimación de fase 1 (y lo traza) mientras no haya suficientes."""
 
-    REFRESH_S = 5.0
-
     def __init__(self, hub, analyzer):
         self.hub = hub
         self.analyzer = analyzer
         self._est = None
         self._stop_norm = 3.0
-        self._last = -1e9
-        self._n_seen = -1
+        self._seen = (-1, -1)
         self.window: tuple[float, int] | None = None
         self.sc: tuple[float, int] | None = None
         self.vsc: tuple[float, int] | None = None
         self.gain: tuple[float, int] | None = None
 
     def reset(self) -> None:
-        self._last = -1e9
-        self._n_seen = -1
+        self._seen = (-1, -1)
         self.window = self.sc = self.vsc = self.gain = None
 
     def update(self) -> None:
-        """Recalcula (throttled) solo cuando cambia la cantidad de
-        paradas cerradas: medir es barato pero no gratis."""
-        now = time.monotonic()
-        if now - self._last < self.REFRESH_S:
-            return
-        self._last = now
-        closed = sum(1 for visits in self.hub.pit_lane.values()
+        """Recalcula solo si hay una parada cerrada nueva O avanzó la
+        vuelta del líder. El conteo solo no alcanza: en replay las
+        visitas llegan TODAS al cargar la sesión — sin mirar la vuelta,
+        jamás se remediría a medida que crece la telemetría (las visitas
+        fuera del rango de datos se descartan solas al medir)."""
+        hub = self.hub
+        closed = sum(1 for visits in hub.pit_lane.values()
                      for v in visits if v[2] is not None)
-        if closed == self._n_seen:
+        lap = 0
+        for b in hub.buffers.values():
+            if b.n:
+                cur = b.current_lap()
+                if cur > lap:
+                    lap = cur
+        if (closed, lap) == self._seen:
             return
-        self._n_seen = closed
+        self._seen = (closed, lap)
+        if not closed:
+            return
         if self._est is None:
             from .ui.pit_strategy import STOP_NORM, PitWindowEstimator
             self._est = PitWindowEstimator(self.hub, self.analyzer)
