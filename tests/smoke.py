@@ -876,6 +876,91 @@ def test_preprocessing() -> None:
           "preproc: entrenamiento persistido y adoptado")
 
 
+def test_strategy_board() -> None:
+    """Motor de estrategia fase 1: escenarios sintéticos con veredictos
+    conocidos y trazabilidad completa (cada decisión guarda factores y
+    razonamiento, en memoria y en strategy-log.jsonl)."""
+    import json as _json
+
+    from f1telem import config as _cfg
+    from f1telem.hub import DataHub as _DH
+    from f1telem.models import Sample as _S
+    from f1telem.strategy_engine import StrategyEngine, neutralization
+    from f1telem.timing import TimingAnalyzer as _TA
+
+    hub_s = _DH()
+    hub_s.on_track_length(3000.0)
+    hub_s.on_session_meta({"type": "Race", "name": "Race",
+                           "meeting": "Strategy GP", "year": 2099})
+    # separaciones en pista (50 m/s → 1 s = 50 m): "2" a 3 s del líder
+    # (amenaza), "3" a 31 s (parada gratis para "2"), "4" a 1.5 s de "3"
+    # (atrapado — pasar es difícil)
+    offsets = {"1": 0.0, "2": 150.0, "3": 1550.0, "4": 1620.0}
+    hub_s.on_tyres({"1": {1: ("MEDIUM", 2)}, "2": {1: ("HARD", 8)},
+                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 2)}})
+    eng = StrategyEngine(hub_s, _TA(hub_s))
+    eng.pit_window = 20.0
+
+    def feed_lap(lap):
+        batch = []
+        for drv, off in offsets.items():
+            for k in range(30):
+                t = (lap - 1) * 60.0 + k * 2.0
+                d_abs = 50.0 * t - off
+                if d_abs < 0:
+                    continue
+                batch.append(_S(drv, t, int(d_abs // 3000.0) + 1,
+                                d_abs % 3000.0, d_abs, 180.0, 90.0, 0.0,
+                                0.0, 6, 0))
+        hub_s.on_batch(batch)
+
+    for lap in range(1, 5):
+        feed_lap(lap)
+        adv = eng.evaluate()
+
+    # pista verde: amenaza, parada gratis y búsqueda de aire
+    check(adv["1"].action == "WATCH"
+          and "undercut" in adv["1"].trace[-1],
+          f"estrategia: líder amenazado → WATCH ({adv['1'].action})")
+    check(adv["2"].action == "FREE STOP"
+          and "exceeds window" in adv["2"].trace[-1],
+          f"estrategia: hueco atrás → FREE STOP ({adv['2'].action})")
+    check(adv["4"].action == "BOX FOR AIR"
+          and "CLEAR AIR" in adv["4"].trace[-1],
+          f"estrategia: atrapado → BOX FOR AIR ({adv['4'].action})")
+    check(all(a.trace and a.factors for a in adv.values()),
+          "estrategia: toda decisión trae traza y factores")
+
+    # SC: la parada se abarata y el veredicto cambia al instante
+    now_s = hub_s.latest_t
+    hub_s.on_track_status([(now_s - 5.0, now_s + 60.0, "4")])
+    adv = eng.evaluate()
+    check(neutralization(hub_s) == "SC" and adv["1"].action == "BOX NOW"
+          and "0.45" in " ".join(adv["1"].trace)
+          and "phase-1" in " ".join(adv["1"].trace),
+          f"estrategia: SC → BOX NOW barata trazada ({adv['1'].action})")
+
+    # verde de nuevo + rival directo boxea → COVER con cuenta de respuesta
+    hub_s.on_track_status([(now_s - 5.0, now_s - 1.0, "4")])
+    hub_s.pit_lane["2"] = [[5, hub_s.latest_t - 10.0, None]]
+    adv = eng.evaluate()
+    check(adv["1"].action.startswith("COVER")
+          and "respond" in " ".join(adv["1"].trace),
+          f"estrategia: parada rival → COVER ({adv['1'].action})")
+    check(adv["2"].action == "IN PIT",
+          f"estrategia: el que paró figura IN PIT ({adv['2'].action})")
+
+    # registro: cambios logueados y persistidos con traza completa
+    check(len(eng.log) >= 4,
+          f"estrategia: log de cambios de veredicto ({len(eng.log)})")
+    log_path = _cfg.data_dir() / "strategy-log.jsonl"
+    check(log_path.exists(), "estrategia: strategy-log.jsonl escrito")
+    first = _json.loads(log_path.read_text("utf-8").splitlines()[0])
+    check(isinstance(first.get("trace"), list)
+          and isinstance(first.get("factors"), dict),
+          "estrategia: el log persiste traza y factores")
+
+
 def test_quali_tower() -> None:
     """Torre en clasificación: tandas Q1-Q3 detectadas por banderas, best
     por tanda (con reset), bloques de eliminados inviolables, drop zone y
@@ -2753,6 +2838,18 @@ def test_app_demo(app: QApplication) -> None:
     check(win.pitlane_map_view.cars == [],
           "pit map: en el demo sin visitas abiertas queda vacío")
 
+    # Strategy Board: panel abierto con una fila por auto y trazas
+    win._panels["strategy_board"].set_panel_visible(True)
+    pump(app, 0.3)
+    sb = win.strategy_board_view
+    sb._last_eval = 0.0
+    sb.refresh()
+    check(sb.table.rowCount() == win.driver_list.count(),
+          f"strategy board: fila por auto ({sb.table.rowCount()})")
+    check(sb.table.item(0, 3) is not None
+          and sb.table.item(0, 3).toolTip() != "",
+          "strategy board: tooltip con el razonamiento completo")
+
     # gestor de notificaciones: los eventos del demo quedaron en el log
     kinds_logged = {k for _s, k, _c, _t in win.notifier.log}
     check({"pit_in", "pit_out", "yellow", "sc"} <= kinds_logged,
@@ -3188,6 +3285,7 @@ def main() -> int:
     test_openf1()
     test_analysis_engine()
     test_preprocessing()
+    test_strategy_board()
     test_quali_tower()
     test_app_demo(app)
     print()

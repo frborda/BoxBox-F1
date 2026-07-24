@@ -48,6 +48,7 @@ from .qualy_view import QualyView
 from .race_control import RaceControlPanel
 from .session_strip import SessionStrip
 from .strategy import StrategyView
+from .strategy_board import StrategyBoardView
 from .timing_view import TimingView
 from .tower import TimingTower
 from .trace_chart import TraceChart
@@ -365,6 +366,7 @@ class MainWindow(QMainWindow):
         self.pitlane_view = PitlaneView(self.hub, self.cfg)
         self.pitlane_map_view = PitlaneMapView(self.hub, self.cfg)
         self.pit_strategy_view = PitStrategyView(self.hub, self.cfg)
+        self.strategy_board_view = StrategyBoardView(self.hub, self.cfg)
         self.notifier = NotificationCenter(self.hub, self.cfg, self)
         self.notifications_view = NotificationsPanel(self.notifier, self.cfg)
         self.weather_now = WeatherNowPanel(self.hub)
@@ -489,6 +491,10 @@ class MainWindow(QMainWindow):
          "(mechanics on all four wheels) and rejoin the track"),
         ("pit_strategy", "Pit strategy",
          "Pit window loss (Ventana de Box) and rejoin projections"),
+        ("strategy_board", "Strategy Board",
+         "What to do with each car RIGHT NOW: cheap-stop verdicts under "
+         "SC/VSC, cover-the-rival countdowns, free stops, box-for-clear-"
+         "air calls and undercut threats — every verdict fully traced"),
         ("race_control", "Race control",
          "Chronological log of official messages"),
         ("weather", "Weather",
@@ -520,7 +526,7 @@ class MainWindow(QMainWindow):
           "notifications")),
         ("Pits & strategy",
          ("strategy", "tyre_stints", "pitlane", "pitlane_map",
-          "pit_strategy")),
+          "pit_strategy", "strategy_board")),
         ("Conditions & analysis",
          ("weather", "weather_chart", "analysis")),
     ]
@@ -883,6 +889,7 @@ class MainWindow(QMainWindow):
             "pitlane": self.pitlane_view,
             "pitlane_map": self.pitlane_map_view,
             "pit_strategy": self.pit_strategy_view,
+            "strategy_board": self.strategy_board_view,
             "race_control": self.race_control_view,
             "weather": self.weather_now,
             "weather_chart": self.weather_chart,
@@ -1229,6 +1236,7 @@ class MainWindow(QMainWindow):
         self.dominance_view.clear_data()
         self.pitlane_view.clear_data()
         self.pitlane_map_view.clear_data()
+        self.strategy_board_view.clear_data()
         self.pit_strategy_view.clear_data()
         self.notifier.reset()
         self.notifications_view.clear_data()
@@ -1629,7 +1637,7 @@ class MainWindow(QMainWindow):
         base = self.geometry()
         wide = (pid in self._CHART_IDS or pid.startswith("an_")
                 or pid in ("strategy", "weather_chart", "timeline",
-                           "lap_compare", "data_table"))
+                           "lap_compare", "data_table", "strategy_board"))
         width = 860 if wide else (320 if pid == "drivers" else 420)
         height = (620 if wide else 520)
         if pid == "session":
@@ -1891,6 +1899,7 @@ class MainWindow(QMainWindow):
                          self.tyre_stints_view, self.micro_config_view,
                          self.dominance_view,
                          self.pitlane_view, self.pit_strategy_view,
+                         self.strategy_board_view,
                          self.weather_now, self.weather_chart,
                          self.notifications_view, self.lap_compare_view,
                          self.data_table_view,
