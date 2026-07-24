@@ -987,8 +987,12 @@ def test_strategy_board() -> None:
           and "lapped" in tr1,
           f"estrategia: cover atrapado por doblado → WATCH "
           f"({adv['1'].action})")
-    check(adv["1"].factors["pit_lap_scan"]["best"] == 1,
-          "estrategia: el escáner sugiere parar a la vuelta siguiente")
+    scan2 = adv["1"].factors["pit_lap_scan"]
+    check(scan2["ratings"][0]["rating"] == "red"
+          and scan2["ratings"][1]["rating"] == "yellow"
+          and scan2["best"] == 5,
+          f"estrategia: el escáner arrastra al doblado con su deriva "
+          f"({[e['rating'] for e in scan2['ratings']]})")
     # fuera de carrera el motor no opina
     hub_s.on_session_meta({"type": "Practice", "name": "Practice 1"})
     check(eng.evaluate() == {}, "estrategia: solo opina en carrera")

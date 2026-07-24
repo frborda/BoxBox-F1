@@ -278,12 +278,14 @@ class SessionMeasures:
                 old = self._clean_laps(drv, range(lap - 3, lap))
                 new = self._clean_laps(drv, range(lap + 2, lap + 5))
                 if len(old) >= 2 and len(new) >= 2:
-                    g = float(np.median(old) - np.median(new))
-                    if g > 0.05:
-                        gains.append(g)
+                    # también las ganancias nulas o NEGATIVAS (compuesto
+                    # más duro, pista que mejora): filtrarlas inflaría
+                    # la mediana — sesgo de selección
+                    gains.append(float(np.median(old) - np.median(new)))
         if gains:
-            self.gain = (_clamp(2.5 * float(np.median(gains)), 1.0, 8.0),
-                         len(gains))
+            med = float(np.median(gains))
+            self.gain = ((_clamp(2.5 * med, 1.0, 8.0), len(gains))
+                         if med > 0.05 else None)
 
     def _clean_laps(self, drv: str, laps) -> list[float]:
         from .ui.pit_strategy import clean_at
@@ -342,9 +344,14 @@ class StrategyEngine:
         self.measures.reset()
 
     def _gap_before(self, t_ref: float, drv: str) -> float | None:
-        """Gap al líder del auto en el último snapshot ANTERIOR a t_ref."""
+        """Gap al líder del auto en el último snapshot ANTERIOR a t_ref.
+        Con tope de antigüedad: si el board estuvo cerrado y el snapshot
+        más cercano es de hace varias vueltas, ese 'gap pre-parada' ya no
+        describe nada — mejor None (la rama que lo usa se abstiene)."""
         for t, snap in reversed(self._gap_snaps):
             if t < t_ref:
+                if t_ref - t > 2.0 * self._lap_s + 30.0:
+                    return None
                 return snap.get(drv)
         return None
 
@@ -495,7 +502,11 @@ class StrategyEngine:
 
     def _lap_trends(self, gaps: dict, lap_s: float) -> dict[str, float]:
         """s/vuelta que cada auto pierde (+) o gana (−) contra el líder,
-        medidos de los snapshots (~2 vueltas hacia atrás)."""
+        medidos de los snapshots (~2 vueltas hacia atrás). Dos venenos a
+        evitar: una PARADA en el medio hace saltar el gap ~20 s (el
+        escáner proyectaría a ese auto 'perdiendo 10 s/vuelta'), y una
+        NEUTRALIZACIÓN comprime los gaps (la tendencia sería la
+        compactación, no el ritmo) — en ambos casos, plano."""
         if len(self._gap_snaps) < 2:
             return {}
         t_now = self._gap_snaps[-1][0]
@@ -506,13 +517,42 @@ class StrategyEngine:
                 break
         if past is None or t_now - past[0] < 0.4 * lap_s:
             return {}
+        for a, b, code in self.hub.track_status:
+            if str(code) in ("4", "6", "7") and a <= t_now \
+                    and past[0] <= b:
+                return {}
         dt_laps = (t_now - past[0]) / lap_s
         out: dict[str, float] = {}
         for d, g in gaps.items():
             g0 = past[1].get(d)
-            if g is not None and g0 is not None:
-                out[d] = (g - g0) / dt_laps
+            if g is None or g0 is None:
+                continue
+            if self._pitted_between(d, past[0], t_now):
+                continue    # su gap saltó por la parada, no por ritmo
+            out[d] = (g - g0) / dt_laps
         return out
+
+    def _pitted_between(self, drv: str, t0: float, t1: float) -> bool:
+        for visit in self.hub.pit_lane.get(drv, []):
+            t_in = float(visit[1])
+            t_out = visit[2]
+            if t_in <= t1 and (t_out is None or float(t_out) >= t0):
+                return True
+        return False
+
+    def _recent_lap_time(self, drv: str) -> float:
+        buf = self.hub.buffers.get(drv)
+        if buf is None or not buf.n:
+            return float("nan")
+        return float(self.analyzer.lap_time(drv, buf.current_lap() - 1))
+
+    def _drift(self, rival: str, own_lt: float) -> float:
+        """s/vuelta que un rival más lento recula en pista respecto a
+        nosotros (piso 0.3 para no congelar la proyección)."""
+        r_lt = self._recent_lap_time(rival)
+        if r_lt == r_lt and own_lt == own_lt:
+            return max(0.3, r_lt - own_lt)
+        return 1.5
 
     def _scan_pit_laps(self, gaps: dict, trends: dict, drv: str,
                        window_now: float, traffic_now: dict | None,
@@ -521,10 +561,22 @@ class StrategyEngine:
         la tendencia medida y califica el rejoin de cada candidata —
         green (aire), yellow (zona poblada atrás), red (atrapado). k=0
         usa el tráfico ya calculado (incluye la pasada espacial); los
-        doblados no se proyectan a futuro (solo cuentan en 'now')."""
+        atrapados espaciales sin gap (doblados) se ARRASTRAN a futuro
+        con su deriva de ritmo — más lentos, reculan k×Δ por vuelta.
+        best es None si ninguna candidata está limpia (no se miente
+        'now' cuando now es rojo)."""
         own = gaps.get(drv)
         if own is None:
             return None
+        carry = []
+        if traffic_now is not None:
+            own_lt = self._recent_lap_time(drv)
+            for d, delta in traffic_now["ahead_close"]:
+                if gaps.get(d) is None:
+                    carry.append((d, delta, self._drift(d, own_lt)))
+            for d, mdelta in traffic_now["zone"]:
+                if gaps.get(d) is None:
+                    carry.append((d, -mdelta, self._drift(d, own_lt)))
         ratings = []
         for k in range(horizon + 1):
             if k == 0 and traffic_now is not None:
@@ -533,6 +585,15 @@ class StrategyEngine:
                 pg = {d: g + trends.get(d, 0.0) * k
                       for d, g in gaps.items() if g is not None}
                 traffic = self._traffic_at(pg, drv, pg[drv] + window_now)
+                for d, delta0, drift in carry:
+                    dk = delta0 - k * drift
+                    if 0.0 <= dk <= TRAFFIC_CLOSE:
+                        traffic["ahead_close"].append((d, dk))
+                    elif -TRAFFIC_SPAN <= dk < 0.0:
+                        traffic["zone"].append((d, -dk))
+                traffic["ahead_close"].sort(key=lambda e: e[1])
+                traffic["zone"].sort(key=lambda e: e[1])
+                traffic["clear"] = not traffic["ahead_close"]
             rating = ("red" if not traffic["clear"] else
                       "yellow" if traffic["zone"] else "green")
             who = (traffic["ahead_close"][0][0] if traffic["ahead_close"]
@@ -540,7 +601,7 @@ class StrategyEngine:
             ratings.append({"k": k, "rating": rating, "who": who})
         best = next((e["k"] for e in ratings if e["rating"] == "green"),
                     next((e["k"] for e in ratings
-                          if e["rating"] == "yellow"), 0))
+                          if e["rating"] == "yellow"), None))
         return {"ratings": ratings, "best": best,
                 "trend_based": bool(trends)}
 
@@ -564,17 +625,21 @@ class StrategyEngine:
             else:
                 self._stuck_count[drv] = 0
 
-    def _recent_rival_pit(self, drv: str, gaps: dict) -> tuple | None:
+    def _recent_rival_pit(self, drv: str, gaps: dict,
+                          u_range: float) -> tuple | None:
         """Rival que ENTRÓ a boxes hace menos de COVER_WINDOW_S estando en
-        rango de undercut. Usa el gap PRE-parada (snapshot anterior a su
+        rango de undercut (u_range: la ganancia de goma fresca VIGENTE,
+        medida si la hay). Usa el gap PRE-parada (snapshot anterior a su
         entrada: el gap actual de un auto en boxes ya está inflado por la
-        parada en curso). Devuelve (rival, hace_s, gap_pre, was_behind):
-        solo el rival que venía DETRÁS te undercutea; el de adelante que
-        para te abre la ventana de overcut, no un cover."""
+        parada en curso). Devuelve (rival, hace_s, gap_pre, was_behind).
+        Con varias paradas simultáneas (doble stack) manda el rival más
+        CERCANO pre-parada, priorizando al que venía detrás — solo ése
+        te undercutea; el de adelante abre overcut, no cover."""
         g_own = gaps.get(drv)
         if g_own is None:
             return None
         now = self.hub.latest_t
+        best = None
         for rival, visits in self.hub.pit_lane.items():
             if rival == drv:
                 continue
@@ -587,9 +652,12 @@ class StrategyEngine:
                 if g_pre is None or g_own_pre is None:
                     continue
                 delta_pre = g_pre - g_own_pre  # + = el rival venía detrás
-                if abs(delta_pre) <= UNDERCUT_RANGE + 2.0:
-                    return rival, now - t_in, abs(delta_pre), delta_pre > 0
-        return None
+                if abs(delta_pre) <= u_range + 2.0:
+                    key = (0 if delta_pre > 0 else 1, abs(delta_pre))
+                    if best is None or key < best[0]:
+                        best = (key, (rival, now - t_in, abs(delta_pre),
+                                      delta_pre > 0))
+        return best[1] if best is not None else None
 
     # ------------------------------------------------------------ veredicto
 
@@ -705,9 +773,12 @@ class StrategyEngine:
                     factors["pit_lap_scan"] = scan
                     dots = " ".join(e["rating"][0].upper()
                                     for e in scan["ratings"])
-                    best_txt = ("now" if scan["best"] == 0
+                    best_txt = ("none in +5" if scan["best"] is None
+                                else "now" if scan["best"] == 0
                                 else f"+{scan['best']} laps")
-                    scan_txt = f" (scan: cleanest pit lap {best_txt})"
+                    scan_txt = (" (scan: no clean pit lap in the next 5)"
+                                if scan["best"] is None else
+                                f" (scan: cleanest pit lap {best_txt})")
                     trace.append(
                         "pit-lap scan now..+5 (gap trends "
                         + ("measured" if scan["trend_based"] else "flat")
@@ -773,7 +844,7 @@ class StrategyEngine:
             action, reason, urgency = "STAY", "no pressure", 0
             visit = hub.last_pit_visit(drv)
             in_pit = visit is not None and hub.pit_visit_open(visit)
-            cover = self._recent_rival_pit(drv, gaps)
+            cover = self._recent_rival_pit(drv, gaps, u_range)
             stuck = self._stuck_count.get(drv, 0)
 
             if in_pit:
@@ -783,9 +854,11 @@ class StrategyEngine:
                 eff_pos = proj[0]
                 if neutral == "SC":
                     # la fila se compacta: los gaps muestreados son
-                    # optimistas — lo que importa es quién NO va a parar
+                    # optimistas — lo que importa es quién NO va a parar.
+                    # Solo autos EN VUELTA: un doblado no te quita posición
                     stay_out = [r for r in ordered[i + 1:]
-                                if self._likely_stays_out(r, stints)]
+                                if gaps.get(r) is not None
+                                and self._likely_stays_out(r, stints)]
                     pack_lost = min(len(stay_out),
                                     int(window_now / PACK_SPACING))
                     eff_pos = i + 1 + pack_lost
@@ -945,7 +1018,19 @@ class StrategyEngine:
                     "free pace beats the nominal position")
             elif stint["cliff"] or (stint["life"] is not None
                                     and stint["life"] <= 2):
-                if stint["cliff"]:
+                if stuck >= 2:
+                    # vueltas lentas por ir en un tren ≠ goma muerta:
+                    # verificar en aire antes de quemar la parada
+                    action, reason = "WATCH", (
+                        "deg signal masked by traffic — verify pace")
+                    urgency = 1
+                    trace.append(
+                        "decision: WATCH — lap times are collapsing BUT "
+                        f"the car has been stuck {stuck} laps in "
+                        "traffic: the rise may be the train, not the "
+                        "tyre; verify in clear air before burning the "
+                        "stop" + scan_txt)
+                elif stint["cliff"]:
                     action, reason = "BOX SOON", (
                         f"tyre cliff: +{stint['marginal']:.1f}s/lap and "
                         "worsening")
@@ -966,7 +1051,7 @@ class StrategyEngine:
                         f"{STINT_LIFE_DROP}s/lap")
             elif flag_delta is not None and flag_delta > FLAG_NET_MIN \
                     and laps_left is not None \
-                    and laps_left <= LAST_CALL_LAPS \
+                    and ENDGAME_LAPS < laps_left <= LAST_CALL_LAPS \
                     and traffic is not None and traffic["clear"]:
                 action, reason = "BOX SOON", (
                     f"last call — a stop still nets ~{flag_delta:.0f}s "

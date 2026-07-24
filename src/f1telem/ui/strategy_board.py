@@ -171,7 +171,9 @@ class StrategyBoardView(QWidget):
             who = f" — behind {e['who']}" if e["who"] else ""
             tips.append(f"{when}: {e['rating']}{who}")
         best = scan["best"]
-        tips.append("cleanest: " + ("now" if best == 0 else f"+{best} laps"))
+        tips.append("cleanest: " + ("none in +5" if best is None
+                                    else "now" if best == 0
+                                    else f"+{best} laps"))
         lbl.setToolTip("\n".join(tips))
         self.table.setCellWidget(r, _SCAN_COL, lbl)
 
