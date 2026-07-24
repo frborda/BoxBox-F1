@@ -61,8 +61,12 @@ import numpy as np
 from . import config
 
 # --- constantes de fase 1 (cada uso queda trazado) ---
-VSC_FACTOR = 0.55        # la ventana de box se paga a este factor bajo VSC
-SC_FACTOR = 0.45         # ídem bajo safety car
+# Factores SC/VSC RECALIBRADOS con el backtest de 26 carreras 2022-2026:
+# mediana medida 0.81 bajo SC (145 paradas) y 0.79 bajo VSC (69). El
+# 0.45/0.55 teórico casi nunca ocurre: se para al INICIO del SC, antes
+# de que la fila comprima, y el pit lane se congestiona.
+VSC_FACTOR = 0.80        # la ventana de box se paga a este factor bajo VSC
+SC_FACTOR = 0.80         # ídem bajo safety car
 # rango REAL de amenaza: la ganancia acumulada de goma fresca (~2-3
 # vueltas); la ventana NO entra — ambos autos la pagan al parar
 UNDERCUT_RANGE = 4.0
@@ -81,6 +85,10 @@ CLIFF_MARGINAL = 0.35    # s/vuelta perdidos AHORA para declarar cliff
 FLAG_NET_MIN = 5.0       # s netos mínimos para el last-call a bandera
 LAST_CALL_LAPS = 10      # vueltas finales donde aplica el last-call
 COVER_WINDOW_S = 90.0    # s tras la parada rival en que se puede responder
+# histéresis anti-oscilación: el backtest midió 56% de cambios A→B→A en
+# <5 min — un veredicto nuevo de baja urgencia debe sostenerse este
+# tiempo antes de reemplazar al vigente (urgencia 2 e IN PIT no esperan)
+DEBOUNCE_S = 10.0
 LOG_MAX_BYTES = 2_000_000
 
 
@@ -295,11 +303,22 @@ class SessionMeasures:
                 vals.append(dur)
         return float(np.median(vals)) if vals else None
 
+    def _raining_near(self, t: float) -> bool:
+        for row in self.hub.weather:
+            if abs(float(row[0]) - t) <= 300.0 and bool(row[4]):
+                return True
+        return False
+
     def _measure_gain(self) -> None:
         gains: list[float] = []
         for drv, visits in self.hub.pit_lane.items():
-            for lap, _t_in, t_out in visits:
+            for lap, t_in, t_out in visits:
                 if t_out is None:
+                    continue
+                if self._raining_near(float(t_in)):
+                    # pista mojada/secándose: la evolución del agarre se
+                    # disfraza de "ganancia de goma" (Imola/Suzuka 2022
+                    # clavaban el clamp de 8 s) — no medir esa parada
                     continue
                 lap = int(lap)
                 old = self._clean_laps(drv, range(lap - 3, lap))
@@ -359,6 +378,9 @@ class StrategyEngine:
         self._gap_snaps: deque = deque(maxlen=180)  # (t, {drv: gap})
         self.measures = SessionMeasures(hub, analyzer)
         self._lap_s = 90.0   # vuelta del líder (pasada espacial y trends)
+        # histéresis: último veredicto publicado y candidato en espera
+        self._published: dict[str, tuple] = {}
+        self._candidate: dict[str, tuple] = {}   # drv -> (action, desde_t)
         self._log_path = None
 
     def reset(self) -> None:
@@ -368,6 +390,8 @@ class StrategyEngine:
         self._stuck_count.clear()
         self._stuck_lap_seen.clear()
         self._gap_snaps.clear()
+        self._published.clear()
+        self._candidate.clear()
         self.measures.reset()
 
     def _gap_before(self, t_ref: float, drv: str) -> float | None:
@@ -1152,6 +1176,31 @@ class StrategyEngine:
                     + (f"{gap_behind:.1f}s" if gap_behind is not None
                        else "n/a")
                     + " inside window, tyres alive, not trapped")
+
+            # histéresis: un veredicto nuevo de baja urgencia debe
+            # sostenerse DEBOUNCE_S antes de publicarse (el backtest de
+            # 26 carreras midió 56% de oscilaciones A→B→A). Urgencia 2,
+            # IN PIT y salir de IN PIT no esperan: son hechos o urgentes.
+            pub = self._published.get(drv)
+            if pub is not None and action != pub[0] and urgency < 2 \
+                    and action != "IN PIT" and pub[0] != "IN PIT":
+                cand = self._candidate.get(drv)
+                if cand is None or cand[0] != action:
+                    cand = (action, hub.latest_t)
+                    self._candidate[drv] = cand
+                if hub.latest_t - cand[1] < DEBOUNCE_S:
+                    trace.append(
+                        f"debounce: computed '{action}' but holding "
+                        f"'{pub[0]}' until the new verdict persists "
+                        f"{DEBOUNCE_S:.0f}s (anti flip-flop, measured "
+                        "56% A-B-A churn)")
+                    action, reason, urgency = pub
+                else:
+                    self._published[drv] = (action, reason, urgency)
+                    self._candidate.pop(drv, None)
+            else:
+                self._published[drv] = (action, reason, urgency)
+                self._candidate.pop(drv, None)
 
             advices[drv] = Advice(
                 drv=drv, action=action, reason=reason, urgency=urgency,

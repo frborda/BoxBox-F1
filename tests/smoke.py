@@ -941,7 +941,7 @@ def test_strategy_board() -> None:
     hub_s.on_track_status([(now_s - 5.0, now_s + 60.0, "4")])
     adv = eng.evaluate()
     check(neutralization(hub_s) == "SC" and adv["1"].action == "BOX NOW"
-          and "0.45" in " ".join(adv["1"].trace)
+          and "0.80" in " ".join(adv["1"].trace)
           and "phase-1" in " ".join(adv["1"].trace),
           f"estrategia: SC → BOX NOW barata trazada ({adv['1'].action})")
     check("pack projection" in " ".join(adv["1"].trace),
@@ -961,6 +961,14 @@ def test_strategy_board() -> None:
     cur_l = hub_s.buffers["1"].current_lap()
     hub_s.on_tyres({"1": {cur_l: ("SOFT", 0)}, "2": {1: ("HARD", 8)},
                     "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+    # histéresis: STAY (urgencia 0) no reemplaza a COVER hasta
+    # sostenerse DEBOUNCE_S — se expira el reloj y se re-evalúa
+    adv = eng.evaluate()
+    check(adv["1"].action.startswith("COVER")
+          and any("debounce" in t for t in adv["1"].trace),
+          f"estrategia: histéresis retiene el veredicto "
+          f"({adv['1'].action})")
+    eng._candidate["1"] = ("STAY", hub_s.latest_t - 11.0)
     adv = eng.evaluate()
     check(adv["1"].action == "STAY"
           and "absorbed" in " ".join(adv["1"].trace),
@@ -981,6 +989,8 @@ def test_strategy_board() -> None:
                        7550.0 + k * 100.0, 180.0, 90.0, 0.0, 0.0, 6, 0)
                     for k in range(5)])
     hub_s.pit_lane = {"2": [[5, hub_s.latest_t - 10.0, None]]}
+    eng.evaluate()      # histéresis: WATCH queda como candidato
+    eng._candidate["1"] = ("WATCH", hub_s.latest_t - 11.0)
     adv = eng.evaluate()
     tr1 = " ".join(adv["1"].trace)
     check(adv["1"].action == "WATCH" and "trap" in tr1
@@ -1098,6 +1108,8 @@ def test_strategy_board() -> None:
     # coherencia entre fases: en el ENDGAME ninguna rama pide parada
     # voluntaria — el cliff se aguanta hasta la bandera
     hub_c.on_lap_count((11, 13))
+    eng_c.evaluate()    # histéresis: WATCH queda como candidato
+    eng_c._candidate["1"] = ("WATCH", hub_c.latest_t - 11.0)
     adv_c = eng_c.evaluate()
     check(adv_c["1"].action == "WATCH",
           f"estrategia: cliff en endgame se aguanta a bandera "
