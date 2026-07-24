@@ -33,6 +33,19 @@ cap = Analysis(
 )
 pyz_cap = PYZ(cap.pure)
 
+# cosechador de estrategia: herramienta de CONSOLA que comparte el
+# _internal de la app (COLLECT deduplica sus binarios/datos)
+harv = Analysis(
+    ["src\\launch_harvest.py"],
+    pathex=["src"],
+    binaries=binaries,
+    datas=datas,
+    hiddenimports=hiddenimports,
+    excludes=["tkinter", "IPython", "jedi"],
+    noarchive=False,
+)
+pyz_harv = PYZ(harv.pure)
+
 exe = EXE(
     pyz,
     a.scripts,
@@ -49,13 +62,24 @@ exe_cap = EXE(
     debug=False,
     console=False,
 )
+exe_harv = EXE(
+    pyz_harv,
+    harv.scripts,
+    exclude_binaries=True,
+    name="BoxBox-F1-Harvest",
+    debug=False,
+    console=True,
+)
 # Carpetas _internal independientes: CPython mapea sus DLLs sin compartir
 # borrado, así que la carpeta del capturador no puede tocarse mientras corre.
 # Separarlas permite actualizar la app principal sin frenar la captura.
 coll = COLLECT(
     exe,
+    exe_harv,
     a.binaries,
     a.datas,
+    harv.binaries,
+    harv.datas,
     name="BoxBox-F1",
 )
 # COLLECT usa solo el basename como carpeta bajo dist: queda como hermano
