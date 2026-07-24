@@ -944,6 +944,8 @@ def test_strategy_board() -> None:
           and "0.45" in " ".join(adv["1"].trace)
           and "phase-1" in " ".join(adv["1"].trace),
           f"estrategia: SC → BOX NOW barata trazada ({adv['1'].action})")
+    check("pack projection" in " ".join(adv["1"].trace),
+          "estrategia: compactación bajo SC proyectada y trazada")
 
     # verde de nuevo + rival directo boxea → COVER con cuenta de respuesta
     hub_s.on_track_status([(now_s - 5.0, now_s - 1.0, "4")])
@@ -1051,6 +1053,44 @@ def test_strategy_board() -> None:
           and "measured" in tr_m,
           f"estrategia: SC con factor MEDIDO en la traza "
           f"({adv_m['1'].action})")
+
+    # ---- fase 3: cliff de goma, ventana de ataque y proyección a bandera
+    hub_c = _DH()
+    hub_c.on_track_length(3000.0)
+    hub_c.on_session_meta({"type": "Race", "name": "Race",
+                           "meeting": "Cliff GP", "year": 2099})
+    hub_c.on_tyres({"1": {1: ("SOFT", 0)}, "2": {1: ("SOFT", 0)}})
+
+    def feed_laps_c(drv, t0, times):
+        rows = []
+        t, d = float(t0), 0.0
+        for T in times:
+            for k in range(30):
+                rows.append((t + T * k / 30.0, d + 3000.0 * k / 30.0,
+                             3000.0 / T * 3.6))
+            t += T
+            d += 3000.0
+        for k in range(8 if drv == "1" else 4):
+            rows.append((t + k * 1.0, d + 45.0 * k, 162.0))
+        hub_c.on_batch([_S(drv, float(tt), int(dd // 3000.0) + 1,
+                           dd % 3000.0, float(dd), v, 90.0, 0.0, 0.0,
+                           6, 0) for tt, dd, v in rows])
+
+    # "1": la degradación ACELERA (cliff); "2" ritmo parejo, ~1.5 s atrás
+    feed_laps_c("1", 0.0, [60.0, 60.0, 60.1, 60.2, 60.4, 60.7, 61.1,
+                           61.6, 62.3, 63.1])
+    feed_laps_c("2", 1.0, [61.0] * 10)
+    hub_c.on_lap_count((11, 14))
+    eng_c = StrategyEngine(hub_c, _TA(hub_c))
+    adv_c = eng_c.evaluate()
+    tr_c = " ".join(adv_c["1"].trace)
+    check(adv_c["1"].action == "BOX SOON" and "cliff" in tr_c.lower(),
+          f"estrategia: cliff de goma detectado → BOX SOON "
+          f"({adv_c['1'].action})")
+    check("flag projection" in tr_c and "net" in tr_c,
+          "estrategia: proyección a bandera trazada")
+    check(any("attack window" in t for t in adv_c["2"].threats),
+          "estrategia: rival adelante en el cliff → ventana de ataque")
 
 
 def test_quali_tower() -> None:

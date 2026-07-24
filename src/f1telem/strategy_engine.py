@@ -27,6 +27,19 @@ Fase 2 — medir lo que la fase 1 estimaba, y decidir con eso:
 - Escáner de vuelta de parada (ahora..+5, gaps proyectados con la
   tendencia medida): green/yellow/red por vuelta candidata.
 - COVER pondera la trampa del propio rejoin antes de pedir respuesta.
+
+Fase 3 — proyectar hacia adelante:
+- Compactación bajo SC: la proyección de rejoin ya no usa los gaps
+  muestreados (optimistas mientras la fila se forma) sino quién es
+  probable que se quede afuera (goma fresca / parada reciente) y te
+  salte a ~1.2 s/auto de fila india; si todos boxean con vos, parar no
+  cuesta orden relativo.
+- Detector de CLIFF: ajuste cuadrático del stint — si la degradación
+  acelera y ya cuesta caro por vuelta, BOX SOON urgente; el auto de
+  atrás del que sufre el cliff recibe la ventana de ataque.
+- Proyección a bandera: quedarse = deg × vueltas restantes × edad vs
+  costo de la parada; si el neto favorece parar y quedan pocas vueltas,
+  last call — cada vuelta esperada erosiona el neto.
 """
 from __future__ import annotations
 
@@ -56,6 +69,11 @@ STUCK_GAP = 1.5          # s: pegado al de adelante = tráfico
 STUCK_LAPS = 3           # vueltas seguidas pegado para declararlo atrapado
 FRESH_ABSORB = 5         # vueltas de ventaja de goma para absorber undercut
 STINT_LIFE_DROP = 1.2    # s/vuelta perdidos que marcan el fin útil del stint
+PACK_SPACING = 1.2       # s/auto en la fila india detrás del SC
+CLIFF_CURV = 0.015       # s/vuelta²: aceleración de deg que declara cliff
+CLIFF_MARGINAL = 0.35    # s/vuelta perdidos AHORA para declarar cliff
+FLAG_NET_MIN = 5.0       # s netos mínimos para el last-call a bandera
+LAST_CALL_LAPS = 10      # vueltas finales donde aplica el last-call
 COVER_WINDOW_S = 90.0    # s tras la parada rival en que se puede responder
 LOG_MAX_BYTES = 2_000_000
 
@@ -339,7 +357,8 @@ class StrategyEngine:
         hub = self.hub
         an = self.analyzer
         out = {"compound": "", "age": 0, "slope": float("nan"),
-               "life": None, "laps_used": 0}
+               "life": None, "laps_used": 0, "cliff": False,
+               "curv": float("nan"), "marginal": float("nan")}
         buf = hub.buffers.get(drv)
         if buf is None or not buf.n:
             return out
@@ -369,7 +388,29 @@ class StrategyEngine:
                 lost_now = slope * out["age"]
                 out["life"] = max(0, int((STINT_LIFE_DROP - lost_now)
                                          / slope))
+        if len(xs) >= 6:
+            # cliff: la degradación ACELERA (curvatura positiva) y ya
+            # cuesta caro por vuelta — la recta del slope no lo ve venir
+            a, b, _c = np.polyfit(xs, ys, 2)
+            out["curv"] = float(a)
+            out["marginal"] = float(2.0 * a * xs[-1] + b)
+            if out["curv"] > CLIFF_CURV \
+                    and out["marginal"] >= CLIFF_MARGINAL:
+                out["cliff"] = True
         return out
+
+    def _likely_stays_out(self, drv: str, stints: dict) -> bool:
+        """Bajo SC casi todos boxean; se queda afuera el que no gana nada
+        parando: goma fresca o parada recién hecha."""
+        st = stints.get(drv, {})
+        if st.get("age", 99) < FRESH_AGE_MIN:
+            return True
+        visit = self.hub.last_pit_visit(drv)
+        if visit is not None:
+            t_ref = visit[2] if visit[2] is not None else visit[1]
+            if self.hub.latest_t - float(t_ref) <= 90.0:
+                return True
+        return False
 
     def _traffic_at(self, gaps: dict, drv: str, gap_after: float,
                     window_now: float | None = None,
@@ -596,6 +637,7 @@ class StrategyEngine:
         self._lap_s = self._leader_lap_s(ordered[0])
         trends = self._lap_trends(gaps, self._lap_s)
         self._update_stuck(ordered, gaps)
+        stints = {d: self._stint(d) for d in ordered}
         leader_buf = hub.buffers.get(ordered[0])
         lap_now = (leader_buf.current_lap()
                    if leader_buf is not None and leader_buf.n else 0)
@@ -611,7 +653,7 @@ class StrategyEngine:
                              "measures": {"window": meas.window,
                                           "sc": meas.sc, "vsc": meas.vsc,
                                           "gain": meas.gain}}
-            stint = self._stint(drv)
+            stint = stints[drv]
             factors["stint"] = dict(stint)
             trace.append(
                 f"tyre {stint['compound'] or '?'} age {stint['age']} · "
@@ -619,6 +661,10 @@ class StrategyEngine:
                 if stint["slope"] == stint["slope"] else
                 f"tyre {stint['compound'] or '?'} age {stint['age']} · "
                 "deg: not enough clean laps yet")
+            if stint["cliff"]:
+                trace.append(
+                    f"tyre CLIFF onset: +{stint['marginal']:.2f}s/lap "
+                    f"now and accelerating ({stint['curv']:+.3f}s/lap²)")
             trace.append(f"session measures: {meas.summary()} · "
                          f"window in use {window:.1f}s ({w_src})")
 
@@ -667,6 +713,29 @@ class StrategyEngine:
                         + ("measured" if scan["trend_based"] else "flat")
                         + f"): [{dots}] → cleanest {best_txt}")
 
+            # proyección a bandera: quedarse corre cada vuelta restante
+            # con una goma `age` vueltas más vieja que la del plan de
+            # parar — la diferencia por vuelta es deg × edad actual
+            flag_delta = None
+            if laps_left is not None and laps_left > 0 \
+                    and stint["slope"] == stint["slope"] \
+                    and stint["slope"] > 0.02 and stint["age"] > 0:
+                lost = stint["slope"] * laps_left * stint["age"]
+                flag_delta = lost - window_now
+                factors["flag_proj"] = {
+                    "laps_left": laps_left,
+                    "slope": round(stint["slope"], 3),
+                    "age": stint["age"],
+                    "stay_loss": round(lost, 1),
+                    "stop_cost": round(window_now, 1),
+                    "net": round(flag_delta, 1)}
+                trace.append(
+                    f"flag projection: staying {laps_left} laps on "
+                    f"tyres {stint['age']} laps old at "
+                    f"{stint['slope']:+.3f}s/lap deg ≈ {lost:.1f}s lost "
+                    f"vs stop cost {window_now:.1f}s → net "
+                    f"{flag_delta:+.1f}s for pitting now")
+
             threats: list[str] = []
             nxt = ordered[i + 1] if i + 1 < len(ordered) else None
             gap_behind = None
@@ -686,6 +755,19 @@ class StrategyEngine:
                         f"(fresh-tyre gain ~{u_range:.1f}s over 2-3 laps "
                         f"[{u_src}]; the window cancels out — both cars "
                         "pay it)")
+            if i > 0 and gaps.get(drv) is not None:
+                prev = ordered[i - 1]
+                p_st = stints.get(prev, {})
+                if p_st.get("cliff") and gaps.get(prev) is not None \
+                        and (gaps[drv] - gaps[prev]) <= 5.0:
+                    threats.append(
+                        f"{prev} ahead on the tyre cliff "
+                        f"(+{p_st['marginal']:.1f}s/lap) — attack window")
+                    trace.append(
+                        f"opportunity: {prev} directly ahead is on the "
+                        f"cliff (+{p_st['marginal']:.2f}s/lap, "
+                        "worsening): stay close — the position may come "
+                        "free without pitting")
 
             # ---- decisión por prioridad (cada rama descarta las demás) ----
             action, reason, urgency = "STAY", "no pressure", 0
@@ -698,7 +780,34 @@ class StrategyEngine:
                 action, reason = "IN PIT", "stop in progress"
                 trace.append("decision: IN PIT (visit open)")
             elif neutral is not None and proj is not None:
-                saved = (proj_norm[0] - proj[0]) if proj_norm else 0
+                eff_pos = proj[0]
+                if neutral == "SC":
+                    # la fila se compacta: los gaps muestreados son
+                    # optimistas — lo que importa es quién NO va a parar
+                    stay_out = [r for r in ordered[i + 1:]
+                                if self._likely_stays_out(r, stints)]
+                    pack_lost = min(len(stay_out),
+                                    int(window_now / PACK_SPACING))
+                    eff_pos = i + 1 + pack_lost
+                    factors["sc_pack"] = {"stay_out_behind": stay_out,
+                                          "pack_pos": eff_pos,
+                                          "spacing_s": PACK_SPACING}
+                    if stay_out:
+                        trace.append(
+                            "SC pack projection: the queue bunches to "
+                            f"~{PACK_SPACING}s/car; rivals behind likely "
+                            "to STAY OUT (" + ", ".join(stay_out)
+                            + ") close up and jump you while you pit → "
+                            f"rejoin ~P{eff_pos} (sampled gaps said "
+                            f"P{proj[0]} — optimistic while the field "
+                            "packs)")
+                    else:
+                        trace.append(
+                            "SC pack projection: every rival behind is "
+                            "likely to pit too (worn tyres, no recent "
+                            "stop) — packing costs nothing, relative "
+                            f"order holds (~P{eff_pos})")
+                saved = (proj_norm[0] - eff_pos) if proj_norm else 0
                 factors["positions_saved_by_neutral"] = saved
                 if stint["age"] < FRESH_AGE_MIN:
                     action, reason = "STAY", (
@@ -730,11 +839,11 @@ class StrategyEngine:
                     trace.append(
                         f"decision: BOX NOW — {neutral} pays the window "
                         f"at ×{cheap:.2f} [{f_src} factor]: "
-                        f"P{i + 1} → P{proj[0]} vs P"
+                        f"P{i + 1} → P{eff_pos} vs P"
                         f"{proj_norm[0] if proj_norm else '?'} at green; "
-                        f"saves {saved} position(s). Gaps are the ones "
-                        "sampled now — SC bunching keeps shrinking them "
-                        "[phase-3: re-project as the field packs]")
+                        f"saves {saved} position(s)"
+                        + (" (pack-projected)" if neutral == "SC"
+                           else "") + scan_txt)
             elif cover is not None:
                 rival, ago, pre, was_behind = cover
                 r_info = self.hub.drivers.get(rival)
@@ -834,15 +943,40 @@ class StrategyEngine:
                     f"{STUCK_GAP}s (passing is hard); boxing rejoins "
                     f"P{proj[0]} (max loss {AIR_MAX_LOSS}) in CLEAR AIR: "
                     "free pace beats the nominal position")
-            elif stint["life"] is not None and stint["life"] <= 2:
+            elif stint["cliff"] or (stint["life"] is not None
+                                    and stint["life"] <= 2):
+                if stint["cliff"]:
+                    action, reason = "BOX SOON", (
+                        f"tyre cliff: +{stint['marginal']:.1f}s/lap and "
+                        "worsening")
+                    urgency = 2
+                    trace.append(
+                        "decision: BOX SOON — cliff detected: lap times "
+                        f"accelerating ({stint['curv']:+.3f}s/lap², now "
+                        f"+{stint['marginal']:.2f}s/lap): the stint is "
+                        "over whatever the plan was" + scan_txt)
+                else:
+                    action, reason = "BOX SOON", (
+                        f"stint life ~{stint['life']} laps")
+                    urgency = 1
+                    trace.append(
+                        f"decision: BOX SOON — measured deg "
+                        f"{stint['slope']:+.3f} s/lap projects "
+                        f"{stint['life']} laps before losing "
+                        f"{STINT_LIFE_DROP}s/lap")
+            elif flag_delta is not None and flag_delta > FLAG_NET_MIN \
+                    and laps_left is not None \
+                    and laps_left <= LAST_CALL_LAPS \
+                    and traffic is not None and traffic["clear"]:
                 action, reason = "BOX SOON", (
-                    f"stint life ~{stint['life']} laps")
+                    f"last call — a stop still nets ~{flag_delta:.0f}s "
+                    "by the flag")
                 urgency = 1
                 trace.append(
-                    f"decision: BOX SOON — measured deg "
-                    f"{stint['slope']:+.3f} s/lap projects "
-                    f"{stint['life']} laps before losing "
-                    f"{STINT_LIFE_DROP}s/lap")
+                    "decision: BOX SOON — flag projection favours "
+                    f"pitting (+{flag_delta:.1f}s net) and only "
+                    f"{laps_left} laps remain: every lap waited erodes "
+                    "the net; rejoin is clear" + scan_txt)
             elif threats:
                 action, reason = "WATCH", threats[0]
                 urgency = 1

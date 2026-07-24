@@ -108,7 +108,10 @@ class StrategyBoardView(QWidget):
             "Measured: " + self.engine.measures.summary())
         neutral = neutralization(self.hub)
         if neutral:
-            factor = 0.45 if neutral == "SC" else 0.55
+            m = self.engine.measures
+            factor = (m.sc[0] if neutral == "SC" and m.sc else
+                      m.vsc[0] if neutral == "VSC" and m.vsc else
+                      0.45 if neutral == "SC" else 0.55)
             self.banner.setText(
                 f"{neutral} — CHEAP STOP WINDOW (pit loss ×{factor:.2f})")
             self.banner.setStyleSheet(
