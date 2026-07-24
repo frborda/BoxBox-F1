@@ -896,8 +896,8 @@ def test_strategy_board() -> None:
     # (amenaza), "3" a 31 s (parada gratis para "2"), "4" a 1.5 s de "3"
     # (atrapado — pasar es difícil)
     offsets = {"1": 0.0, "2": 150.0, "3": 1550.0, "4": 1620.0}
-    hub_s.on_tyres({"1": {1: ("MEDIUM", 2)}, "2": {1: ("HARD", 8)},
-                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 2)}})
+    hub_s.on_tyres({"1": {1: ("MEDIUM", 4)}, "2": {1: ("HARD", 8)},
+                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
     eng = StrategyEngine(hub_s, _TA(hub_s))
     eng.pit_window = 20.0
 
@@ -949,6 +949,26 @@ def test_strategy_board() -> None:
           f"estrategia: parada rival → COVER ({adv['1'].action})")
     check(adv["2"].action == "IN PIT",
           f"estrategia: el que paró figura IN PIT ({adv['2'].action})")
+
+    # goma fresca ABSORBE el undercut: sin respuesta necesaria
+    cur_l = hub_s.buffers["1"].current_lap()
+    hub_s.on_tyres({"1": {cur_l: ("SOFT", 0)}, "2": {1: ("HARD", 8)},
+                    "3": {1: ("MEDIUM", 2)}, "4": {1: ("MEDIUM", 6)}})
+    adv = eng.evaluate()
+    check(adv["1"].action == "STAY"
+          and "absorbed" in " ".join(adv["1"].trace),
+          f"estrategia: goma fresca absorbe ({adv['1'].action})")
+    # si el que para es el de ADELANTE, no es cover: es ventana de overcut
+    hub_s.pit_lane = {"1": [[5, hub_s.latest_t - 10.0, None]]}
+    adv = eng.evaluate()
+    check(adv["2"].action == "WATCH"
+          and any("overcut" in t for t in adv["2"].threats),
+          f"estrategia: adelante boxea → overcut, no cover "
+          f"({adv['2'].action})")
+    # fuera de carrera el motor no opina
+    hub_s.on_session_meta({"type": "Practice", "name": "Practice 1"})
+    check(eng.evaluate() == {}, "estrategia: solo opina en carrera")
+    hub_s.on_session_meta({"type": "Race", "name": "Race"})
 
     # registro: cambios logueados y persistidos con traza completa
     check(len(eng.log) >= 4,
